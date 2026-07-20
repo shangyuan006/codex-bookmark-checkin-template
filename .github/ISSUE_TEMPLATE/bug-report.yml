@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible problem without private account data
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach logs, screenshots, bookmark exports, usernames, email addresses, cookies, tokens, balances, or private URLs.
+  - type: input
+    id: version
+    attributes:
+      label: Commit or release
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Stage
+      options:
+        - Environment preflight
+        - Configuration
+        - Bookmark discovery
+        - Browser check-in
+        - Login recovery
+        - Scheduling
+        - Notification
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction with synthetic data
+      description: Replace domains and account details with examples.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true

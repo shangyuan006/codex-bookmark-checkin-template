@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {
+      "origin": "https://ptchdbits.co",
+      "questionIncludes": "娜娜莉喜欢哪",
+      "answerText": "《爱丽丝梦游仙境》",
+      "submitText": "提交"
+    }
+  ]
+}

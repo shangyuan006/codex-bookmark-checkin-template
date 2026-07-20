@@ -1,0 +1,37 @@
+{
+  "groups": [
+    {
+      "id": "environment_decision",
+      "askWhen": "preflight reports missing or optional capabilities",
+      "questions": [
+        "是否允许 Codex 补全缺失的 Node.js、npm 依赖或 PowerShell 组件？",
+        "若不能使用 Windows 计划任务，是否允许回退到用户级隐藏调度器？"
+      ]
+    },
+    {
+      "id": "bookmark_scope",
+      "questions": [
+        "使用哪个 Chrome 配置文件？不确定可选择 Auto。",
+        "移动书签目录可能使用哪些名称？",
+        "其中哪些子目录需要每天签到？"
+      ]
+    },
+    {
+      "id": "automation_policy",
+      "questions": [
+        "每天几点运行？默认 08:05。",
+        "是否启用公开内置站点规则？默认启用。",
+        "是否复用 Chrome 加密保存的登录记录和 Linux DO OAuth？默认启用。",
+        "问答未知时是否允许基于限定选项进行公开搜索？默认启用。",
+        "留言框使用什么非敏感文本？默认“今日天气不错”。"
+      ]
+    },
+    {
+      "id": "notification",
+      "questions": [
+        "是否需要结果通知？可选择无通知或自定义命令。",
+        "自定义通知器的可执行文件和参数模板是什么？敏感值只能来自环境变量或安全存储。"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "_meta": {
+    "schemaVersion": 1,
+    "lastVerifiedAt": "2026-07-20"
+  },
+  "relatedCandidateUrls": {
+    "https://x666.me": ["https://up.x666.me/"],
+    "https://checkin.new-api.abrdns.com": ["https://checkin.new-api.abrdns.com/checkin"],
+    "https://new-api.abrdns.com": ["https://checkin.new-api.abrdns.com/checkin"]
+  },
+  "logicalCheckinGroups": {
+    "https://checkin.new-api.abrdns.com": "abrdns-welfare",
+    "https://new-api.abrdns.com": "abrdns-welfare"
+  },
+  "knownNoCheckinFeatureOrigins": [
+    "https://ai-cf.ailinyu.de",
+    "https://muyuan.do",
+    "https://rrrapi.com",
+    "https://token.fourj.space"
+  ],
+  "visitCheckinRules": {
+    "https://anyrouter.top": { "after": "08:00" }
+  },
+  "nativeWafPreflightUrls": [
+    { "url": "https://piggo.me/attendance.php", "waitSeconds": 35 },
+    { "url": "https://www.hdkyl.in/attendance.php", "waitSeconds": 15 }
+  ],
+  "nativeChallengePreflight": [
+    { "url": "https://audiences.me/attendance.php", "waitSeconds": 20 },
+    { "url": "https://ourbits.club/attendance.php", "waitSeconds": 30 }
+  ],
+  "oauthRedirectOverrides": {
+    "https://free.lyclaude.site": {
+      "LinuxDO": "https://free.lyclaude.site/oauth/linuxdo"
+    }
+  },
+  "oauthLoginUrls": {
+    "https://checkin.new-api.abrdns.com": "https://checkin.new-api.abrdns.com/"
+  },
+  "automaticOAuthProviders": {
+    "https://muyuan.do": "LinuxDO",
+    "https://checkin.new-api.abrdns.com": "LinuxDO"
+  },
+  "attentionPreferredOrigins": [
+    "https://audiences.me",
+    "https://jianzhile.vip"
+  ]
+}

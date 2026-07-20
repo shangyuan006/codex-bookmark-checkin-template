@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {
+      "origin": "https://example.com",
+      "questionIncludes": "示例问题关键词",
+      "answerText": "经过页面确认的答案",
+      "submitText": "提交"
+    }
+  ]
+}

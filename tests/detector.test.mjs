@@ -1,0 +1,68 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { classifyPageText, scoreActionText, solveArithmeticQuestion } from "../src/detector.mjs";
+
+test("识别已签到状态", () => {
+  assert.equal(classifyPageText({ bodyText: "您今日已签到，请明天再来" }).status, "already_signed");
+  assert.equal(classifyPageText({ bodyText: "邀请 [发送]: 0 [已签到] 分享率" }).status, "already_signed");
+  assert.equal(classifyPageText({ bodyText: "[查看签到记录] [21点]" }).status, "already_signed");
+  assert.equal(classifyPageText({ bodyText: "[查看簽到記錄] [21點]" }).status, "already_signed");
+  assert.equal(classifyPageText({ bodyText: "抱歉 您今天已经签到过了，请勿重复刷新。" }).status, "already_signed");
+  assert.equal(classifyPageText({ bodyText: "鲸币 [使用]: 154,464.0 (签到已得350)" }).status, "already_signed");
+});
+
+test("识别签到成功状态", () => {
+  assert.equal(classifyPageText({ bodyText: "签到成功，获得 10 积分" }).status, "signed");
+  assert.equal(classifyPageText({ bodyText: "这是您的第159次签到，本次签到获得800个憨豆。" }).status, "signed");
+  assert.equal(classifyPageText({ bodyText: "回答正确，签到奖励已发放。" }).status, "signed");
+});
+
+test("带图片验证码的登录页仍识别为登录失效", () => {
+  const result = classifyPageText({ url: "https://example.test/login", challengeSelectors: true, hasPassword: true });
+  assert.equal(result.status, "login_required");
+  assert.match(result.reason, /验证码/);
+});
+
+test("说明文字不被误判为当前人机挑战", () => {
+  assert.equal(classifyPageText({ bodyText: "每日签到 完成人机验证即可领取奖励" }).status, "ready");
+});
+
+test("签到功能说明和历史入口不被误判为已完成", () => {
+  assert.equal(classifyPageText({ bodyText: "每日签到可获得随机额度奖励" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "查看签到记录" }).status, "ready");
+});
+
+test("识别 Linux DO 登录入口", () => {
+  assert.equal(classifyPageText({ bodyText: "使用 Linux DO 登录" }).status, "login_required");
+});
+
+test("可见的 Cloudflare 复选框优先识别为交互挑战", () => {
+  assert.equal(classifyPageText({ bodyText: "正在进行安全验证 请验证您是真人" }).status, "interactive_challenge");
+});
+
+test("无复选框的托管验证继续等待", () => {
+  assert.equal(classifyPageText({ bodyText: "Just a moment... 正在验证您是否是真人" }).status, "managed_challenge");
+});
+
+test("识别带连字符的登录路径", () => {
+  assert.equal(classifyPageText({ url: "https://example.test/sign-in?redirect=%2Fconsole" }).status, "login_required");
+});
+
+test("识别公开首页的登录注册入口", () => {
+  assert.equal(classifyPageText({ bodyText: "首页 控制台 登录 注册 获取密钥" }).status, "login_required");
+});
+
+test("只选择明确的签到动作", () => {
+  assert.ok(scoreActionText("立即签到") > 0);
+  assert.ok(scoreActionText("[签到]") > 0);
+  assert.ok(scoreActionText("福利站") > 0);
+  assert.ok(scoreActionText("开始转动") > 0);
+  assert.equal(scoreActionText("签到记录"), -1);
+  assert.equal(scoreActionText("购买"), -1);
+});
+
+test("只计算简单安全整数算式", () => {
+  assert.equal(solveArithmeticQuestion("请回答 12 × 3"), "36");
+  assert.equal(solveArithmeticQuestion("10 / 4"), null);
+  assert.equal(solveArithmeticQuestion("没有算式"), null);
+});

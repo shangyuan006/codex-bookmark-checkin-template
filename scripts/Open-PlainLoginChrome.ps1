@@ -1,0 +1,63 @@
+[CmdletBinding()]
+param(
+    [string[]]$Urls = @(),
+    [switch]$Offscreen,
+    [int]$RemoteDebuggingPort = 0
+)
+
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $PSScriptRoot
+$config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+$node = Resolve-CheckinNode $config
+$closeSignal = Join-Path $root 'tmp\close-manual-session.signal'
+
+if (Test-Path -LiteralPath (Join-Path $root 'tmp\manual-session.json')) {
+    [System.IO.File]::WriteAllText($closeSignal, (Get-Date).ToString('o'), [System.Text.UTF8Encoding]::new($false))
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+        Start-Sleep -Milliseconds 500
+        $manual = Get-CimInstance Win32_Process | Where-Object {
+            $_.Name -eq 'node.exe' -and $_.CommandLine -like "*$(Join-Path $root 'src\manual-session.mjs')*"
+        }
+    } while ($manual -and (Get-Date) -lt $deadline)
+    if ($manual) { throw '旧的 Playwright 手动会话未能正常退出。' }
+}
+
+$existing = Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -eq 'chrome.exe' -and $_.CommandLine -like "*$($config.automationUserDataDir)*"
+}
+if ($existing) { throw '机器人专用 Chrome 配置仍被其他进程占用。' }
+
+$items = if ($Urls.Count -gt 0) {
+    @($Urls | ForEach-Object {
+        $uri = [uri]$_
+        if ($uri.Scheme -notin @('http', 'https') -or -not $uri.Host) { throw "无效网址：$_" }
+        [pscustomobject]@{ url = $uri.AbsoluteUri }
+    })
+}
+else {
+    @(& $node (Join-Path $root 'src\attention-urls.mjs') | ConvertFrom-Json)
+}
+$windowPosition = if ($Offscreen) { '-32000,-32000' } else { '60,60' }
+$arguments = @(
+    "--user-data-dir=$($config.automationUserDataDir)",
+    '--profile-directory=Default',
+    '--new-window',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--force-renderer-accessibility',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    "--window-position=$windowPosition",
+    '--window-size=1400,900'
+)
+if ($RemoteDebuggingPort -gt 0) {
+    $arguments += "--remote-debugging-port=$RemoteDebuggingPort"
+    $arguments += "--remote-allow-origins=http://127.0.0.1:$RemoteDebuggingPort"
+}
+$arguments += @($items | ForEach-Object { [string]$_.url })
+
+Start-Process -FilePath ([string]$config.chromeExecutable) -ArgumentList $arguments
+Write-Output "已使用无自动化标记的原生 Chrome 打开 $(@($items).Count) 个待处理站点。"

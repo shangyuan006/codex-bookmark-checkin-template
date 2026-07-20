@@ -1,0 +1,14 @@
+{
+  "relatedCandidateUrls": {
+    "https://example.com": ["https://example.com/account/check-in"]
+  },
+  "logicalCheckinGroups": {
+    "https://example.com": "example-service"
+  },
+  "visitCheckinRules": {
+    "https://example.com": { "after": "08:00" }
+  },
+  "nativeWafPreflightUrls": [
+    { "url": "https://example.com/account/check-in", "waitSeconds": 20 }
+  ]
+}
