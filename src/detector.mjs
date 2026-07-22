@@ -3,6 +3,7 @@ const CHECKIN_EXACT = new Set([
   "今日签到", "今日簽到", "去签到", "去簽到", "打卡", "立即打卡",
   "福利站", "check in", "check-in", "daily check in", "daily check-in", "attendance",
   "开始转动", "開始轉動", "转动转盘", "轉動轉盤",
+  "申请额度", "申請額度",
 ]);
 
 const EXCLUDED_ACTIONS = /(签到记录|簽到記錄|签到排行|签到规则|补签|補簽|历史|history|rules?)/i;
@@ -44,7 +45,7 @@ export function classifyPageText({ url = "", title = "", bodyText = "", hasPassw
   if (/(今日已签到|今天已签到|今天已经签到过|已经签到|已完成签到|已签到|已簽到|签到已得\s*\d*|簽到已得\s*\d*|查看(?:签到|簽到)(?:记录|記錄).{0,20}\d{1,2}(?:点|點)|無需重複簽到|无需重复签到|already checked[ -]?in|checked in today)/i.test(text)) {
     return { status: "already_signed", reason: "今天已经签到" };
   }
-  if (/(签到成功|簽到成功|成功签到|成功簽到|打卡成功|回答正确|回答正確|本次签到获得|本次簽到獲得|successfully checked[ -]?in)/i.test(text)) {
+  if (/(签到成功|簽到成功|成功签到|成功簽到|打卡成功|回答正确|回答正確|本次签到获得|本次簽到獲得|申请额度成功|申請額度成功|额度已发放|額度已發放|额度申请成功|額度申請成功|申请成功.*额度|申請成功.*額度|successfully checked[ -]?in)/i.test(text)) {
     return { status: "signed", reason: "页面显示签到成功" };
   }
   return { status: "ready", reason: "页面可继续处理" };

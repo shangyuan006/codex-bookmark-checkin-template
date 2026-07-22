@@ -19,10 +19,18 @@ $runValue = try {
     [string]$runProperties.$runKeyName
 } catch { $null }
 $schedulerScript = Join-Path $PSScriptRoot 'Start-UserScheduler.ps1'
+$watchdogScript = Join-Path $PSScriptRoot 'Ensure-UserScheduler.ps1'
 $schedulerCount = @(Get-CimInstance Win32_Process | Where-Object {
     $_.Name -in @('pwsh.exe', 'powershell.exe') -and $_.CommandLine -like "*-File*$schedulerScript*"
 }).Count
+$watchdogCount = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -in @('pwsh.exe', 'powershell.exe') -and $_.CommandLine -like "*-File*$watchdogScript*"
+}).Count
 $latest = if (Test-Path -LiteralPath $latestPath) { Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json } else { $null }
+$heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
+$heartbeat = if (Test-Path -LiteralPath $heartbeatPath) { Get-Content -Raw -Encoding UTF8 -LiteralPath $heartbeatPath | ConvertFrom-Json } else { $null }
+$heartbeatMaxAgeMinutes = if ($heartbeat -and [string]$heartbeat.phase -eq 'running_checkin') { ([int]$config.taskTimeoutMinutes) + 10 } else { 5 }
+$heartbeatFresh = $heartbeat -and ((Get-Date) - [datetime]$heartbeat.updatedAt) -lt [timespan]::FromMinutes($heartbeatMaxAgeMinutes)
 $problemCount = if ($latest) { @($latest.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') }).Count } else { $null }
 $notificationReady = $config.notification.mode -in @($null, '', 'none') -or (
     $config.notification.mode -eq 'command' -and
@@ -35,7 +43,8 @@ $checks = [ordered]@{
     automationProfilePresent = Test-Path -LiteralPath (Join-Path ([string]$config.automationUserDataDir) 'Local State')
     notificationReady = [bool]$notificationReady
     schedulerReady = [bool]$scheduledTask -or [bool]$runValue
-    schedulerUnique = if ($scheduledTask) { $true } else { $schedulerCount -eq 1 }
+    schedulerUnique = if ($scheduledTask) { $true } else { $schedulerCount -eq 1 -and $watchdogCount -eq 1 }
+    schedulerHeartbeatFresh = [bool]$heartbeatFresh
     latestResultPresent = [bool]$latest
     latestResultConfirmed = $null -ne $problemCount -and $problemCount -eq 0
     siteStatePresent = Test-Path -LiteralPath $statePath
@@ -45,6 +54,7 @@ $checks = [ordered]@{
     schedule = [string]$config.schedule
     schedulerMode = if ($scheduledTask) { 'windows_task' } elseif ($runValue) { 'user_scheduler' } else { 'none' }
     schedulerProcessCount = $schedulerCount
+    watchdogProcessCount = $watchdogCount
     latestRunId = if ($latest) { [string]$latest.runId } else { $null }
     latestSiteCount = if ($latest) { @($latest.results).Count } else { $null }
     latestProblemCount = $problemCount

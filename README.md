@@ -31,7 +31,7 @@ pwsh -NoProfile -File .\scripts\Test-Environment.ps1 `
 
 - 每次启动动态读取书签，因此后续新增书签会自动进入下一次任务。
 - 相同来源和相同逻辑签到入口会去重，仍为每个书签保留结果。
-- 内置适配器覆盖 NexusPHP、New API、Linux DO OAuth、图片验证码、站内问答、Cloudflare/Turnstile 和部分公开站点特殊流程。
+- 内置适配器覆盖 NexusPHP、New API、Linux DO OAuth、图片验证码、站内问答、Cloudflare/Turnstile，以及将“申请额度”作为每日签到动作的公益站流程。
 - 未知站点先走通用入口发现；Codex 只把经过页面成功确认的规则写入本机 `config/config.local.json`。
 - 单站重试、异常复查和任务级断点续跑只重新访问未确认目标。
 - 默认不配置外部通知。用户可选择安全的命令型通知器，敏感值应从环境变量或凭据管理器读取。

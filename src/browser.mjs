@@ -105,7 +105,7 @@ async function findCheckinAction(page, allowedOrigins, excludedAction = null) {
       try {
         const href = new URL(candidate.href);
         if (!originSet.has(href.origin)) return false;
-        if (/(attendance|check[-_]?in|showup|bakatest|sign|签到|簽到)/i.test(href.href)) return true;
+        if (/(attendance|check[-_]?in|showup|bakatest|sign|签到|簽到|申请额度|申請額度)/i.test(href.href)) return true;
         // Some NexusPHP trackers expose check-in as an onclick handler on a
         // same-page "#" link (for example onclick="signin(this)").  The
         // visible label remains the authoritative signal in that case.

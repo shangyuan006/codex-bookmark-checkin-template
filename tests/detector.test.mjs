@@ -15,6 +15,7 @@ test("识别签到成功状态", () => {
   assert.equal(classifyPageText({ bodyText: "签到成功，获得 10 积分" }).status, "signed");
   assert.equal(classifyPageText({ bodyText: "这是您的第159次签到，本次签到获得800个憨豆。" }).status, "signed");
   assert.equal(classifyPageText({ bodyText: "回答正确，签到奖励已发放。" }).status, "signed");
+  assert.equal(classifyPageText({ bodyText: "申请额度成功，额度已发放。" }).status, "signed");
 });
 
 test("带图片验证码的登录页仍识别为登录失效", () => {
@@ -57,6 +58,7 @@ test("只选择明确的签到动作", () => {
   assert.ok(scoreActionText("[签到]") > 0);
   assert.ok(scoreActionText("福利站") > 0);
   assert.ok(scoreActionText("开始转动") > 0);
+  assert.ok(scoreActionText("申请额度") > 0);
   assert.equal(scoreActionText("签到记录"), -1);
   assert.equal(scoreActionText("购买"), -1);
 });

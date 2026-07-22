@@ -1,6 +1,7 @@
 {
   "mobileFolderNames": [],
   "targetFolderNames": [],
+  "minimumBookmarkTargetCount": 1,
   "relatedCandidateUrls": {},
   "logicalCheckinGroups": {},
   "knownNoCheckinFeatureOrigins": [],

@@ -195,6 +195,7 @@ export async function readBookmarkPlan(bookmarksPath, options = {}) {
 export function publicBookmarkReport(plan) {
   return {
     generatedAt: plan.generatedAt,
+    recoveredFromBackup: Boolean(plan.recoveredFromBackup),
     sourceCount: plan.sources.length,
     sources: plan.sources.map((source) => ({
       path: source.path,

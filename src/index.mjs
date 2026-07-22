@@ -35,6 +35,7 @@ let selectedOrigins = originsIndex >= 0
 const requestedResumePath = resumeIndex >= 0 ? String(process.argv[resumeIndex + 1] ?? "").trim() : null;
 const lockPath = path.join(rootDirectory, "tmp", "run.lock");
 const nativeWafPreflightPath = path.join(rootDirectory, "tmp", "native-waf-preflight.json");
+const lastValidBookmarkPlanPath = path.join(rootDirectory, "data", "last-valid-bookmark-plan.json");
 const RECOVERABLE_STATUSES = new Set([
   "error", "login_required", "interactive_challenge", "managed_challenge_timeout",
   "visited", "clicked", "no_action",
@@ -42,6 +43,34 @@ const RECOVERABLE_STATUSES = new Set([
 
 function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function validateBookmarkPlan(plan) {
+  const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);
+  let lastValid = null;
+  try { lastValid = JSON.parse(await fs.readFile(lastValidBookmarkPlanPath, "utf8")); } catch { /* first run */ }
+  const previousCount = Number(lastValid?.targetCount) || 0;
+  const suddenDrop = previousCount >= minimumTargets && plan.targetCount < Math.ceil(previousCount * 0.5);
+  if (plan.targetCount < minimumTargets || suddenDrop) {
+    throw new Error(`书签目标异常：当前 ${plan.targetCount} 个，上次 ${previousCount || "无记录"} 个；拒绝生成空签到结果`);
+  }
+  await atomicWriteJson(lastValidBookmarkPlanPath, publicBookmarkReport(plan));
+}
+
+async function readValidatedBookmarkPlan() {
+  const candidates = [config.bookmarksPath, `${config.bookmarksPath}.bak`];
+  const failures = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidatePath = candidates[index];
+    try {
+      const plan = await readBookmarkPlan(candidatePath, config);
+      await validateBookmarkPlan(plan);
+      return { ...plan, recoveredFromBackup: index > 0 };
+    } catch (error) {
+      failures.push(`${path.basename(candidatePath)}：${error.message}`);
+    }
+  }
+  throw new Error(`无法读取有效签到书签：${failures.join("；")}`);
 }
 
 async function readFreshNativeWafPreflight() {
@@ -80,7 +109,7 @@ async function acquireLock() {
 
 const lockHandle = await acquireLock();
 try {
-  const plan = await readBookmarkPlan(config.bookmarksPath, config);
+  const plan = await readValidatedBookmarkPlan();
   const report = publicBookmarkReport(plan);
   const reportPath = path.join(rootDirectory, "outputs", "bookmark-comparison.json");
   await atomicWriteJson(reportPath, report);
