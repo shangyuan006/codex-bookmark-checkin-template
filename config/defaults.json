@@ -2,6 +2,12 @@
   "mobileFolderNames": [],
   "targetFolderNames": [],
   "minimumBookmarkTargetCount": 1,
+  "quotaRequestRules": {
+    "https://new.sharedchat.cc": {
+      "minimumReasonLength": 10,
+      "reason": "今日正常使用服务，申请额度用于开发测试和日常体验，谢谢。"
+    }
+  },
   "relatedCandidateUrls": {},
   "logicalCheckinGroups": {},
   "knownNoCheckinFeatureOrigins": [],

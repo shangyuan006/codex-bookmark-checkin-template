@@ -131,6 +131,40 @@ async function clickCandidate(page, candidate) {
   await locator.click({ timeout: 10000 });
 }
 
+async function tryQuotaRequestFlow(page, activeOrigin, config) {
+  const rule = config.quotaRequestRules?.[activeOrigin];
+  if (!rule) return null;
+  const reason = String(rule.reason || "今日正常使用服务，申请额度用于开发测试和日常体验，谢谢。");
+  const minimumLength = Math.max(10, Number(rule.minimumReasonLength) || 10);
+  if ([...reason].length < minimumLength) throw new Error(`额度申请理由少于 ${minimumLength} 个字符`);
+  const reasonFields = page.locator([
+    'textarea:visible',
+    'input[name*="reason" i]:visible',
+    'input[name*="remark" i]:visible',
+    'input[name*="message" i]:visible',
+    'input[placeholder*="理由" i]:visible',
+    'input[placeholder*="原因" i]:visible',
+  ].join(", "));
+  if (await reasonFields.count() !== 1) return null;
+  await reasonFields.fill(reason);
+  let submit = null;
+  for (const label of ["提交申请", "确认申请", "确认提交", "提交", "确认"]) {
+    const candidate = page.getByRole("button", { name: label, exact: true });
+    if (await candidate.count() === 1 && await candidate.isVisible().catch(() => false)) { submit = candidate; break; }
+    const input = page.locator(`input[type="submit"][value="${label}"], input[type="button"][value="${label}"]`);
+    if (await input.count() === 1 && await input.isVisible().catch(() => false)) { submit = input; break; }
+  }
+  if (!submit) return { status: "needs_attention", reason: "已填写额度申请理由，但未找到提交按钮" };
+  await submit.click({ timeout: 10000 });
+  await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+  await sleep(Math.max(1000, Number(config.actionWaitMs) || 0));
+  const state = await waitForManagedChallenge(page, config);
+  if (["signed", "already_signed"].includes(state.status)) return state;
+  const bodyText = String(await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+  if (/(额度申请已提交|申请额度成功|额度已发放|额度申请成功|申请成功.*额度|今日已申请|今天已申请)/i.test(bodyText)) return { status: "signed", reason: "额度申请已提交并获得页面确认" };
+  return { status: "unconfirmed", reason: "额度申请已提交，但页面未确认结果" };
+}
+
 async function findCheckinDiscoveryUrls(page, expectedOrigin) {
   const links = await page.locator("a[href]").evaluateAll((elements) => elements.slice(0, 300).map((element) => {
     const style = getComputedStyle(element);
@@ -608,6 +642,10 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
     state = await waitForManagedChallenge(page, config);
     if (["signed", "already_signed", "login_required", "interactive_challenge", "managed_challenge_timeout"].includes(state.status)) {
       return { ...state, action: action.text, url: safeLogUrl(page.url()) };
+    }
+    if (state.status === "ready") {
+      const quotaResult = await tryQuotaRequestFlow(page, activeOrigin, config);
+      if (quotaResult) return { ...quotaResult, action: `${action.text} → 申请理由`, url: safeLogUrl(page.url()) };
     }
 
     const openCdResult = await tryOpenCdCaptcha(page, activeOrigin);

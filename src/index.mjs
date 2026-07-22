@@ -38,7 +38,7 @@ const nativeWafPreflightPath = path.join(rootDirectory, "tmp", "native-waf-prefl
 const lastValidBookmarkPlanPath = path.join(rootDirectory, "data", "last-valid-bookmark-plan.json");
 const RECOVERABLE_STATUSES = new Set([
   "error", "login_required", "interactive_challenge", "managed_challenge_timeout",
-  "visited", "clicked", "no_action",
+  "visited", "clicked", "no_action", "unconfirmed",
 ]);
 
 function wait(delayMs) {
