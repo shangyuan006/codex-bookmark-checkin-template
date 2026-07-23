@@ -29,16 +29,31 @@ function Get-FreshResumeReport([datetime]$NotBefore) {
         }
     })
     $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
+    $validCandidates = @()
     foreach ($file in @($candidates | Where-Object { $_.LastWriteTime -ge $NotBefore.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending)) {
         try {
             $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $file.FullName | ConvertFrom-Json
             if ([string]$value.runId -like "$todayPrefix*" -and $null -ne $value.results) {
-                return [pscustomobject]@{ Path = $file.FullName; Report = $value; LastWriteTime = $file.LastWriteTime }
+                $plannedTotal = if ($null -ne $value.plannedTotal) { [int]$value.plannedTotal } else { 0 }
+                $processedTotal = if ($null -ne $value.processedTotal) { [int]$value.processedTotal } else { @($value.results).Count }
+                $completeFinal = [string]$value.runState -eq 'final' `
+                    -and $value.isComplete -eq $true `
+                    -and $plannedTotal -gt 0 `
+                    -and $processedTotal -ge $plannedTotal `
+                    -and @($value.results).Count -ge $plannedTotal
+                $validCandidates += [pscustomobject]@{
+                    Path = $file.FullName
+                    Report = $value
+                    LastWriteTime = $file.LastWriteTime
+                    CompleteFinal = $completeFinal
+                }
             }
         }
         catch { }
     }
-    return $null
+    return @($validCandidates | Sort-Object `
+        @{ Expression = { [int]$_.CompleteFinal }; Descending = $true }, `
+        @{ Expression = { $_.LastWriteTime }; Descending = $true } | Select-Object -First 1)[0]
 }
 
 function Get-TodayResumeReport {
