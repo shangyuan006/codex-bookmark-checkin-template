@@ -64,4 +64,4 @@ pwsh -NoProfile -File .\scripts\Export-PublicBundle.ps1
 
 项目目前面向 Windows 10/11 与桌面版 Chrome。电脑休眠或关机错过计划时间后，用户级调度器会在当天恢复登录后补跑。
 
-自定义通知器应接受参数数组，支持 `{status}`、`{summary}`、`{taskId}`、`{name}` 和 `{source}` 占位符。实现不会使用 `Invoke-Expression`，也不会读取任何 Telegram Bot Token。
+自定义通知器应接受参数数组，支持 `{status}`、`{summary}`、`{taskId}`、`{name}`、`{source}` 和 `{eventKey}` 占位符。`{eventKey}` 按“日期 + 站点状态指纹”生成：相同结果重复执行会去重，异常解决后的新结果仍可发送。实现不会使用 `Invoke-Expression`，也不会读取任何 Telegram Bot Token。

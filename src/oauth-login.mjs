@@ -88,12 +88,24 @@ try {
   const providerLabels = providerVariants.flatMap((name) => [
     `使用 ${name} 继续`, `使用 ${name} 登录`, `使用 ${name} 登入`,
   ]);
+  const providerAltLabels = /linux\s*do/i.test(provider)
+    ? ["LINUX DO", "Linux DO", "LinuxDO"]
+    : [provider, `${provider}登录`, `${provider}登入`];
   let providerButton = null;
   for (const label of providerLabels) {
     const candidate = page.getByText(label, { exact: true });
     if (await candidate.count() === 1 && await candidate.isVisible()) {
       providerButton = candidate;
       break;
+    }
+  }
+  if (!providerButton) {
+    for (const label of providerAltLabels) {
+      const candidate = page.locator(`img[alt="${label}"]`);
+      if (await candidate.count() === 1 && await candidate.isVisible()) {
+        providerButton = candidate;
+        break;
+      }
     }
   }
   if (!providerButton) throw new Error(`没有找到唯一的 ${provider} 登录按钮`);
@@ -152,6 +164,15 @@ try {
     if (await candidate.count() === 1 && await candidate.isVisible()) {
       visibleProviderLogin = true;
       break;
+    }
+  }
+  if (!visibleProviderLogin) {
+    for (const label of providerAltLabels) {
+      const candidate = page.locator(`img[alt="${label}"]`);
+      if (await candidate.count() === 1 && await candidate.isVisible()) {
+        visibleProviderLogin = true;
+        break;
+      }
     }
   }
   const loggedIn = finalLocation.origin === origin

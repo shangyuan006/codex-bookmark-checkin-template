@@ -46,7 +46,7 @@ export function classifyPageText({ url = "", title = "", bodyText = "", hasPassw
   }
 
   if (/(操作过于频繁|操作過於頻繁|请求过于频繁|請求過於頻繁|too many requests|rate limit|try again later|请稍后再试|請稍後再試)/i.test(text)) {
-    return { status: "deferred", reason: "站点触发频率限制，请稍后重试" };
+    return { status: "deferred", retryCause: "rate_limit", reason: "站点触发频率限制，请稍后重试" };
   }
 
   // Visible Turnstile/recaptcha widgets and an explicit checkbox prompt need

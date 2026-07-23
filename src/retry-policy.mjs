@@ -40,7 +40,11 @@ export function withRetrySchedule(result, config = {}, now = new Date()) {
   const existing = Date.parse(result.nextEligibleAt ?? "");
   if (Number.isFinite(existing)) return result;
   const requestedTime = String(result.reason ?? "").match(/(?:要求|需在)\s*([0-2]\d:[0-5]\d)\s*后/)?.[1];
-  const configuredDelay = Number(config.deferredRetryDelayMs);
+  const configuredDelay = Number(
+    result.retryCause === "rate_limit"
+      ? (config.rateLimitRetryDelayMs ?? config.deferredRetryDelayMs)
+      : config.deferredRetryDelayMs,
+  );
   const delayMs = Math.max(60_000, Math.min(6 * 60 * 60 * 1000,
     Number.isFinite(configuredDelay) ? configuredDelay : 30 * 60 * 1000));
   return {
@@ -48,6 +52,18 @@ export function withRetrySchedule(result, config = {}, now = new Date()) {
     nextEligibleAt: (requestedTime ? nextShanghaiTime(requestedTime, now) : null)
       ?? new Date(now.getTime() + delayMs).toISOString(),
   };
+}
+
+export function deferUnresolvedLogin(result, config = {}, now = new Date()) {
+  if (result?.status !== "login_required") return result;
+  return withRetrySchedule({
+    ...result,
+    status: "deferred",
+    retryCause: "login_required",
+    reason: "自动登录恢复未成功，已安排低频重试",
+  }, {
+    deferredRetryDelayMs: config.loginRetryDelayMs ?? config.deferredRetryDelayMs,
+  }, now);
 }
 
 export function isRetryEligible(result, now = new Date()) {

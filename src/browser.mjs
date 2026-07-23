@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { classifyPageText, formatDailyReason, normalizeText, scoreActionText } from "./detector.mjs";
 import { assertBookmarkNavigation, safeErrorMessage, safeLogUrl } from "./security.mjs";
 import { recognizeOpenCdCaptcha } from "./captcha-ocr.mjs";
@@ -10,17 +11,57 @@ import { withRetrySchedule } from "./retry-policy.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
+const rootDirectory = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const COMPLETED = new Set(["signed", "already_signed", "not_available"]);
 const CHALLENGE = new Set(["interactive_challenge", "managed_challenge_timeout"]);
 const UNCONFIRMED = new Set(["visited", "clicked"]);
+const STORAGE_CONFIRMED = new Set(["signed", "already_signed"]);
+const CANDIDATE_STATUS_PRIORITY = new Map([
+  ["signed", 100],
+  ["already_signed", 100],
+  ["not_available", 95],
+  ["needs_attention", 90],
+  ["login_required", 85],
+  ["interactive_challenge", 84],
+  ["managed_challenge_timeout", 83],
+  ["managed_challenge", 82],
+  ["deferred", 80],
+  ["unconfirmed", 70],
+  ["clicked", 65],
+  ["visited", 60],
+  ["error", 30],
+  ["no_action", 20],
+]);
+export const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, [data-cap-api-endpoint], [class*="captcha" i]';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export function preferCandidateResult(current, candidate) {
+  if (!candidate) return current;
+  if (!current) return candidate;
+  const currentPriority = CANDIDATE_STATUS_PRIORITY.get(current.status) ?? 0;
+  const candidatePriority = CANDIDATE_STATUS_PRIORITY.get(candidate.status) ?? 0;
+  return candidatePriority > currentPriority ? candidate : current;
+}
+
+export function shouldPersistSiteStorage(result) {
+  return STORAGE_CONFIRMED.has(result?.status);
+}
+
+export function candidateHistoryEntry(candidateUrl, result, attempt) {
+  return {
+    attempt,
+    candidateUrl: safeLogUrl(candidateUrl),
+    status: String(result?.status || "error"),
+    reason: safeErrorMessage(result?.reason || "未知错误").slice(0, 240),
+  };
+}
+
 async function snapshotState(page) {
-  const state = await page.evaluate(() => {
+  const state = await page.evaluate((challengeSelector) => {
     const bodyText = String(document.body?.innerText ?? "").slice(0, 30000);
     const passwordInputs = [...document.querySelectorAll('input[type="password"]')]
       .some((element) => {
@@ -28,15 +69,13 @@ async function snapshotState(page) {
         const rect = element.getBoundingClientRect();
         return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
       });
-    const challengeSelectors = [...document.querySelectorAll(
-      'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, [class*="captcha" i]'
-    )].some((element) => {
+    const challengeSelectors = [...document.querySelectorAll(challengeSelector)].some((element) => {
       const style = getComputedStyle(element);
       const rect = element.getBoundingClientRect();
       return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
     });
     return { bodyText, passwordInputs, challengeSelectors };
-  });
+  }, CHALLENGE_SELECTOR);
   return classifyPageText({
     url: page.url(),
     title: await page.title(),
@@ -54,7 +93,13 @@ async function waitForManagedChallenge(page, config) {
     if (state.status !== "managed_challenge") return state;
     await sleep(2000);
   }
-  return { status: "managed_challenge_timeout", reason: "托管安全验证等待超时" };
+  return withRetrySchedule({
+    status: "deferred",
+    retryCause: "managed_challenge_timeout",
+    reason: "安全验证未自动通过，改为低频重试",
+  }, {
+    deferredRetryDelayMs: config.challengeRetryDelayMs ?? config.deferredRetryDelayMs,
+  });
 }
 
 async function acceptConfiguredTerms(page, state, activeOrigin, config) {
@@ -680,7 +725,7 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
     activeOrigin = new URL(activeUrl).origin;
     state = await waitForManagedChallenge(page, config);
     state = await acceptConfiguredTerms(page, state, activeOrigin, config);
-    if (["signed", "already_signed", "login_required", "interactive_challenge", "managed_challenge_timeout"].includes(state.status)) {
+    if (["signed", "already_signed", "login_required", "interactive_challenge", "managed_challenge_timeout", "deferred"].includes(state.status)) {
       return { ...state, action: action.text, url: safeLogUrl(page.url()) };
     }
     if (state.status === "ready") {
@@ -700,7 +745,8 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
       activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
       activeOrigin = new URL(activeUrl).origin;
       state = await waitForManagedChallenge(page, config);
-      if (["signed", "already_signed"].includes(state.status)) {
+      state = await acceptConfiguredTerms(page, state, activeOrigin, config);
+      if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred"].includes(state.status)) {
         return { ...state, action: `${action.text} → ${secondAction.text}`, url: safeLogUrl(page.url()) };
       }
       return {
@@ -737,7 +783,7 @@ async function saveFailureScreenshot(page, logDirectory, target) {
 
 export async function launchAutomationContext(config) {
   await fs.access(config.chromeExecutable);
-  return chromium.launchPersistentContext(config.automationUserDataDir, {
+  const context = await chromium.launchPersistentContext(config.automationUserDataDir, {
     executablePath: config.chromeExecutable,
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain", "--enable-automation"],
     headless: config.headless,
@@ -758,19 +804,91 @@ export async function launchAutomationContext(config) {
       ...(config.backgroundWindowMode === "visible" ? ["--window-position=80,80", "--window-size=1365,900"] : []),
     ],
   });
+  for (const [origin, relativeFile] of Object.entries(config.siteStorageBootstrap ?? {})) {
+    const storagePath = path.resolve(rootDirectory, String(relativeFile));
+    const allowedRoot = path.resolve(rootDirectory, "data");
+    if (!storagePath.startsWith(`${allowedRoot}${path.sep}`)) continue;
+    const value = await fs.readFile(storagePath, "utf8").then(JSON.parse).catch(() => null);
+    if (value?.origin !== origin || !Array.isArray(value.local) || !Array.isArray(value.session)) continue;
+    const local = value.local.filter((entry) => Array.isArray(entry) && entry.length === 2 && entry.every((item) => typeof item === "string"));
+    const session = value.session.filter((entry) => Array.isArray(entry) && entry.length === 2 && entry.every((item) => typeof item === "string"));
+    await context.addInitScript(({ expectedOrigin, localEntries, sessionEntries }) => {
+      if (location.origin !== expectedOrigin) return;
+      for (const [key, item] of localEntries) {
+        if (localStorage.getItem(key) === null) localStorage.setItem(key, item);
+      }
+      for (const [key, item] of sessionEntries) {
+        if (sessionStorage.getItem(key) === null) sessionStorage.setItem(key, item);
+      }
+    }, { expectedOrigin: origin, localEntries: local, sessionEntries: session });
+  }
+  return context;
+}
+
+export async function writeSiteStorageSnapshot(storagePath, value) {
+  await fs.mkdir(path.dirname(storagePath), { recursive: true });
+  const temporary = `${storagePath}.${process.pid}.tmp`;
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await fs.copyFile(storagePath, `${storagePath}.bak`).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    await fs.rename(temporary, storagePath);
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function persistSiteStorage(page, target, config, result) {
+  if (!shouldPersistSiteStorage(result)) return;
+  const relativeFile = config.siteStorageBootstrap?.[target.origin];
+  if (!relativeFile) return;
+  let activeOrigin;
+  try { activeOrigin = new URL(page.url()).origin; } catch { return; }
+  if (activeOrigin !== target.origin) return;
+  if (/\/(?:log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)/i.test(page.url())) return;
+  const visiblePassword = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+  if (visiblePassword > 0) return;
+  const storagePath = path.resolve(rootDirectory, String(relativeFile));
+  const allowedRoot = path.resolve(rootDirectory, "data");
+  if (!storagePath.startsWith(`${allowedRoot}${path.sep}`)) return;
+  const storage = await page.evaluate(() => ({
+    local: Object.entries(localStorage),
+    session: Object.entries(sessionStorage),
+  }));
+  await writeSiteStorageSnapshot(storagePath, {
+    version: 1,
+    origin: target.origin,
+    capturedAt: new Date().toISOString(),
+    ...storage,
+  });
 }
 
 export async function processTarget(context, target, config, qaRules, logDirectory) {
   let lastResult = null;
+  const candidateHistory = [];
   for (let attempt = 0; attempt <= config.retryCount; attempt += 1) {
     const page = await context.newPage();
+    let attemptResult = null;
     try {
       for (const candidateUrl of target.candidates) {
-        const result = withRetrySchedule(
-          await processCandidate(page, target, candidateUrl, config, qaRules),
-          config,
-        );
-        lastResult = result;
+        let result;
+        try {
+          result = withRetrySchedule(
+            await processCandidate(page, target, candidateUrl, config, qaRules),
+            config,
+          );
+        } catch (error) {
+          result = {
+            status: "error",
+            reason: safeErrorMessage(error),
+            url: safeLogUrl(page.url()),
+          };
+        }
+        candidateHistory.push(candidateHistoryEntry(candidateUrl, result, attempt + 1));
+        attemptResult = preferCandidateResult(attemptResult, result);
+        lastResult = preferCandidateResult(lastResult, result);
         // A logical bookmark target can contain multiple related URLs.  One
         // public/API URL may require login while another dedicated check-in
         // URL already has a valid session, so only a completed result should
@@ -778,30 +896,39 @@ export async function processTarget(context, target, config, qaRules, logDirecto
         if (COMPLETED.has(result.status)) break;
       }
 
-      if (lastResult && !CHALLENGE.has(lastResult.status)
-        && (!UNCONFIRMED.has(lastResult.status) || attempt === config.retryCount)) {
-        if (config.failureScreenshots && !COMPLETED.has(lastResult.status) && lastResult.status !== "login_required") {
-          lastResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
+      const effectiveResult = preferCandidateResult(lastResult, attemptResult);
+      if (effectiveResult && !CHALLENGE.has(effectiveResult.status)
+        && (!UNCONFIRMED.has(effectiveResult.status) || attempt === config.retryCount)) {
+        if (config.failureScreenshots && !COMPLETED.has(effectiveResult.status) && effectiveResult.status !== "login_required") {
+          effectiveResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
         }
-        return { ...lastResult, attempt: attempt + 1 };
+        return { ...effectiveResult, attempt: attempt + 1, candidateHistory };
       }
-      if (lastResult?.status === "interactive_challenge") {
-        if (config.failureScreenshots) lastResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
-        return { ...lastResult, attempt: attempt + 1 };
+      if (effectiveResult?.status === "interactive_challenge") {
+        if (config.failureScreenshots) effectiveResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
+        return { ...effectiveResult, attempt: attempt + 1, candidateHistory };
       }
-      if (lastResult && CHALLENGE.has(lastResult.status) && attempt === config.retryCount && config.failureScreenshots) {
-        lastResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
+      if (effectiveResult && CHALLENGE.has(effectiveResult.status) && attempt === config.retryCount && config.failureScreenshots) {
+        effectiveResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
       }
     } catch (error) {
-      lastResult = { status: "error", reason: safeErrorMessage(error), url: safeLogUrl(page.url()) };
+      const result = { status: "error", reason: safeErrorMessage(error), url: safeLogUrl(page.url()) };
+      candidateHistory.push(candidateHistoryEntry(page.url(), result, attempt + 1));
+      attemptResult = preferCandidateResult(attemptResult, result);
+      lastResult = preferCandidateResult(lastResult, result);
       if (config.failureScreenshots) {
-        try { lastResult.screenshot = await saveFailureScreenshot(page, logDirectory, target); } catch { /* 页面可能已经关闭 */ }
+        try { result.screenshot = await saveFailureScreenshot(page, logDirectory, target); } catch { /* 页面可能已经关闭 */ }
       }
     } finally {
+      await persistSiteStorage(page, target, config, attemptResult).catch(() => {});
       await page.close().catch(() => {});
     }
 
     if (attempt < config.retryCount) await sleep(config.retryDelayMs);
   }
-  return { ...(lastResult ?? { status: "error", reason: "未知错误" }), attempt: config.retryCount + 1 };
+  return {
+    ...(lastResult ?? { status: "error", reason: "未知错误" }),
+    attempt: config.retryCount + 1,
+    candidateHistory,
+  };
 }

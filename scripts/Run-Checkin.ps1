@@ -41,9 +41,35 @@ function Get-FreshResumeReport([datetime]$NotBefore) {
     return $null
 }
 
+function Get-TodayResumeReport {
+    $latestPath = Join-Path $root 'logs\latest.json'
+    if (-not (Test-Path -LiteralPath $latestPath)) { return $null }
+    try {
+        $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json
+        $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
+        $minimumTargets = [Math]::Max(1, [int]$config.minimumBookmarkTargetCount)
+        if ([string]$value.runId -like "$todayPrefix*" `
+            -and [string]$value.runState -eq 'final' `
+            -and $value.isComplete -eq $true `
+            -and @($value.results).Count -ge $minimumTargets) {
+            return [pscustomobject]@{ Path = $latestPath; Report = $value; LastWriteTime = (Get-Item -LiteralPath $latestPath).LastWriteTime }
+        }
+    }
+    catch { }
+    return $null
+}
+
+function Test-IsCompleteFinalReport($Report) {
+    if ($null -eq $Report) { return $false }
+    if ([string]$Report.runState -ne 'final' -or $Report.isComplete -ne $true) { return $false }
+    $plannedTotal = if ($null -ne $Report.plannedTotal) { [int]$Report.plannedTotal } else { 0 }
+    $processedTotal = if ($null -ne $Report.processedTotal) { [int]$Report.processedTotal } else { @($Report.results).Count }
+    return $plannedTotal -gt 0 -and $processedTotal -ge $plannedTotal -and @($Report.results).Count -ge $plannedTotal
+}
+
 function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
     $results = @($Report.results)
-    if ($null -ne $Report.total -and $results.Count -lt [int]$Report.total) { return $true }
+    if (-not (Test-IsCompleteFinalReport $Report)) { return $true }
     $unresolved = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
     if ($unresolved.Count -eq 0) { return $false }
     foreach ($result in $unresolved) {
@@ -79,6 +105,8 @@ try {
         & (Join-Path $PSScriptRoot 'Sync-ChromeSavedLogins.ps1')
     }
 
+    if (-not $DryRun) { $resumeCandidate = Get-TodayResumeReport }
+
     if ($DryRun) {
         & $node @arguments
         $nodeExitCode = $LASTEXITCODE
@@ -88,12 +116,12 @@ try {
     else {
         for ($attempt = 1; $attempt -le $runAttempts; $attempt++) {
             $runArguments = @($arguments)
-            if ($attempt -gt 1 -and $null -ne $resumeCandidate) {
+            if ($null -ne $resumeCandidate) {
                 $runArguments += @('--resume-report', [string]$resumeCandidate.Path)
             }
             if (@($config.nativeWafPreflightUrls).Count -gt 0 -or @($config.nativeChallengePreflight).Count -gt 0) {
                 $preflightOrigins = @()
-                if ($attempt -gt 1 -and $null -ne $resumeCandidate) {
+                if ($null -ne $resumeCandidate) {
                     $preflightOrigins = @($resumeCandidate.Report.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') } | ForEach-Object { [string]$_.origin })
                 }
                 if ($preflightOrigins.Count -gt 0) { & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins }
@@ -118,6 +146,10 @@ try {
             }
             $freshCandidate = Get-FreshResumeReport $attemptStartedAt
             if ($null -ne $freshCandidate) { $resumeCandidate = $freshCandidate }
+            if ($nodeExitCode -eq 0 -and ($null -eq $freshCandidate -or -not (Test-IsCompleteFinalReport $freshCandidate.Report))) {
+                $nodeExitCode = 2
+                $runnerMessage = "签到程序已结束，但第 $attempt 次尝试未生成完整的 final 报告。"
+            }
             if ($nodeExitCode -eq 0) { break }
             if ($attempt -lt $runAttempts) {
                 if ($null -ne $resumeCandidate -and -not (Test-HasImmediateRetry $resumeCandidate.Report ((Get-Date).AddMinutes($retryDelayMinutes)))) {

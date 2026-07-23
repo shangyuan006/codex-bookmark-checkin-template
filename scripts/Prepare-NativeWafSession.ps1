@@ -15,16 +15,18 @@ $items = @($config.nativeWafPreflightUrls | ForEach-Object {
     $rawUrl = if ($_ -is [string]) { [string]$_ } else { [string]$_.url }
     $uri = [uri]$rawUrl
     $waitSeconds = if ($_ -is [string] -or $null -eq $_.waitSeconds) { 30 } else { [int]$_.waitSeconds }
+    $passiveOnly = $_ -isnot [string] -and [bool]$_.passiveOnly
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "原生 WAF 预热地址无效：$rawUrl" }
-    if ($waitSeconds -lt 5 -or $waitSeconds -gt 60) { throw "原生 WAF 等待时间必须为 5 到 60 秒：$rawUrl" }
-    [pscustomobject]@{ url = $uri.AbsoluteUri; waitSeconds = $waitSeconds; trustAsSigned = $true }
+    if ($waitSeconds -lt 5 -or $waitSeconds -gt 120) { throw "原生 WAF 等待时间必须为 5 到 120 秒：$rawUrl" }
+    [pscustomobject]@{ url = $uri.AbsoluteUri; waitSeconds = $waitSeconds; trustAsSigned = $true; passiveOnly = $passiveOnly }
 })
 $items += @($config.nativeChallengePreflight | ForEach-Object {
     $uri = [uri][string]$_.url
     $waitSeconds = [int]$_.waitSeconds
+    $passiveOnly = [bool]$_.passiveOnly
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "原生验证预热地址无效：$($_.url)" }
-    if ($waitSeconds -lt 5 -or $waitSeconds -gt 60) { throw "原生验证等待时间必须为 5 到 60 秒：$($_.url)" }
-    [pscustomobject]@{ url = $uri.AbsoluteUri; waitSeconds = $waitSeconds; trustAsSigned = $false }
+    if ($waitSeconds -lt 5 -or $waitSeconds -gt 120) { throw "原生验证等待时间必须为 5 到 120 秒：$($_.url)" }
+    [pscustomobject]@{ url = $uri.AbsoluteUri; waitSeconds = $waitSeconds; trustAsSigned = $false; passiveOnly = $passiveOnly }
 })
 
 if ($Origins.Count -gt 0) {
@@ -70,6 +72,43 @@ foreach ($item in $items) {
     $url = [string]$item.url
     $origin = ([uri]$url).GetLeftPart([System.UriPartial]::Authority)
     $hostName = ([uri]$url).Host
+
+    if ([bool]$item.passiveOnly) {
+        $passivePrepared = $false
+        try {
+            # 被动模式只启动真实有头 Chrome，不开放调试端口，也不连接 CDP。
+            # 等待本身不是签到成功证据，因此这里只能报告 prepared/unconfirmed。
+            & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -Urls @($url)
+            Start-Sleep -Seconds 2
+            if ((Get-AutomationChromeProcesses).Count -gt 0) {
+                Start-Sleep -Seconds ([int]$item.waitSeconds)
+                $passivePrepared = (Get-AutomationChromeProcesses).Count -gt 0
+            }
+        }
+        catch {
+            $passivePrepared = $false
+        }
+        finally {
+            if ((Get-AutomationChromeProcesses).Count -gt 0) { Close-AutomationChrome }
+        }
+
+        if (-not $passivePrepared) {
+            Write-Warning "被动原生预热未完成：$hostName"
+        }
+        $preflightResults += [pscustomobject]@{
+            origin = $origin
+            url = $url
+            status = if ($passivePrepared) { 'prepared' } else { 'unconfirmed' }
+            reason = if ($passivePrepared) {
+                '原生 Chrome 已完成被动等待，等待自动化复查'
+            } else {
+                '原生 Chrome 被动等待未完成'
+            }
+            inspectionStatus = if ($passivePrepared) { 'passive_wait' } else { 'unavailable' }
+        }
+        continue
+    }
+
     $inspection = $null
     $inspectionMode = if ([bool]$item.trustAsSigned) { 'allow-endpoint' } else { 'require-confirmed' }
     for ($inspectionAttempt = 1; $inspectionAttempt -le 2 -and $null -eq $inspection; $inspectionAttempt++) {

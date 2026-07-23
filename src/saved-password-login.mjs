@@ -19,7 +19,9 @@ let loginUrl = config.savedLoginUrls?.[origin] ?? null;
 if (!loginUrl && requestedUrl) {
   try {
     const candidate = new URL(requestedUrl);
-    if (/\/(?:log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)/i.test(candidate.href)) loginUrl = candidate.href;
+    if (/\/(?:log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)|#\/(?:log[-_]?in|sign[-_]?in)(?:[/?#]|$)/i.test(candidate.href)) {
+      loginUrl = candidate.href;
+    }
   } catch { /* ignore invalid diagnostic URL */ }
 }
 loginUrl ??= `${origin}/login`;
@@ -58,7 +60,7 @@ try {
 
     if (filled) {
       let submit = null;
-      for (const label of ["登录", "登入", "Log in", "Sign in"]) {
+      for (const label of ["登录", "登入", "用户登录", "用戶登入", "Log in", "Sign in"]) {
         const candidate = page.getByRole("button", { name: label, exact: true });
         if (await candidate.count() === 1) { submit = candidate; break; }
       }

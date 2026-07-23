@@ -7,9 +7,21 @@ import { readBookmarkPlan, publicBookmarkReport } from "./bookmarks.mjs";
 import { launchAutomationContext, processTarget } from "./browser.mjs";
 import { cleanupOldLogs, createRunLog, writeRunResult } from "./logger.mjs";
 import { atomicWriteJson, ensurePrivateDirectory } from "./security.mjs";
-import { applyPreferredCandidates, loadSiteState, updateSiteState, writeSiteState } from "./site-state.mjs";
+import {
+  applyPreferredCandidates,
+  loadSiteState,
+  runWithRecentNotAvailableCache,
+  updateSiteState,
+  writeSiteState,
+} from "./site-state.mjs";
 import { loadQaCache, updateQaCache, writeQaCache } from "./qa-solver.mjs";
-import { TERMINAL_STATUSES, isCurrentLocalRunId, isRetryEligible, nextDeferredRetryAt } from "./retry-policy.mjs";
+import {
+  TERMINAL_STATUSES,
+  deferUnresolvedLogin,
+  isCurrentLocalRunId,
+  isRetryEligible,
+  nextDeferredRetryAt,
+} from "./retry-policy.mjs";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
@@ -158,8 +170,37 @@ try {
     const selectedTargets = limit
       ? originFilteredTargets.slice(offset, offset + limit)
       : originFilteredTargets.slice(offset);
-    const context = selectedTargets.length > 0 ? await launchAutomationContext(config) : null;
+    const plannedTotal = preferredTargets.length;
     const logicalCompletions = new Map();
+
+    const mergedProgressResults = () => {
+      if (!resumeBase) return [...results];
+      const currentByOrigin = new Map(results.map((result) => [result.origin, result]));
+      const previousByOrigin = new Map(resumeBase.results.map((result) => [result.origin, result]));
+      return preferredTargets
+        .map((target) => currentByOrigin.get(target.origin) ?? previousByOrigin.get(target.origin))
+        .filter(Boolean);
+    };
+
+    const writeProgress = async (phase, details = {}) => {
+      const progressResults = mergedProgressResults();
+      await atomicWriteJson(path.join(runLog.directory, "progress.json"), {
+        runId: runLog.runId,
+        runState: "in_progress",
+        isComplete: false,
+        phase,
+        plannedTotal,
+        processedTotal: progressResults.length,
+        completed: progressResults.length,
+        total: plannedTotal,
+        updatedAt: new Date().toISOString(),
+        ...details,
+        results: progressResults,
+      });
+    };
+
+    await writeProgress("initial");
+    const context = selectedTargets.length > 0 ? await launchAutomationContext(config) : null;
 
     const rememberLogicalCompletion = (target, result) => {
       const group = config.logicalCheckinGroups?.[target.origin];
@@ -182,10 +223,12 @@ try {
           durationMs: Date.now() - started,
         };
       }
-      const preflight = nativeWafPreflight.get(target.origin);
-      const result = preflight
-        ? { status: "signed", reason: preflight.reason, url: preflight.url, attempt: 1, nativePreflight: true }
-        : await processTarget(activeContext, target, config, qaRules, runLog.directory);
+      const result = await runWithRecentNotAvailableCache(target, siteState, config, async () => {
+        const preflight = nativeWafPreflight.get(target.origin);
+        return preflight
+          ? { status: "signed", reason: preflight.reason, url: preflight.url, attempt: 1, nativePreflight: true }
+          : processTarget(activeContext, target, config, qaRules, runLog.directory);
+      });
       const timed = { ...result, durationMs: Date.now() - started };
       rememberLogicalCompletion(target, timed);
       return timed;
@@ -202,13 +245,7 @@ try {
           folderNames: target.folderNames,
           ...targetResult,
         });
-        await atomicWriteJson(path.join(runLog.directory, "progress.json"), {
-          runId: runLog.runId,
-          completed: results.length,
-          total: selectedTargets.length,
-          updatedAt: new Date().toISOString(),
-          results,
-        });
+        await writeProgress("checkin");
       }
     } finally {
       await context?.close();
@@ -292,13 +329,9 @@ try {
               }],
             },
           };
-          await atomicWriteJson(path.join(runLog.directory, "progress.json"), {
-            runId: runLog.runId,
-            phase: `recovery_${round + 1}`,
-            completed: recoveryIndex + 1,
-            total: recoveryIndexes.length,
-            updatedAt: new Date().toISOString(),
-            results,
+          await writeProgress(`recovery_${round + 1}`, {
+            recoveryCompleted: recoveryIndex + 1,
+            recoveryTotal: recoveryIndexes.length,
           });
         }
       } finally {
@@ -306,17 +339,24 @@ try {
       }
     }
 
-    const finalResults = resumeBase
+    const finishedAt = new Date();
+    const assembledResults = resumeBase
       ? preferredTargets.map((target) => results.find((result) => result.origin === target.origin)
         ?? resumeBase.results.find((result) => result.origin === target.origin)
         ?? { origin: target.origin, title: target.title, folderNames: target.folderNames, status: "error", reason: "续跑未生成站点结果" })
       : results;
+    const finalResults = assembledResults.map((result) => deferUnresolvedLogin(result, config, finishedAt));
     const summary = Object.fromEntries(
       [...new Set(finalResults.map((result) => result.status))].map((status) => [status, finalResults.filter((result) => result.status === status).length])
     );
-    const finishedAt = new Date();
+    const processedTotal = finalResults.length;
+    const isComplete = processedTotal === plannedTotal;
     const output = {
       runId: runLog.runId,
+      runState: "final",
+      plannedTotal,
+      processedTotal,
+      isComplete,
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
       bookmarkSummary: report,
@@ -326,13 +366,13 @@ try {
     };
     const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);
     const resultPath = await writeRunResult(logsRoot, runLog, output, {
-      updateLatest: finalResults.length >= minimumTargets,
+      updateLatest: isComplete && finalResults.length >= minimumTargets,
     });
     await writeSiteState(siteStatePath, updateSiteState(siteState, results, finishedAt));
     await writeQaCache(qaCachePath, updateQaCache(qaCache, results, finishedAt));
     await fs.rm(nativeWafPreflightPath, { force: true }).catch(() => {});
     console.log(JSON.stringify({ resultPath, summary }, null, 2));
-    if (finalResults.some((result) => !TERMINAL_STATUSES.has(result.status))) {
+    if (!isComplete || finalResults.some((result) => !TERMINAL_STATUSES.has(result.status))) {
       process.exitCode = 2;
     }
   }

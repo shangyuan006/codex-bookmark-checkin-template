@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+$report = $null
 $results = @()
 
 function Compress-Text([object]$Value, [int]$MaximumLength = 120) {
@@ -22,11 +23,23 @@ function Compress-Text([object]$Value, [int]$MaximumLength = 120) {
 if ($ReportPath) {
     $resolvedReport = (Resolve-Path -LiteralPath $ReportPath).Path
     $logsRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'logs'))
-    if (-not $resolvedReport.StartsWith($logsRoot, [System.StringComparison]::OrdinalIgnoreCase)) { throw '报告必须位于本项目 logs 目录。' }
-    $results = @((Get-Content -Raw -Encoding UTF8 -LiteralPath $resolvedReport | ConvertFrom-Json).results)
+    $logsPrefix = $logsRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedReport.StartsWith($logsPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw '报告必须位于本项目 logs 目录。' }
+    $report = Get-Content -Raw -Encoding UTF8 -LiteralPath $resolvedReport | ConvertFrom-Json
+    $results = @($report.results)
 }
 
 $statuses = @($results | ForEach-Object { [string]$_.status })
+$reportRunState = if ($null -ne $report) { [string]$report.runState } else { '' }
+$plannedTotal = if ($null -ne $report -and $null -ne $report.plannedTotal) { [int]$report.plannedTotal } else { $results.Count }
+$processedTotal = if ($null -ne $report -and $null -ne $report.processedTotal) { [int]$report.processedTotal } else { $results.Count }
+$isCompleteFinalReport = $null -ne $report `
+    -and $reportRunState -eq 'final' `
+    -and $report.isComplete -eq $true `
+    -and $plannedTotal -gt 0 `
+    -and $processedTotal -ge $plannedTotal `
+    -and $results.Count -ge $plannedTotal
+$isPartialReport = $null -ne $report -and -not $isCompleteFinalReport
 $done = @($statuses | Where-Object { $_ -in @('signed', 'already_signed') }).Count
 $notAvailable = @($statuses | Where-Object { $_ -eq 'not_available' }).Count
 $problems = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
@@ -35,6 +48,7 @@ $timeoutCount = @($problems | Where-Object { $_.status -eq 'managed_challenge_ti
 $hardFailureCount = @($problems | Where-Object { $_.status -in @('error', 'failed') }).Count
 
 if ($RunnerStatus -eq 'timeout') { $status = 'timeout' }
+elseif ($isPartialReport) { $status = 'unconfirmed' }
 elseif ($results.Count -gt 0 -and $problems.Count -eq 0 -and $statuses -contains 'signed') { $status = 'success' }
 elseif ($results.Count -gt 0 -and $problems.Count -eq 0 -and $statuses -contains 'already_signed') { $status = 'already_done' }
 elseif ($results.Count -gt 0 -and $problems.Count -eq 0) { $status = 'skipped' }
@@ -48,23 +62,33 @@ elseif ($RunnerStatus -eq 'failed') { $status = 'failed' }
 elseif ($RunnerStatus -eq 'skipped') { $status = 'skipped' }
 else { $status = 'unconfirmed' }
 
-$summary = if ($results.Count -gt 0) { "共 $($results.Count) 站：`n$done 个签到正常`n$notAvailable 个未开放签到" } else { Compress-Text $RunnerMessage 160 }
+$summary = if ($results.Count -gt 0 -or ($null -ne $report -and $plannedTotal -gt 0)) {
+    $heading = if ($isCompleteFinalReport) { "共 $plannedTotal 站：" } else { "已处理 $processedTotal/$plannedTotal 站（任务未完成）：" }
+    "$heading`n$done 个签到正常`n$notAvailable 个未开放签到"
+}
+else { Compress-Text $RunnerMessage 160 }
 if ($problems.Count -gt 0) {
     $summary += "`n需关注 $($problems.Count) 个："
     $brief = @($problems | ForEach-Object {
-        $hostName = try { ([uri]$_.origin).DnsSafeHost } catch { Compress-Text $_.origin 30 }
-        $reason = switch ([string]$_.status) {
+        $problem = $_
+        $hostName = try { ([uri]$problem.origin).DnsSafeHost } catch { Compress-Text $problem.origin 30 }
+        $reason = switch ([string]$problem.status) {
             'login_required' { '登录失效' }
             'interactive_challenge' { '需要验证' }
             'managed_challenge_timeout' { '验证超时' }
             'deferred' {
-                if ($_.nextEligibleAt) { try { "限频，计划 $(([datetime]$_.nextEligibleAt).ToLocalTime().ToString('HH:mm')) 重试" } catch { '限频，已安排重试' } }
-                else { '限频，已安排重试' }
+                $retryLabel = switch ([string]$problem.retryCause) {
+                    'login_required' { '登录恢复未成功'; break }
+                    'managed_challenge_timeout' { '验证未自动通过'; break }
+                    default { '限频' }
+                }
+                if ($problem.nextEligibleAt) { try { "$retryLabel，计划 $(([datetime]$problem.nextEligibleAt).ToLocalTime().ToString('HH:mm')) 重试" } catch { "$retryLabel，已安排重试" } }
+                else { "$retryLabel，已安排重试" }
             }
             'no_action' { '未找到入口' }
             'visited' { '结果未确认' }
             'clicked' { '结果未确认' }
-            default { Compress-Text $_.reason 40 }
+            default { Compress-Text $problem.reason 40 }
         }
         "- $hostName：$reason"
     }) -join "`n"
@@ -72,9 +96,29 @@ if ($problems.Count -gt 0) {
 }
 if ($summary.Length -gt 950) { $summary = $summary.Substring(0, 947) + "…`n（其余站点请查看本地日志）" }
 
+$stateParts = @($results | Sort-Object origin | ForEach-Object {
+    "$([string]$_.origin)=$([string]$_.status):$([string]$_.retryCause)"
+})
+$stateMaterial = if ($stateParts.Count -gt 0) { "$status|$reportRunState|$($stateParts -join '|')" } else { "$status|$RunnerStatus" }
+$stateBytes = [System.Text.Encoding]::UTF8.GetBytes($stateMaterial)
+$stateHashBytes = [System.Security.Cryptography.SHA256]::HashData($stateBytes)
+$stateHash = [System.Convert]::ToHexString($stateHashBytes).Substring(0, 16).ToLowerInvariant()
+$eventKey = "external:browser-codex:bookmark_daily:$((Get-Date).ToString('yyyy-MM-dd')):$stateHash"
+
 $notification = $config.notification
 $mode = if ($notification.mode) { [string]$notification.mode } else { 'none' }
-$payload = [ordered]@{ status = $status; summary = $summary; siteCount = $results.Count; problemCount = $problems.Count; mode = $mode }
+$payload = [ordered]@{
+    status = $status
+    summary = $summary
+    siteCount = $results.Count
+    problemCount = $problems.Count
+    runState = $reportRunState
+    plannedTotal = $plannedTotal
+    processedTotal = $processedTotal
+    isComplete = [bool]$isCompleteFinalReport
+    eventKey = $eventKey
+    mode = $mode
+}
 if ($Preview -or $mode -eq 'none') {
     $payload.accepted = $false
     $payload.preview = [bool]$Preview
@@ -95,6 +139,7 @@ $values = @{
     '{taskId}' = [string]$notification.taskId
     '{name}' = [string]$notification.name
     '{source}' = [string]$notification.source
+    '{eventKey}' = $eventKey
 }
 $arguments = @($notification.arguments | ForEach-Object {
     $value = [string]$_

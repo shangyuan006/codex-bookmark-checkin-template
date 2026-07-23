@@ -32,24 +32,41 @@ function Read-SchedulerState {
 
 function Get-LatestReportState([datetime]$now, $config, [Nullable[datetime]]$notBefore = $null) {
     $latestPath = Join-Path $root 'logs\latest.json'
-    $empty = [pscustomobject]@{ Valid = $false; Complete = $false; NextEligibleAt = $null; RunId = $null; ProblemCount = $null }
+    $empty = [pscustomobject]@{
+        Valid = $false; Complete = $false; NextEligibleAt = $null; RunId = $null
+        ProblemCount = $null; RunState = $null; PlannedTotal = 0; ProcessedTotal = 0
+    }
     if (-not (Test-Path -LiteralPath $latestPath)) { return $empty }
     try {
         if ($null -ne $notBefore -and (Get-Item -LiteralPath $latestPath).LastWriteTime -lt ([datetime]$notBefore).AddSeconds(-2)) { return $empty }
         $latest = Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json
         $minimumTargets = [Math]::Max(1, [int]$config.minimumBookmarkTargetCount)
-        $valid = [string]$latest.runId -like "$($now.ToString('yyyyMMdd'))-*" -and @($latest.results).Count -ge $minimumTargets
+        $results = @($latest.results)
+        $runState = [string]$latest.runState
+        $plannedTotal = if ($null -ne $latest.plannedTotal) { [int]$latest.plannedTotal } else { 0 }
+        $processedTotal = if ($null -ne $latest.processedTotal) { [int]$latest.processedTotal } else { $results.Count }
+        $valid = [string]$latest.runId -like "$($now.ToString('yyyyMMdd'))-*" `
+            -and $runState -eq 'final' `
+            -and $results.Count -ge $minimumTargets `
+            -and $plannedTotal -ge $minimumTargets
         if (-not $valid) { return $empty }
-        $problems = @($latest.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+        $contractComplete = $latest.isComplete -eq $true `
+            -and $processedTotal -ge $plannedTotal `
+            -and $results.Count -ge $plannedTotal
+        $problems = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+        $missingCount = [Math]::Max(0, $plannedTotal - $processedTotal)
         $retryTimes = @($problems | Where-Object { $_.status -eq 'deferred' -and $_.nextEligibleAt } | ForEach-Object {
             try { [datetime]$_.nextEligibleAt } catch { }
         } | Where-Object { $_ -gt $now })
         return [pscustomobject]@{
             Valid = $true
-            Complete = $problems.Count -eq 0
+            Complete = $contractComplete -and $problems.Count -eq 0
             NextEligibleAt = if ($retryTimes.Count -gt 0) { @($retryTimes | Sort-Object)[0] } else { $null }
             RunId = [string]$latest.runId
-            ProblemCount = $problems.Count
+            ProblemCount = $problems.Count + $missingCount
+            RunState = $runState
+            PlannedTotal = $plannedTotal
+            ProcessedTotal = $processedTotal
         }
     }
     catch { return $empty }
@@ -120,6 +137,9 @@ function Write-SchedulerState([datetime]$finishedAt, [int]$exitCode, $reportStat
         reportComplete = [bool]$reportState.Complete
         lastRunId = $reportState.RunId
         problemCount = $reportState.ProblemCount
+        reportRunState = $reportState.RunState
+        plannedTotal = $reportState.PlannedTotal
+        processedTotal = $reportState.ProcessedTotal
         nextEligibleAt = $nextEligibleAt
     }
     $temporary = "$statePath.$PID.tmp"
@@ -158,7 +178,7 @@ try {
                 $finishedAt = Get-Date
                 $reportState = Get-LatestReportState $finishedAt $config $runStartedAt
                 Write-SchedulerState $finishedAt $process.ExitCode $reportState $config
-                Write-SchedulerLog "签到结束：退出码=$($process.ExitCode)，报告有效=$($reportState.Valid)，完整=$($reportState.Complete)，异常=$($reportState.ProblemCount)。"
+                Write-SchedulerLog "签到结束：退出码=$($process.ExitCode)，报告有效=$($reportState.Valid)，完整=$($reportState.Complete)，进度=$($reportState.ProcessedTotal)/$($reportState.PlannedTotal)，异常=$($reportState.ProblemCount)。"
             }
         }
         catch {

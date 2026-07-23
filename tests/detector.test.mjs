@@ -53,7 +53,9 @@ test("识别带连字符的登录路径", () => {
 });
 
 test("识别站点频率限制并延后处理", () => {
-  assert.equal(classifyPageText({ bodyText: "操作过于频繁，请稍后再试" }).status, "deferred");
+  const result = classifyPageText({ bodyText: "操作过于频繁，请稍后再试" });
+  assert.equal(result.status, "deferred");
+  assert.equal(result.retryCause, "rate_limit");
 });
 
 test("额度申请理由按上海日期生成唯一文案", () => {
