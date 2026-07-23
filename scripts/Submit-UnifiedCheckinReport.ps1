@@ -9,7 +9,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+$configPath = Join-Path $root 'config\config.json'
+$defaultsPath = Join-Path $root 'config\defaults.json'
+$effectiveConfigPath = if (Test-Path -LiteralPath $configPath) { $configPath } else { $defaultsPath }
+$config = Get-Content -Raw -Encoding UTF8 -LiteralPath $effectiveConfigPath | ConvertFrom-Json
 $report = $null
 $results = @()
 
