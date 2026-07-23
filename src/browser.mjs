@@ -132,6 +132,20 @@ async function clickCandidate(page, candidate) {
   await locator.click({ timeout: 10000 });
 }
 
+async function detectActiveQuotaBenefit(page, activeOrigin, config, status = "already_signed") {
+  if (!config.quotaRequestRules?.[activeOrigin]) return null;
+  const bodyText = String(await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+  const claimButton = page.getByRole("button", { name: "领取 Codex 权益", exact: true });
+  const claimButtonVisible = await claimButton.count() === 1 && await claimButton.isVisible().catch(() => false);
+  if (!claimButtonVisible
+    && /当前套餐\s*[-—:]?\s*Codex/i.test(bodyText)
+    && /剩余(?:额度|額度)|下次重置|有效期/i.test(bodyText)
+    && !/已过期|已過期/i.test(bodyText)) {
+    return { status, reason: "Codex 权益已领取，页面显示有效套餐" };
+  }
+  return null;
+}
+
 async function tryQuotaRequestFlow(page, activeOrigin, config) {
   const rule = config.quotaRequestRules?.[activeOrigin];
   if (!rule) return null;
@@ -163,14 +177,8 @@ async function tryQuotaRequestFlow(page, activeOrigin, config) {
   if (["signed", "already_signed"].includes(state.status)) return state;
   const bodyText = String(await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
   if (/(额度申请已提交|申请额度成功|额度已发放|额度申请成功|申请成功.*额度|今日已申请|今天已申请|codex\s*(?:权益|權益)\s*已(?:领取|領取)|(?:领取|領取)\s*codex\s*(?:权益|權益)\s*成功)/i.test(bodyText)) return { status: "signed", reason: "额度申请已提交并获得页面确认" };
-  const claimButton = page.getByRole("button", { name: "领取 Codex 权益", exact: true });
-  const claimButtonVisible = await claimButton.count() === 1 && await claimButton.isVisible().catch(() => false);
-  if (!claimButtonVisible
-    && /当前套餐\s*[-—:]?\s*Codex/i.test(bodyText)
-    && /剩余(?:额度|額度)|下次重置|有效期/i.test(bodyText)
-    && !/已过期|已過期/i.test(bodyText)) {
-    return { status: "signed", reason: "Codex 权益已领取，页面显示有效套餐" };
-  }
+  const activeBenefit = await detectActiveQuotaBenefit(page, activeOrigin, config, "signed");
+  if (activeBenefit) return activeBenefit;
   return { status: "unconfirmed", reason: "额度申请已提交，但页面未确认结果" };
 }
 
@@ -603,6 +611,9 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
 
   const hddolbyResult = await tryHddolbyPostRedirectVerification(page, activeOrigin, config);
   if (hddolbyResult) return { ...hddolbyResult, url: safeLogUrl(page.url()) };
+
+  const activeBenefit = await detectActiveQuotaBenefit(page, activeOrigin, config);
+  if (activeBenefit) return { ...activeBenefit, url: safeLogUrl(page.url()) };
 
   const visitRule = (config.visitCheckinRules ?? {})[activeOrigin];
   if (visitRule?.after) {

@@ -326,7 +326,10 @@ try {
       summary,
       results: finalResults,
     };
-    const resultPath = await writeRunResult(logsRoot, runLog, output);
+    const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);
+    const resultPath = await writeRunResult(logsRoot, runLog, output, {
+      updateLatest: finalResults.length >= minimumTargets,
+    });
     await writeSiteState(siteStatePath, updateSiteState(siteState, results, finishedAt));
     await writeQaCache(qaCachePath, updateQaCache(qaCache, results, finishedAt));
     await fs.rm(nativeWafPreflightPath, { force: true }).catch(() => {});

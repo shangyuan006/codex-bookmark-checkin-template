@@ -13,9 +13,25 @@ $mutex = [System.Threading.Mutex]::new($true, $mutexName, [ref]$mutexCreated)
 if (-not $mutexCreated) { exit 0 }
 
 function Read-SchedulerState {
-    if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ lastRunDate = $null } }
+    if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ lastRunDate = $null; lastAttemptDate = $null } }
     try { return Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json }
-    catch { return [pscustomobject]@{ lastRunDate = $null } }
+    catch { return [pscustomobject]@{ lastRunDate = $null; lastAttemptDate = $null } }
+}
+
+function Write-SchedulerClaim([datetime]$startedAt) {
+    $state = Read-SchedulerState
+    $value = [ordered]@{
+        lastAttemptDate = $startedAt.ToString('yyyy-MM-dd')
+        lastAttemptStartedAt = $startedAt.ToString('o')
+        lastRunDate = $state.lastRunDate
+        lastFinishedAt = $state.lastFinishedAt
+        lastExitCode = $state.lastExitCode
+        lastRunId = $state.lastRunId
+        reportValid = $state.reportValid
+    }
+    $temporary = "$statePath.$PID.tmp"
+    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $statePath -Force
 }
 
 function Write-SchedulerHeartbeat([string]$phase) {
@@ -43,6 +59,7 @@ function Write-SchedulerState([datetime]$finishedAt, [int]$exitCode, [bool]$repo
         try { $latestRunId = [string](Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json).runId } catch { }
     }
     $state = [ordered]@{
+        lastAttemptDate = $finishedAt.ToString('yyyy-MM-dd')
         lastRunDate = if ($reportValid) { $finishedAt.ToString('yyyy-MM-dd') } else { $null }
         lastFinishedAt = $finishedAt.ToString('o')
         lastExitCode = $exitCode
@@ -65,12 +82,14 @@ try {
             $now = Get-Date
             $scheduledToday = [datetime]::ParseExact("$($now.ToString('yyyy-MM-dd')) $schedule", 'yyyy-MM-dd HH:mm', $null)
             $state = Read-SchedulerState
-            $alreadyRanToday = [string]$state.lastRunDate -eq $now.ToString('yyyy-MM-dd') -and (Test-LatestReportValid $now $config)
+            $alreadyRanToday = [string]$state.lastAttemptDate -eq $now.ToString('yyyy-MM-dd') `
+                -or ([string]$state.lastRunDate -eq $now.ToString('yyyy-MM-dd') -and (Test-LatestReportValid $now $config))
 
             if (-not $alreadyRanToday -and $now -ge $scheduledToday) {
                 Write-SchedulerHeartbeat 'running_checkin'
                 $runScript = Join-Path $PSScriptRoot 'Run-Checkin.ps1'
                 $runStartedAt = Get-Date
+                Write-SchedulerClaim $runStartedAt
                 $shell = (Get-Command pwsh,powershell -ErrorAction SilentlyContinue | Select-Object -First 1).Source
                 if (-not $shell) { throw '未找到 PowerShell 可执行文件。' }
                 $process = Start-Process -FilePath $shell -ArgumentList @(

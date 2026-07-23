@@ -28,12 +28,10 @@ $activeAutomationChrome = @(Get-CimInstance Win32_Process -Filter "Name='chrome.
 })
 if ($activeAutomationChrome.Count -gt 0) { throw '机器人专用 Chrome 正在运行，不能同步登录记录。' }
 
-$source = Join-Path ([string]$config.sourceUserDataDir) "$([string]$config.sourceProfileDirectory)\Login Data"
-$target = Join-Path $profilePath 'Default\Login Data'
 $python = Resolve-CheckinPython $config
 $helper = Join-Path $PSScriptRoot 'Sync-ChromeSavedLogins.py'
 
-foreach ($required in @($source, $target, $python, $helper)) {
+foreach ($required in @($python, $helper)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "登录同步所需文件不存在：$required" }
 }
 
@@ -44,7 +42,17 @@ if (-not $sourceState.os_crypt.encrypted_key -or $sourceState.os_crypt.encrypted
 }
 
 $allowedJson = ConvertTo-Json -InputObject @($allowedHosts) -Compress
-$resultText = & $python $helper $source $target $allowedJson
-if ($LASTEXITCODE -ne 0) { throw "Chrome 登录记录同步失败，退出码 $LASTEXITCODE。" }
-$result = $resultText | ConvertFrom-Json
-Write-Output "已为 $([int]$result.origins) 个书签来源同步 $([int]$result.copied) 条加密登录记录。"
+$copied = 0
+$databases = 0
+foreach ($databaseName in @('Login Data', 'Login Data For Account')) {
+    $source = Join-Path ([string]$config.sourceUserDataDir) "$([string]$config.sourceProfileDirectory)\$databaseName"
+    $target = Join-Path $profilePath "Default\$databaseName"
+    if (-not (Test-Path -LiteralPath $source) -or -not (Test-Path -LiteralPath $target)) { continue }
+    $resultText = & $python $helper $source $target $allowedJson
+    if ($LASTEXITCODE -ne 0) { throw "Chrome 登录记录同步失败（$databaseName），退出码 $LASTEXITCODE。" }
+    $result = $resultText | ConvertFrom-Json
+    $copied += [int]$result.copied
+    $databases += 1
+}
+if ($databases -eq 0) { throw '未找到可同步的 Chrome 登录数据库。' }
+Write-Output "已从 $databases 个 Chrome 密码库为 $($allowedHosts.Count) 个书签来源同步 $copied 条加密登录记录。"

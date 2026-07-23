@@ -14,11 +14,11 @@ export async function createRunLog(rootDirectory) {
   return { runId, directory };
 }
 
-export async function writeRunResult(rootDirectory, runLog, result) {
+export async function writeRunResult(rootDirectory, runLog, result, { updateLatest = true } = {}) {
   const runFile = path.join(runLog.directory, "result.json");
   const latestFile = path.join(rootDirectory, "latest.json");
   await atomicWriteJson(runFile, result);
-  await atomicWriteJson(latestFile, result);
+  if (updateLatest) await atomicWriteJson(latestFile, result);
   return runFile;
 }
 

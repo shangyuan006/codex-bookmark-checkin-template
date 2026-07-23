@@ -30,17 +30,13 @@ try {
   const page = await context.newPage();
   await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
   await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+  await page.locator('input[type="password"]:visible').first().waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
 
-  const password = page.locator('input[type="password"]:visible');
-  const username = page.locator([
-    'input[type="email"]:visible',
-    'input[name*="user" i]:visible',
-    'input[name*="login" i]:visible',
-    'input[name*="email" i]:visible',
-    'input[type="text"]:visible',
-  ].join(", "));
+  const password = page.locator('input[type="password"]:visible').first();
+  const username = page.locator('input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"])').first();
+  await username.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
   let status = "unsupported";
-  if (await password.count() === 1 && await username.count() === 1) {
+  if (await password.count() >= 1 && await username.count() >= 1) {
     let filled = await page.evaluate(() => {
       const secret = document.querySelector('input[type="password"]');
       const identity = document.querySelector('input[type="email"], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[type="text"]');
