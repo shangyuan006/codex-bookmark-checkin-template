@@ -121,6 +121,7 @@ test("登录恢复可从 Bookmarks.bak 找到主文件缺失的目标", async ()
   });
   assert.equal(fallbackPlan.targetCount, 1);
   assert.equal(fallbackPlan.recoveredFromBackup, true);
+  assert.equal(fallbackPlan.bookmarkPath, `${file}.bak`);
   const fallbackCandidates = await listBookmarkFolderCandidatesWithBackup(file);
   assert.equal(fallbackCandidates.recoveredFromBackup, true);
   assert.ok(fallbackCandidates.candidates.some((value) => value.name === "我的自动任务"));

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { listBookmarkFolderCandidatesWithBackup, readBookmarkPlanWithBackup } from "./bookmarks.mjs";
+import { listBookmarkFolderCandidates, listBookmarkFolderCandidatesWithBackup, readBookmarkPlanWithBackup } from "./bookmarks.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const defaults = JSON.parse(await fs.readFile(path.join(root, "config", "defaults.json"), "utf8"));
@@ -39,7 +39,6 @@ async function inspectProfiles(userDataDir) {
     const bookmarksPath = path.join(userDataDir, entry.name, "Bookmarks");
     if (!(await exists(bookmarksPath))) continue;
     try {
-      const folderReport = await listBookmarkFolderCandidatesWithBackup(bookmarksPath);
       const plan = scopeProvided
         ? await readBookmarkPlanWithBackup(bookmarksPath, {
           ...defaults,
@@ -47,6 +46,12 @@ async function inspectProfiles(userDataDir) {
           targetFolderNames: requestedScope.targetFolderNames,
         })
         : null;
+      const folderReport = plan
+        ? {
+          candidates: await listBookmarkFolderCandidates(plan.bookmarkPath),
+          recoveredFromBackup: plan.recoveredFromBackup,
+        }
+        : await listBookmarkFolderCandidatesWithBackup(bookmarksPath);
       profiles.push({
         name: entry.name,
         bookmarksPath,

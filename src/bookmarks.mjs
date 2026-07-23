@@ -242,7 +242,7 @@ export async function readBookmarkPlanWithBackup(bookmarksPath, options = {}) {
   for (let index = 0; index < candidates.length; index += 1) {
     try {
       const plan = await readBookmarkPlan(candidates[index], options);
-      if (plan.targetCount > 0) return { ...plan, recoveredFromBackup: index > 0 };
+      if (plan.targetCount > 0) return { ...plan, bookmarkPath: candidates[index], recoveredFromBackup: index > 0 };
       failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"} 中没有签到目标`);
     } catch (error) {
       failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"}：${error.message}`);
