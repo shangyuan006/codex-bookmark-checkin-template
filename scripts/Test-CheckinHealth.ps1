@@ -62,7 +62,7 @@ $checks = [ordered]@{
     latestSiteCount = if ($latest) { @($latest.results).Count } else { $null }
     latestProblemCount = $problemCount
     schedulerAttemptsToday = if ($schedulerState) { [int]$schedulerState.attemptsToday } else { 0 }
-    schedulerNextEligibleAt = if ($schedulerState) { [string]$schedulerState.nextEligibleAt } else { $null }
+    schedulerNextEligibleAt = if ($schedulerState -and $schedulerState.nextEligibleAt) { try { ([datetime]$schedulerState.nextEligibleAt).ToString('o') } catch { [string]$schedulerState.nextEligibleAt } } else { $null }
     schedulerReportComplete = if ($schedulerState) { [bool]$schedulerState.reportComplete } else { $false }
     checks = $checks
 } | ConvertTo-Json -Depth 6
