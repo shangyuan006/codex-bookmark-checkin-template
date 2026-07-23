@@ -11,6 +11,8 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $latestPath = Join-Path $root 'logs\latest.json'
 $statePath = Join-Path $root 'data\site-state.json'
+$notificationQuarantinePath = Join-Path $root 'data\notification-outbox\quarantine'
+$notificationQuarantinedCount = @(Get-ChildItem -LiteralPath $notificationQuarantinePath -Filter '*.invalid.json' -File -ErrorAction SilentlyContinue).Count
 $taskName = if ($config.schedulerTaskName) { [string]$config.schedulerTaskName } else { 'CodexBookmarkDailyCheckin' }
 $runKeyName = if ($config.schedulerRunKeyName) { [string]$config.schedulerRunKeyName } else { 'CodexBookmarkDailyCheckin' }
 $scheduledTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -44,6 +46,7 @@ $checks = [ordered]@{
     chromeExecutablePresent = Test-Path -LiteralPath ([string]$config.chromeExecutable)
     automationProfilePresent = Test-Path -LiteralPath (Join-Path ([string]$config.automationUserDataDir) 'Local State')
     notificationReady = [bool]$notificationReady
+    notificationOutboxClean = $notificationQuarantinedCount -eq 0
     schedulerReady = [bool]$scheduledTask -or [bool]$runValue
     schedulerUnique = if ($scheduledTask) { $true } else { $schedulerCount -eq 1 -and $watchdogCount -eq 1 }
     schedulerHeartbeatFresh = [bool]$heartbeatFresh
@@ -64,5 +67,6 @@ $checks = [ordered]@{
     schedulerAttemptsToday = if ($schedulerState) { [int]$schedulerState.attemptsToday } else { 0 }
     schedulerNextEligibleAt = if ($schedulerState -and $schedulerState.nextEligibleAt) { try { ([datetime]$schedulerState.nextEligibleAt).ToString('o') } catch { [string]$schedulerState.nextEligibleAt } } else { $null }
     schedulerReportComplete = if ($schedulerState) { [bool]$schedulerState.reportComplete } else { $false }
+    notificationQuarantinedCount = $notificationQuarantinedCount
     checks = $checks
 } | ConvertTo-Json -Depth 6

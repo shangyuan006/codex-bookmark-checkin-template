@@ -7,7 +7,12 @@ import { listBookmarkFolderCandidates, listBookmarkFolderCandidatesWithBackup, r
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const defaults = JSON.parse(await fs.readFile(path.join(root, "config", "defaults.json"), "utf8"));
 const scopeIndex = process.argv.indexOf("--scope-json");
-const requestedScope = scopeIndex >= 0 ? JSON.parse(String(process.argv[scopeIndex + 1] ?? "{}")) : null;
+const scopeBase64Index = process.argv.indexOf("--scope-json-base64");
+const requestedScope = scopeBase64Index >= 0
+  ? JSON.parse(Buffer.from(String(process.argv[scopeBase64Index + 1] ?? ""), "base64").toString("utf8"))
+  : scopeIndex >= 0
+    ? JSON.parse(String(process.argv[scopeIndex + 1] ?? "{}"))
+    : null;
 const scopeProvided = Array.isArray(requestedScope?.mobileFolderNames)
   && requestedScope.mobileFolderNames.length > 0
   && Array.isArray(requestedScope?.targetFolderNames)

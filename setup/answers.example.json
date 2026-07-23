@@ -4,9 +4,9 @@
   "targetFolderNames": [],
   "schedule": "08:05",
   "useBuiltInSiteRules": true,
-  "syncChromeSavedLogins": true,
+  "syncChromeSavedLogins": false,
   "autoDetectLinuxDoOAuth": true,
-  "qaWebSearchEnabled": true,
+  "qaWebSearchEnabled": false,
   "checkinMessage": "今日天气不错",
   "notification": {
     "mode": "none",

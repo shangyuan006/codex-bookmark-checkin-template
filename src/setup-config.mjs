@@ -24,6 +24,15 @@ async function exists(filePath) {
   return fs.access(filePath).then(() => true).catch(() => false);
 }
 
+async function findOnPath(executableName) {
+  const pathValue = process.env.Path ?? process.env.PATH ?? "";
+  for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(directory, executableName);
+    if (await exists(candidate)) return path.resolve(candidate);
+  }
+  return null;
+}
+
 async function findChrome() {
   const configured = process.env.CHROME_EXECUTABLE;
   const roots = [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA].filter(Boolean);
@@ -92,6 +101,8 @@ if (answers.chromeProfile && answers.chromeProfile !== "Auto") {
 if (selected.targetCount === 0) throw new Error("所选 Chrome 配置中没有找到目标书签目录，请检查目录名称后重试");
 
 const windowsPowerShell = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+const preferredPowerShell = await findOnPath("pwsh.exe")
+  ?? (await exists(windowsPowerShell) ? windowsPowerShell : "pwsh.exe");
 config = deepMerge(config, {
   bookmarksPath: selected.bookmarksPath,
   sourceUserDataDir,
@@ -100,7 +111,7 @@ config = deepMerge(config, {
   chromeExecutable: await findChrome(),
   nodeExecutable: process.execPath,
   pythonExecutable: answers.pythonExecutable ?? "",
-  powershellExecutable: answers.powershellExecutable ?? (await exists(windowsPowerShell) ? windowsPowerShell : "pwsh.exe"),
+  powershellExecutable: answers.powershellExecutable || preferredPowerShell,
   schedulerTaskName: "CodexBookmarkDailyCheckin",
   schedulerRunKeyName: "CodexBookmarkDailyCheckin",
 });

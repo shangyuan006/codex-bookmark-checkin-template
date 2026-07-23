@@ -38,6 +38,8 @@ pwsh -NoProfile -File .\scripts\Test-Environment.ps1 `
 - Windows 计划任务从签到时间起按小时做无副作用探测，用户级调度器按分钟探测；两者都受每日次数上限和运行锁保护。
 - 主 Chrome 配置只作为只读来源；后台运行始终使用独立配置，并为原生登录窗口禁用同步。
 - 默认不配置外部通知。用户可选择安全的命令型通知器，敏感值应从环境变量或凭据管理器读取。
+- 主 Chrome 保存密码同步和外部问答搜索默认关闭；初始化问卷获得明确授权后才启用，未授权时不会读取密码库或访问搜索引擎。
+- 机器人 Chrome 默认关闭 Chromium 的本地大模型下载；限频重试采用有界指数退避，达到当日上限后转到次日计划时间，避免空转。
 
 Chrome 保存密码和 OAuth 都无法恢复的站点，可选择使用 Windows DPAPI 凭据。运行 `scripts\Set-ProtectedSiteCredential.ps1 -Origin https://example.com` 交互录入，用户名和密码不会显示；密文只写入被 Git 忽略的 `data\credentials\`，且仅能由当前 Windows 用户解密。随后在本机 `config/config.json` 的 `protectedCredentialOrigins` 中加入站点，并按需配置 `protectedLoginVerificationPaths` 和 `siteStorageBootstrap`。登录器只通过子进程标准输入接收临时明文，不写命令行或日志。
 
@@ -58,6 +60,13 @@ npm test
 pwsh -NoProfile -File .\scripts\Scan-PublicSafety.ps1
 ```
 
+机器人 Chrome 未运行时，可先只读查看可清理缓存；确认后再显式应用。脚本只允许操作项目 `data` 下的独立资料目录，不删除 Cookie、保存密码、站点存储、IndexedDB 或 Service Worker：
+
+```powershell
+pwsh -NoProfile -File .\scripts\Clear-AutomationChromeCache.ps1
+pwsh -NoProfile -File .\scripts\Clear-AutomationChromeCache.ps1 -Apply
+```
+
 不使用 GitHub 时，可在完成本地提交后生成只包含 Git 已跟踪文件的安全分享包：
 
 ```powershell
@@ -66,4 +75,6 @@ pwsh -NoProfile -File .\scripts\Export-PublicBundle.ps1
 
 项目目前面向 Windows 10/11 与桌面版 Chrome。电脑休眠或关机错过计划时间后，用户级调度器会在当天恢复登录后补跑。
 
-自定义通知器应接受参数数组，支持 `{status}`、`{summary}`、`{taskId}`、`{name}`、`{source}` 和 `{eventKey}` 占位符。`{eventKey}` 按“日期 + 站点状态指纹”生成：相同结果重复执行会去重，异常解决后的新结果仍可发送。实现不会使用 `Invoke-Expression`，也不会读取任何 Telegram Bot Token。
+自定义通知器应接受参数数组，支持 `{status}`、`{summary}`、`{taskId}`、`{name}`、`{source}` 和 `{eventKey}` 占位符。`{eventKey}` 按“日期 + 站点状态指纹”生成：相同结果重复执行会去重，异常解决后的新结果仍可发送。`executable` 只直接接受原生 `.exe/.com`；脚本通知应使用 `pwsh.exe -File script.ps1` 或 `node.exe script.mjs` 的参数形式，避免站点文本经过命令解释器。通知先原子写入本地 `data/notification-outbox`，再由独立投递器执行命令；命令需返回包含 `accepted=true` 或 `duplicate=true` 的 JSON 才算送达。缺失或不匹配 `payloadHash` 的条目会进入 `quarantine`，失败只按退避时间重发通知，不会重新运行浏览器签到。`mode=none` 和预览模式不会发送、也不会创建 outbox 条目。实现不会使用 `Invoke-Expression`，也不会读取任何 Telegram Bot Token。
+
+签到进程锁同时校验 PID、进程启动时间和随机 nonce。进程崩溃、PID 被系统复用或外层超时强杀后，旧锁会安全回收；仍在运行的签到进程会继续阻止并发访问同一个自动化 Chrome 配置。

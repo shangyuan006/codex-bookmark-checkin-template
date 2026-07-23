@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$DryRun,
     [switch]$SuppressReport,
@@ -8,13 +8,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+. (Join-Path $PSScriptRoot 'RunLock.ps1')
 $reporterScript = Join-Path $PSScriptRoot 'Submit-UnifiedCheckinReport.ps1'
+$outboxScript = Join-Path $PSScriptRoot 'Invoke-CheckinNotificationOutbox.ps1'
+$runLockPath = Join-Path $root 'tmp\run.lock'
 $startedAt = Get-Date
 $runnerStatus = 'failed'
 $runnerMessage = '签到任务尚未开始。'
 $nodeExitCode = 1
 $locationPushed = $false
 $resumeCandidate = $null
+$wrapperMutex = $null
+$wrapperMutexOwned = $false
 
 function Get-FreshResumeReport([datetime]$NotBefore) {
     $logsRoot = Join-Path $root 'logs'
@@ -97,6 +102,18 @@ function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
     return $false
 }
 
+function Test-NeedsSavedLoginSync($ResumeCandidate, [datetime]$Now) {
+    if ($null -eq $ResumeCandidate) { return $true }
+    foreach ($result in @($ResumeCandidate.Report.results)) {
+        $isLoginProblem = [string]$result.status -eq 'login_required' `
+            -or ([string]$result.status -eq 'deferred' -and [string]$result.retryCause -eq 'login_required')
+        if (-not $isLoginProblem) { continue }
+        try { if (-not $result.nextEligibleAt -or [datetime]$result.nextEligibleAt -le $Now) { return $true } }
+        catch { return $true }
+    }
+    return $false
+}
+
 try {
     Push-Location $root
     $locationPushed = $true
@@ -104,6 +121,18 @@ try {
     if (-not (Test-Path -LiteralPath $configPath)) { throw '尚未初始化，请先运行 scripts\Initialize-Checkin.ps1。' }
     $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
     $node = Resolve-CheckinNode $config
+
+    $wrapperMutexName = if ($config.runMutexName) { [string]$config.runMutexName } else { 'Local\CodexBookmarkCheckinRun' }
+    $wrapperMutex = [System.Threading.Mutex]::new($false, $wrapperMutexName)
+    try { $wrapperMutexOwned = $wrapperMutex.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $wrapperMutexOwned = $true }
+    if (-not $wrapperMutexOwned) {
+        $runnerStatus = 'busy'
+        $runnerMessage = '已有一个签到 wrapper 正在运行，本次不重复启动。'
+        $nodeExitCode = 0
+        $SuppressReport = $true
+        return
+    }
 
     $timeoutMinutes = if ($null -ne $config.taskTimeoutMinutes) { [int]$config.taskTimeoutMinutes } else { 25 }
     if ($timeoutMinutes -lt 5 -or $timeoutMinutes -gt 55) { throw 'taskTimeoutMinutes 必须为 5 到 55 分钟。' }
@@ -116,11 +145,14 @@ try {
     $arguments = @((Join-Path $root 'src\index.mjs'))
     if ($DryRun) { $arguments += '--dry-run' }
 
-    if (-not $DryRun -and (@($config.syncSavedLoginOrigins).Count -gt 0 -or $config.syncBookmarkSavedLogins -ne $false)) {
+    if (-not $DryRun) { $resumeCandidate = Get-TodayResumeReport }
+
+    $shouldSyncSavedLogins = -not $DryRun `
+        -and (Test-NeedsSavedLoginSync $resumeCandidate (Get-Date)) `
+        -and $config.syncBookmarkSavedLogins -eq $true
+    if ($shouldSyncSavedLogins) {
         & (Join-Path $PSScriptRoot 'Sync-ChromeSavedLogins.ps1')
     }
-
-    if (-not $DryRun) { $resumeCandidate = Get-TodayResumeReport }
 
     if ($DryRun) {
         & $node @arguments
@@ -146,13 +178,24 @@ try {
             Write-Output "开始签到任务级尝试 $attempt/$runAttempts。"
             $attemptStartedAt = Get-Date
             $process = Start-Process -FilePath $node -ArgumentList $runArguments -NoNewWindow -PassThru
+            $processStartedAt = $process.StartTime
             $finishedInTime = $process.WaitForExit($timeoutMinutes * 60 * 1000)
             if (-not $finishedInTime) {
                 try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
-                [void]$process.WaitForExit(10000)
                 $nodeExitCode = 124
                 $runnerStatus = 'timeout'
                 $runnerMessage = "第 $attempt 次尝试超过 $timeoutMinutes 分钟。"
+                $processExited = $false
+                try { $processExited = $process.WaitForExit(10000) } catch { }
+                try { $process.Refresh(); $processExited = $processExited -or $process.HasExited } catch { }
+                if (-not $processExited) {
+                    $runnerStatus = 'timeout_process_alive'
+                    $runnerMessage = "第 $attempt 次尝试超时且子进程仍存活；保留运行锁，拒绝并发重试。"
+                    $SuppressReport = $true
+                    Write-Warning $runnerMessage
+                    break
+                }
+                [void](Remove-RunLockOwnedByProcess -LockPath $runLockPath -ProcessId $process.Id -ProcessStartedAt $processStartedAt)
             }
             else {
                 $nodeExitCode = $process.ExitCode
@@ -192,10 +235,15 @@ finally {
         }
         catch {
             Write-Warning "结果通知失败：$($_.Exception.Message)"
-            if ($nodeExitCode -eq 0) { $nodeExitCode = 3 }
         }
+        try { & $outboxScript | Out-Null }
+        catch { Write-Warning "通知 outbox 暂未送达，将由后台调度器重试：$($_.Exception.Message)" }
     }
     if ($locationPushed) { Pop-Location }
+    if ($wrapperMutexOwned -and $null -ne $wrapperMutex) {
+        try { $wrapperMutex.ReleaseMutex() | Out-Null } catch { }
+    }
+    if ($null -ne $wrapperMutex) { $wrapperMutex.Dispose() }
 }
 
 exit $nodeExitCode

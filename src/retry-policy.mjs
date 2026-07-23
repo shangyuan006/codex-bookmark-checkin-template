@@ -35,6 +35,15 @@ export function nextShanghaiTime(time, now = new Date()) {
   return new Date(utcMidnight - 8 * 60 * 60 * 1000 + requestedMinutes * 60 * 1000).toISOString();
 }
 
+export function nextShanghaiTimeNextDay(time, now = new Date()) {
+  const match = String(time ?? "").match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return null;
+  const parts = shanghaiParts(now);
+  const requestedMinutes = Number(match[1]) * 60 + Number(match[2]);
+  const utcMidnight = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day) + 1);
+  return new Date(utcMidnight - 8 * 60 * 60 * 1000 + requestedMinutes * 60 * 1000).toISOString();
+}
+
 export function withRetrySchedule(result, config = {}, now = new Date()) {
   if (result?.status !== "deferred") return result;
   const existing = Date.parse(result.nextEligibleAt ?? "");
@@ -52,6 +61,49 @@ export function withRetrySchedule(result, config = {}, now = new Date()) {
     nextEligibleAt: (requestedTime ? nextShanghaiTime(requestedTime, now) : null)
       ?? new Date(now.getTime() + delayMs).toISOString(),
   };
+}
+
+export function advanceDeferredRetry(result, previous, config = {}, now = new Date()) {
+  if (result?.status !== "deferred") return result;
+  const sameCause = previous?.status === "deferred"
+    && String(previous.retryCause || "") === String(result.retryCause || "");
+  const currentDate = localRunDate(now);
+  const sameDate = String(previous?.retrySequenceDate || "") === currentDate;
+  const previousSequence = Math.max(0, Number(previous?.retrySequence) || (sameCause && sameDate ? 1 : 0));
+  const retrySequence = sameCause && sameDate ? previousSequence + 1 : 1;
+  if (result.retryCause !== "rate_limit") return { ...result, retrySequence, retrySequenceDate: currentDate };
+
+  const baseDelay = Math.max(60_000, Number(config.rateLimitRetryDelayMs) || 60 * 60 * 1000);
+  const maxDelay = Math.max(baseDelay, Number(config.rateLimitMaxDelayMs) || 6 * 60 * 60 * 1000);
+  const maxDailyAttempts = Math.max(1, Math.min(6, Number(config.rateLimitMaxDailyAttempts) || 3));
+  if (retrySequence >= maxDailyAttempts) {
+    const nextDayTime = [config.rateLimitNextDayTime, config.schedule, "08:05"]
+      .map((value) => String(value ?? ""))
+      .find((value) => /^([01]\d|2[0-3]):[0-5]\d$/.test(value)) || "08:05";
+    return {
+      ...result,
+      retrySequence,
+      retrySequenceDate: currentDate,
+      retryExhaustedForDay: true,
+      nextEligibleAt: nextShanghaiTimeNextDay(nextDayTime, now),
+    };
+  }
+  const delayMs = Math.min(maxDelay, baseDelay * (2 ** (retrySequence - 1)));
+  return {
+    ...result,
+    retrySequence,
+    retrySequenceDate: currentDate,
+    retryExhaustedForDay: false,
+    nextEligibleAt: new Date(now.getTime() + delayMs).toISOString(),
+  };
+}
+
+export function advanceAttemptedDeferredRetries(results, attemptedOrigins, previousResults, config = {}, now = new Date()) {
+  const attempted = attemptedOrigins instanceof Set ? attemptedOrigins : new Set(attemptedOrigins ?? []);
+  const previousByOrigin = new Map((previousResults ?? []).map((result) => [result.origin, result]));
+  return (results ?? []).map((result) => attempted.has(result.origin)
+    ? advanceDeferredRetry(result, previousByOrigin.get(result.origin), config, now)
+    : result);
 }
 
 export function deferUnresolvedLogin(result, config = {}, now = new Date()) {

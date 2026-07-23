@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  advanceAttemptedDeferredRetries,
+  advanceDeferredRetry,
   deferUnresolvedLogin,
   isCurrentLocalRunId,
   isRetryEligible,
@@ -20,6 +22,72 @@ test("频率限制会获得有界的下次执行时间", () => {
   assert.equal(result.retryCause, "rate_limit");
   assert.equal(isRetryEligible(result, now), false);
   assert.equal(isRetryEligible(result, new Date("2026-07-23T06:00:01Z")), true);
+});
+
+test("同站限频使用指数退避并在达到上限后转到次日", () => {
+  const config = {
+    schedule: "08:05",
+    rateLimitRetryDelayMs: 3600000,
+    rateLimitMaxDelayMs: 21600000,
+    rateLimitMaxDailyAttempts: 3,
+  };
+  const now = new Date("2026-07-23T12:00:00Z");
+  const first = advanceDeferredRetry({ status: "deferred", retryCause: "rate_limit" }, null, config, now);
+  const second = advanceDeferredRetry({ status: "deferred", retryCause: "rate_limit" }, first, config, now);
+  const third = advanceDeferredRetry({ status: "deferred", retryCause: "rate_limit" }, second, config, now);
+  assert.equal(first.nextEligibleAt, "2026-07-23T13:00:00.000Z");
+  assert.equal(second.nextEligibleAt, "2026-07-23T14:00:00.000Z");
+  assert.equal(third.nextEligibleAt, "2026-07-24T00:05:00.000Z");
+  assert.equal(third.retryExhaustedForDay, true);
+});
+
+test("续跑只推进本轮真正尝试过的站点", () => {
+  const now = new Date("2026-07-23T12:00:00Z");
+  const previous = [
+    { origin: "https://wait.test", status: "deferred", retryCause: "rate_limit", retrySequence: 1, retrySequenceDate: "20260723", nextEligibleAt: "2026-07-23T13:00:00.000Z" },
+    { origin: "https://retry.test", status: "deferred", retryCause: "rate_limit", retrySequence: 1, retrySequenceDate: "20260723", nextEligibleAt: "2026-07-23T13:00:00.000Z" },
+  ];
+  const current = previous.map((result) => ({ ...result }));
+  const advanced = advanceAttemptedDeferredRetries(current, new Set(["https://retry.test"]), previous, {
+    rateLimitRetryDelayMs: 3600000,
+  }, now);
+  assert.deepEqual(advanced[0], current[0]);
+  assert.equal(advanced[1].retrySequence, 2);
+  assert.equal(advanced[1].nextEligibleAt, "2026-07-23T14:00:00.000Z");
+});
+
+test("限频序列跨上海日期会重置且耗尽始终转到次日", () => {
+  const config = {
+    schedule: "08:05",
+    rateLimitRetryDelayMs: 3600000,
+    rateLimitMaxDailyAttempts: 3,
+  };
+  const afterMidnight = new Date("2026-07-23T16:01:00Z");
+  const yesterday = {
+    status: "deferred",
+    retryCause: "rate_limit",
+    retrySequence: 3,
+    retrySequenceDate: "20260723",
+    retryExhaustedForDay: true,
+  };
+  const reset = advanceDeferredRetry({ status: "deferred", retryCause: "rate_limit" }, yesterday, config, afterMidnight);
+  assert.equal(reset.retrySequence, 1);
+  assert.equal(reset.retrySequenceDate, "20260724");
+  assert.equal(reset.retryExhaustedForDay, false);
+
+  const atSevenShanghai = new Date("2026-07-23T23:00:00Z");
+  const first = advanceDeferredRetry({ status: "deferred", retryCause: "rate_limit" }, null, config, atSevenShanghai);
+  const second = advanceDeferredRetry({ status: "deferred", retryCause: "rate_limit" }, first, config, atSevenShanghai);
+  const exhausted = advanceDeferredRetry({ status: "deferred", retryCause: "rate_limit" }, second, config, atSevenShanghai);
+  assert.equal(exhausted.nextEligibleAt, "2026-07-25T00:05:00.000Z");
+
+  const fallback = advanceDeferredRetry(
+    { status: "deferred", retryCause: "rate_limit" },
+    { ...second, retrySequence: 2 },
+    { ...config, rateLimitNextDayTime: "invalid", schedule: "09:10" },
+    atSevenShanghai,
+  );
+  assert.equal(fallback.nextEligibleAt, "2026-07-25T01:10:00.000Z");
 });
 
 test("站点指定的上海时间会转换为准确的下一次时间", () => {

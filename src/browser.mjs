@@ -60,6 +60,11 @@ export function candidateHistoryEntry(candidateUrl, result, attempt) {
   };
 }
 
+function targetUsesConfiguredOrigins(target, configuredOrigins) {
+  const configured = new Set(configuredOrigins ?? []);
+  return (target.allowedOrigins ?? [target.origin]).some((origin) => configured.has(origin));
+}
+
 async function snapshotState(page) {
   const state = await page.evaluate((challengeSelector) => {
     const bodyText = String(document.body?.innerText ?? "").slice(0, 30000);
@@ -631,9 +636,11 @@ async function tryU2Captcha(page, expectedOrigin, config) {
 
 async function processCandidate(page, target, candidateUrl, config, qaRules) {
   const allowedOrigins = target.allowedOrigins ?? [target.origin];
+  const useNewApiCheckin = targetUsesConfiguredOrigins(target, config.newApiCheckinOrigins);
+  const useExtendedDiscovery = targetUsesConfiguredOrigins(target, config.extendedDiscoveryOrigins);
   const destination = assertBookmarkNavigation(candidateUrl, allowedOrigins);
   await page.goto(destination, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
-  if (target.folderNames.includes("公益站")) {
+  if (useExtendedDiscovery) {
     await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
   }
   let activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
@@ -658,7 +665,7 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
   // before interpreting generic page copy such as “每日签到可获得奖励”, which is
   // a feature description rather than proof that today's check-in succeeded.
   let initialApiResult = null;
-  if (target.folderNames.includes("公益站")) {
+  if (useNewApiCheckin) {
     initialApiResult = await tryNewApiCheckin(page);
     if (initialApiResult && initialApiResult.status !== "not_available") {
       return { ...initialApiResult, url: safeLogUrl(page.url()) };
@@ -703,7 +710,7 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
   if (qaResult) return { ...qaResult, url: safeLogUrl(page.url()) };
 
   let action = await findCheckinAction(page, allowedOrigins);
-  if (!action && target.folderNames.includes("公益站")) {
+  if (!action && useExtendedDiscovery) {
     const discoveryUrls = await findCheckinDiscoveryUrls(page, activeOrigin);
     for (const discoveryUrl of discoveryUrls) {
       if (discoveryUrl === page.url()) continue;
@@ -763,12 +770,12 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
     return { status: "visited", reason: "已访问打开即签到的网址", url: safeLogUrl(page.url()) };
   }
 
-  if (target.folderNames.includes("公益站")) {
+  if (useNewApiCheckin) {
     const apiResult = initialApiResult ?? await tryNewApiCheckin(page);
     if (apiResult) return { ...apiResult, url: safeLogUrl(page.url()) };
-    if ((config.knownNoCheckinFeatureOrigins ?? []).includes(activeOrigin)) {
-      return { status: "not_available", reason: "站点当前版本未提供签到功能", url: safeLogUrl(page.url()) };
-    }
+  }
+  if ((config.knownNoCheckinFeatureOrigins ?? []).includes(activeOrigin)) {
+    return { status: "not_available", reason: "站点当前版本未提供签到功能", url: safeLogUrl(page.url()) };
   }
 
   return { status: "no_action", reason: "未发现明确签到控件", url: safeLogUrl(page.url()) };
@@ -783,6 +790,11 @@ async function saveFailureScreenshot(page, logDirectory, target) {
 
 export async function launchAutomationContext(config) {
   await fs.access(config.chromeExecutable);
+  const disabledFeatures = [
+    "Translate",
+    "MediaRouter",
+    ...(config.disableOptimizationGuideOnDeviceModel === false ? [] : ["OptimizationGuideOnDeviceModel"]),
+  ];
   const context = await chromium.launchPersistentContext(config.automationUserDataDir, {
     executablePath: config.chromeExecutable,
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain", "--enable-automation"],
@@ -798,7 +810,7 @@ export async function launchAutomationContext(config) {
       "--no-default-browser-check",
       "--disable-sync",
       "--disable-component-update",
-      "--disable-features=Translate,MediaRouter",
+      "--disable-features=" + disabledFeatures.join(","),
       "--disable-blink-features=AutomationControlled",
       ...(config.backgroundWindowMode === "offscreen" ? ["--window-position=-32000,-32000", "--window-size=1365,900"] : []),
       ...(config.backgroundWindowMode === "visible" ? ["--window-position=80,80", "--window-size=1365,900"] : []),

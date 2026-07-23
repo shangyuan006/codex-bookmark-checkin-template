@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string[]]$Urls = @(),
     [switch]$Offscreen,
@@ -48,6 +48,7 @@ $arguments = @(
     '--no-default-browser-check',
     '--disable-sync',
     '--disable-component-update',
+    '--disable-features=OptimizationGuideOnDeviceModel',
     '--force-renderer-accessibility',
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',

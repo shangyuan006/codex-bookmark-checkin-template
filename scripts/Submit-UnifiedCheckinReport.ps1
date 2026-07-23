@@ -1,23 +1,33 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('completed', 'failed', 'timeout', 'skipped')]
     [string]$RunnerStatus = 'completed',
     [string]$RunnerMessage = '',
     [string]$ReportPath,
+    [string]$OutboxPath,
+    [string]$ConfigPath,
     [switch]$Preview
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$configPath = Join-Path $root 'config\config.json'
+$localConfigPath = Join-Path $root 'config\config.json'
 $defaultsPath = Join-Path $root 'config\defaults.json'
-$effectiveConfigPath = if (Test-Path -LiteralPath $configPath) { $configPath } else { $defaultsPath }
+$effectiveConfigPath = if ($ConfigPath) { $ConfigPath } elseif (Test-Path -LiteralPath $localConfigPath) { $localConfigPath } else { $defaultsPath }
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $effectiveConfigPath | ConvertFrom-Json
 $report = $null
 $results = @()
 
+function Remove-SensitiveText([object]$Value) {
+    $text = [string]$Value
+    $text = $text -replace '(?i)\b(authorization)\s*:\s*(?:bearer|basic)\s+[^\s,;，；]+', '$1: [REDACTED]'
+    $text = $text -replace '(?i)\b(password|passwd|pwd|access[-_]?token|refresh[-_]?token|id[-_]?token|token|cookie|client[-_]?secret|secret|api[-_ ]?key)\b\s*[:=]\s*(?:"[^"]*"|''[^'']*''|[^\s,;，；]+)', '$1=[REDACTED]'
+    $text = $text -replace '(密码|口令|令牌|密钥)\s*[:=：]\s*(?:"[^"]*"|''[^'']*''|[^\s,;，；]+)', '$1=[REDACTED]'
+    return $text
+}
+
 function Compress-Text([object]$Value, [int]$MaximumLength = 120) {
-    $text = ([string]$Value -replace "`e\[[0-?]*[ -/]*[@-~]", '' -replace '[\r\n\t]+', ' ' -replace '\s{2,}', ' ').Trim()
+    $text = ((Remove-SensitiveText $Value) -replace "`e\[[0-?]*[ -/]*[@-~]", '' -replace '[\r\n\t]+', ' ' -replace '\s{2,}', ' ').Trim()
     $text = ($text -replace '\s*Call log:.*$', '').Trim()
     if ($text.Length -gt $MaximumLength) { return $text.Substring(0, $MaximumLength) + '…' }
     return $text
@@ -98,6 +108,13 @@ if ($problems.Count -gt 0) {
     $summary += "`n$brief"
 }
 if ($summary.Length -gt 950) { $summary = $summary.Substring(0, 947) + "…`n（其余站点请查看本地日志）" }
+$summary = Remove-SensitiveText $summary
+
+$notification = $config.notification
+$mode = if ($notification.mode) { [string]$notification.mode } else { 'none' }
+$taskId = if ($notification.taskId) { [string]$notification.taskId } else { 'bookmark_daily' }
+$name = if ($notification.name) { [string]$notification.name } else { '浏览器书签签到' }
+$source = if ($notification.source) { [string]$notification.source } else { 'browser-codex' }
 
 $stateParts = @($results | Sort-Object origin | ForEach-Object {
     "$([string]$_.origin)=$([string]$_.status):$([string]$_.retryCause)"
@@ -106,10 +123,7 @@ $stateMaterial = if ($stateParts.Count -gt 0) { "$status|$reportRunState|$($stat
 $stateBytes = [System.Text.Encoding]::UTF8.GetBytes($stateMaterial)
 $stateHashBytes = [System.Security.Cryptography.SHA256]::HashData($stateBytes)
 $stateHash = [System.Convert]::ToHexString($stateHashBytes).Substring(0, 16).ToLowerInvariant()
-$eventKey = "external:browser-codex:bookmark_daily:$((Get-Date).ToString('yyyy-MM-dd')):$stateHash"
-
-$notification = $config.notification
-$mode = if ($notification.mode) { [string]$notification.mode } else { 'none' }
+$eventKey = "external:$source`:$taskId`:$((Get-Date).ToString('yyyy-MM-dd')):$stateHash"
 $payload = [ordered]@{
     status = $status
     summary = $summary
@@ -129,25 +143,52 @@ if ($Preview -or $mode -eq 'none') {
     return
 }
 if ($mode -ne 'command') { throw "不支持的通知模式：$mode" }
-$executable = [string]$notification.executable
-if (-not $executable) { throw '命令型通知缺少 executable。' }
-if (-not (Test-Path -LiteralPath $executable)) {
-    $command = Get-Command $executable -ErrorAction SilentlyContinue
-    if (-not $command) { throw "通知程序不存在：$executable" }
-    $executable = $command.Source
+if (-not $OutboxPath) { $OutboxPath = Join-Path $root 'data\notification-outbox' }
+[System.IO.Directory]::CreateDirectory($OutboxPath) | Out-Null
+
+$eventBytes = [System.Text.Encoding]::UTF8.GetBytes($eventKey)
+$eventHashBytes = [System.Security.Cryptography.SHA256]::HashData($eventBytes)
+$eventHash = [System.Convert]::ToHexString($eventHashBytes).ToLowerInvariant()
+$itemPath = Join-Path $OutboxPath "$eventHash.json"
+$payloadMaterial = @($eventKey, $taskId, $name, $source, $status, $summary) -join "`n"
+$payloadHashBytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($payloadMaterial))
+$payloadHash = [System.Convert]::ToHexString($payloadHashBytes).ToLowerInvariant()
+$now = [DateTimeOffset]::UtcNow
+$existing = $null
+if (Test-Path -LiteralPath $itemPath) {
+    try { $existing = Get-Content -Raw -Encoding UTF8 -LiteralPath $itemPath | ConvertFrom-Json }
+    catch { throw "通知 outbox 条目损坏：$itemPath" }
+    if ([string]$existing.eventKey -ne $eventKey) { throw '通知 outbox 事件哈希冲突。' }
 }
-$values = @{
-    '{status}' = $status
-    '{summary}' = $summary
-    '{taskId}' = [string]$notification.taskId
-    '{name}' = [string]$notification.name
-    '{source}' = [string]$notification.source
-    '{eventKey}' = $eventKey
+
+$item = [ordered]@{
+    schemaVersion = 1
+    eventKey = $eventKey
+    payloadHash = $payloadHash
+    taskId = $taskId
+    name = $name
+    source = $source
+    status = $status
+    summary = $summary
+    createdAt = if ($existing.createdAt) { [string]$existing.createdAt } else { $now.ToString('o') }
+    updatedAt = $now.ToString('o')
+    nextAttemptAt = if ($existing.delivered -eq $true) { $null } elseif ($existing.nextAttemptAt) { [string]$existing.nextAttemptAt } else { $now.ToString('o') }
+    attempts = if ($null -ne $existing.attempts) { [int]$existing.attempts } else { 0 }
+    delivered = [bool]($existing.delivered -eq $true)
+    deliveredAt = if ($existing.deliveredAt) { [string]$existing.deliveredAt } else { $null }
+    disposition = if ($existing.disposition) { [string]$existing.disposition } else { $null }
+    lastError = if ($existing.lastError) { Remove-SensitiveText $existing.lastError } else { $null }
 }
-$arguments = @($notification.arguments | ForEach-Object {
-    $value = [string]$_
-    foreach ($entry in $values.GetEnumerator()) { $value = $value.Replace($entry.Key, $entry.Value) }
-    $value
-})
-& $executable @arguments
-if ($LASTEXITCODE -ne 0) { throw "通知程序退出码：$LASTEXITCODE" }
+
+$temporary = "$itemPath.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+try {
+    [System.IO.File]::WriteAllText($temporary, ($item | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $itemPath -Force
+}
+finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
+
+$payload.accepted = [bool]$item.delivered
+$payload.enqueued = -not [bool]$item.delivered
+$payload | ConvertTo-Json -Compress

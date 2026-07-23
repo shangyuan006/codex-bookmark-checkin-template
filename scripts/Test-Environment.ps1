@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string[]]$ContainerFolderNames = @(),
     [string[]]$TargetFolderNames = @()
@@ -40,7 +40,8 @@ if ($resolvedContainerNames.Count -gt 0 -or $resolvedTargetNames.Count -gt 0) {
         mobileFolderNames = @($resolvedContainerNames)
         targetFolderNames = @($resolvedTargetNames)
     } | ConvertTo-Json -Compress
-    $nodeArguments += @('--scope-json', $scope)
+    $scopeBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($scope))
+    $nodeArguments += @('--scope-json-base64', $scopeBase64)
 }
 $raw = & $nodeCommand.Source @nodeArguments
 if ($LASTEXITCODE -ne 0) { throw '环境预检程序运行失败。' }

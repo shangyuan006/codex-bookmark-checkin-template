@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$Force,
     [switch]$SkipSavedLoginSync
@@ -36,7 +36,8 @@ $chrome = [string]$config.chromeExecutable
 if (-not (Test-Path -LiteralPath $chrome)) { throw "未找到 Chrome：$chrome" }
 $process = Start-Process -FilePath $chrome -ArgumentList @(
     "--user-data-dir=$targetRoot", '--profile-directory=Default', '--headless=new',
-    '--no-first-run', '--no-default-browser-check', 'about:blank'
+    '--no-first-run', '--no-default-browser-check',
+    '--disable-features=OptimizationGuideOnDeviceModel', 'about:blank'
 ) -WindowStyle Hidden -PassThru
 try {
     $deadline = (Get-Date).AddSeconds(20)

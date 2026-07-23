@@ -7,6 +7,7 @@ import { readBookmarkPlan, publicBookmarkReport } from "./bookmarks.mjs";
 import { launchAutomationContext, processTarget } from "./browser.mjs";
 import { cleanupOldLogs, createRunLog, writeRunResult } from "./logger.mjs";
 import { atomicWriteJson, ensurePrivateDirectory } from "./security.mjs";
+import { acquireRunLock, releaseRunLock } from "./run-lock.mjs";
 import {
   applyPreferredCandidates,
   loadSiteState,
@@ -17,6 +18,7 @@ import {
 import { loadQaCache, updateQaCache, writeQaCache } from "./qa-solver.mjs";
 import {
   TERMINAL_STATUSES,
+  advanceAttemptedDeferredRetries,
   deferUnresolvedLogin,
   isCurrentLocalRunId,
   isRetryEligible,
@@ -98,24 +100,7 @@ async function readFreshNativeWafPreflight() {
     .map((result) => [result.origin, result]));
 }
 
-async function acquireLock() {
-  await ensurePrivateDirectory(path.dirname(lockPath));
-  try {
-    const handle = await fs.open(lockPath, "wx", 0o600);
-    await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-    return handle;
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    const stat = await fs.stat(lockPath).catch(() => null);
-    if (stat && Date.now() - stat.mtimeMs > 2 * 60 * 60 * 1000) {
-      await fs.rm(lockPath, { force: true });
-      return acquireLock();
-    }
-    throw new Error("已有一个签到任务正在运行");
-  }
-}
-
-const lockHandle = await acquireLock();
+const lockLease = await acquireRunLock(lockPath);
 try {
   const plan = await readValidatedBookmarkPlan();
   const report = publicBookmarkReport(plan);
@@ -276,7 +261,8 @@ try {
           });
         }
         if (provider) methods.push({ method: "oauth", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, provider] });
-        else if (config.autoDetectLinuxDoOAuth !== false && target.folderNames.includes("公益站")) {
+        else if (config.autoDetectLinuxDoOAuth !== false
+          && (config.autoDetectOAuthOrigins ?? []).includes(current.origin)) {
           methods.push({ method: "oauth_autodetect", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, "LinuxDO"] });
         }
         methods.push({
@@ -352,7 +338,14 @@ try {
         ?? resumeBase.results.find((result) => result.origin === target.origin)
         ?? { origin: target.origin, title: target.title, folderNames: target.folderNames, status: "error", reason: "续跑未生成站点结果" })
       : results;
-    const finalResults = assembledResults.map((result) => deferUnresolvedLogin(result, config, finishedAt));
+    const currentOrigins = new Set(results.map((result) => result.origin));
+    const finalResults = advanceAttemptedDeferredRetries(
+      assembledResults.map((result) => currentOrigins.has(result.origin) ? deferUnresolvedLogin(result, config, finishedAt) : result),
+      currentOrigins,
+      resumeBase?.results,
+      config,
+      finishedAt,
+    );
     const summary = Object.fromEntries(
       [...new Set(finalResults.map((result) => result.status))].map((status) => [status, finalResults.filter((result) => result.status === status).length])
     );
@@ -384,6 +377,5 @@ try {
     }
   }
 } finally {
-  await lockHandle.close().catch(() => {});
-  await fs.rm(lockPath, { force: true }).catch(() => {});
+  await releaseRunLock(lockLease).catch(() => {});
 }

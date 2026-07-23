@@ -97,8 +97,11 @@ function candidateScore(rawUrl) {
 }
 
 export async function readBookmarkPlan(bookmarksPath, options = {}) {
-  const mobileNames = new Set(options.mobileFolderNames ?? ["移动设备书签"]);
-  const targetNames = new Set(options.targetFolderNames ?? ["签到", "公益站"]);
+  const mobileNames = new Set(options.mobileFolderNames ?? []);
+  const targetNames = new Set(options.targetFolderNames ?? []);
+  if (mobileNames.size === 0 || targetNames.size === 0) {
+    throw new Error("必须先明确配置上级书签文件夹和目标子文件夹名称");
+  }
   const raw = JSON.parse(await fs.readFile(bookmarksPath, "utf8"));
   const roots = Object.values(raw.roots ?? {});
   const mobileFolders = [];

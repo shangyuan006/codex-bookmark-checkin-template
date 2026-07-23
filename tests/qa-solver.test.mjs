@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { selectAnswerFromSearchText, updateQaCache } from "../src/qa-solver.mjs";
+import { sanitizeQaSearchQuestion, selectAnswerFromSearchText, updateQaCache } from "../src/qa-solver.mjs";
+
+test("外部问答搜索前移除账号与站点标识", () => {
+  const value = sanitizeQaSearchQuestion("账号 123456@example.com 在 https://private.example.com 提问：北京是哪个国家的首都？订单 123456789");
+  assert.equal(value, "在 提问：北京是哪个国家的首都？订单");
+});
 
 test("只在搜索摘要明确给出唯一正确答案时选择选项", () => {
   const result = selectAnswerFromSearchText(

@@ -12,6 +12,26 @@
     "https://checkin.new-api.abrdns.com": "abrdns-welfare",
     "https://new-api.abrdns.com": "abrdns-welfare"
   },
+  "newApiCheckinOrigins": [
+    "https://ai-cf.ailinyu.de",
+    "https://checkin.new-api.abrdns.com",
+    "https://muyuan.do",
+    "https://new-api.abrdns.com",
+    "https://rrrapi.com",
+    "https://token.fourj.space"
+  ],
+  "extendedDiscoveryOrigins": [
+    "https://ai-cf.ailinyu.de",
+    "https://checkin.new-api.abrdns.com",
+    "https://free.lyclaude.site",
+    "https://muyuan.do",
+    "https://new-api.abrdns.com",
+    "https://rrrapi.com",
+    "https://token.fourj.space"
+  ],
+  "autoDetectOAuthOrigins": [
+    "https://free.lyclaude.site"
+  ],
   "knownNoCheckinFeatureOrigins": [
     "https://ai-cf.ailinyu.de",
     "https://muyuan.do",

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([switch]$Once)
 
 $ErrorActionPreference = 'Stop'
@@ -8,6 +8,7 @@ $initialConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | Conv
 $statePath = Join-Path $root 'data\scheduler-state.json'
 $heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
 $schedulerLogPath = Join-Path $root 'logs\scheduler.log'
+$outboxScript = Join-Path $PSScriptRoot 'Invoke-CheckinNotificationOutbox.ps1'
 $mutexCreated = $false
 $mutexName = if ($initialConfig.schedulerMutexName) { [string]$initialConfig.schedulerMutexName } else { 'Local\CodexBookmarkDailyCheckinScheduler' }
 $mutex = [System.Threading.Mutex]::new($true, $mutexName, [ref]$mutexCreated)
@@ -153,6 +154,18 @@ try {
         try {
             Write-SchedulerHeartbeat 'idle'
             $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
+            try {
+                Write-SchedulerHeartbeat 'flushing_notifications'
+                $outboxResult = (& $outboxScript | Select-Object -Last 1) | ConvertFrom-Json
+                if ([int]$outboxResult.processed -gt 0 -or [int]$outboxResult.invalid -gt 0) {
+                    Write-SchedulerLog "通知 outbox：处理=$($outboxResult.processed)，送达=$($outboxResult.delivered)，延后=$($outboxResult.deferred)，无效=$($outboxResult.invalid)，隔离=$($outboxResult.quarantined)。"
+                }
+            }
+            catch {
+                $outboxMessage = ([string]$_.Exception.Message) -replace '[\r\n\t]+', ' '
+                Write-SchedulerLog "通知 outbox 可恢复异常：$outboxMessage"
+            }
+            Write-SchedulerHeartbeat 'idle'
             $schedule = [string]$config.schedule
             if ($schedule -notmatch '^([01]\d|2[0-3]):[0-5]\d$') { throw "无效签到时间：$schedule" }
             $now = Get-Date

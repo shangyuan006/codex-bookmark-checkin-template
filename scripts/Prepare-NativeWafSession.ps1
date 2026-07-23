@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [int]$LoadTimeoutSeconds = 20,
     [string[]]$Origins = @()

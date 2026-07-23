@@ -9,6 +9,19 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+export function sanitizeQaSearchQuestion(value) {
+  return normalize(value)
+    .replace(/(?:用户名|账号|帳號|用户\s*ID|user\s*id)\s*[:：]?\s*\S+/gi, " ")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
+    .replace(/\b(?:[a-z0-9-]+\.)+(?:com|net|org|xyz|top|site|club|me|do|cc|cn)\b/gi, " ")
+    .replace(/\b(?:\d[ -]?){6,}\b/g, " ")
+    .replace(/\b[a-f0-9]{24,}\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 260);
+}
+
 export function selectAnswerFromSearchText(options, searchText) {
   const text = normalize(searchText).slice(0, 40000);
   const scored = options.map((rawOption) => {
@@ -37,7 +50,9 @@ export async function resolveQaByWebSearch(page, question, options, config = {})
   if (config.qaWebSearchEnabled === false || !question || options.length < 2) return null;
   const endpoint = String(config.qaWebSearchUrl || "https://www.google.com/search?q=");
   if (!endpoint.startsWith("https://www.google.com/search?q=")) return null;
-  const query = `${normalize(question).slice(0, 260)} 正确答案`;
+  const sanitizedQuestion = sanitizeQaSearchQuestion(question);
+  if (sanitizedQuestion.length < 4) return null;
+  const query = `${sanitizedQuestion} 正确答案`;
   const searchPage = await page.context().newPage();
   try {
     await searchPage.goto(`${endpoint}${encodeURIComponent(query)}`, {
