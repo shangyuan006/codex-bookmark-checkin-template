@@ -9,6 +9,7 @@ import { cleanupOldLogs, createRunLog, writeRunResult } from "./logger.mjs";
 import { atomicWriteJson, ensurePrivateDirectory } from "./security.mjs";
 import { applyPreferredCandidates, loadSiteState, updateSiteState, writeSiteState } from "./site-state.mjs";
 import { loadQaCache, updateQaCache, writeQaCache } from "./qa-solver.mjs";
+import { TERMINAL_STATUSES, isCurrentLocalRunId, isRetryEligible, nextDeferredRetryAt } from "./retry-policy.mjs";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
@@ -36,11 +37,6 @@ const requestedResumePath = resumeIndex >= 0 ? String(process.argv[resumeIndex +
 const lockPath = path.join(rootDirectory, "tmp", "run.lock");
 const nativeWafPreflightPath = path.join(rootDirectory, "tmp", "native-waf-preflight.json");
 const lastValidBookmarkPlanPath = path.join(rootDirectory, "data", "last-valid-bookmark-plan.json");
-const RECOVERABLE_STATUSES = new Set([
-  "error", "login_required", "interactive_challenge", "managed_challenge_timeout",
-  "visited", "clicked", "no_action", "unconfirmed",
-]);
-
 function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
@@ -133,11 +129,12 @@ try {
       if (!resolvedResume.startsWith(`${resolvedLogs}${path.sep}`)) throw new Error("续跑报告必须位于本任务 logs 目录内");
       resumeBase = JSON.parse(await fs.readFile(resolvedResume, "utf8"));
       if (!Array.isArray(resumeBase?.results)) throw new Error("续跑报告缺少站点结果");
+      if (!isCurrentLocalRunId(resumeBase.runId)) throw new Error("续跑报告不是今天生成的，拒绝复用旧签到结果");
       if (!selectedOrigins) {
         const currentOrigins = new Set(plan.targets.map((target) => target.origin));
         const previousOrigins = new Set(resumeBase.results.map((result) => result.origin));
         selectedOrigins = new Set([
-          ...resumeBase.results.filter((result) => RECOVERABLE_STATUSES.has(result.status)).map((result) => result.origin),
+          ...resumeBase.results.filter((result) => isRetryEligible(result)).map((result) => result.origin),
           ...[...currentOrigins].filter((origin) => !previousOrigins.has(origin)),
         ]);
       }
@@ -152,7 +149,6 @@ try {
       ...(localQaConfig.rules ?? []),
       ...qaCache.entries.map((entry) => ({ ...entry, source: "verified_cache" })),
     ];
-    const context = await launchAutomationContext(config);
     const results = [];
     const nativeWafPreflight = await readFreshNativeWafPreflight();
     const preferredTargets = applyPreferredCandidates(plan.targets, siteState);
@@ -162,6 +158,7 @@ try {
     const selectedTargets = limit
       ? originFilteredTargets.slice(offset, offset + limit)
       : originFilteredTargets.slice(offset);
+    const context = selectedTargets.length > 0 ? await launchAutomationContext(config) : null;
     const logicalCompletions = new Map();
 
     const rememberLogicalCompletion = (target, result) => {
@@ -214,7 +211,7 @@ try {
         });
       }
     } finally {
-      await context.close();
+      await context?.close();
     }
 
     // Only unresolved sites enter recovery.  Login repair is attempted before
@@ -223,7 +220,7 @@ try {
     const recoveryDelays = Array.isArray(config.recoveryDelaysMs) ? config.recoveryDelaysMs : [5000, 30000];
     for (let round = 0; round < recoveryRounds; round += 1) {
       const recoveryIndexes = results
-        .map((result, index) => RECOVERABLE_STATUSES.has(result.status) ? index : -1)
+        .map((result, index) => isRetryEligible(result) ? index : -1)
         .filter((index) => index >= 0);
       if (recoveryIndexes.length === 0) break;
       console.log(`[recovery ${round + 1}/${recoveryRounds}] 将复查 ${recoveryIndexes.length} 个异常站点`);
@@ -324,6 +321,7 @@ try {
       finishedAt: finishedAt.toISOString(),
       bookmarkSummary: report,
       summary,
+      nextRetryAt: nextDeferredRetryAt(finalResults, finishedAt),
       results: finalResults,
     };
     const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);
@@ -334,7 +332,7 @@ try {
     await writeQaCache(qaCachePath, updateQaCache(qaCache, results, finishedAt));
     await fs.rm(nativeWafPreflightPath, { force: true }).catch(() => {});
     console.log(JSON.stringify({ resultPath, summary }, null, 2));
-    if (finalResults.some((result) => !["signed", "already_signed", "not_available"].includes(result.status))) {
+    if (finalResults.some((result) => !TERMINAL_STATUSES.has(result.status))) {
       process.exitCode = 2;
     }
   }

@@ -14,12 +14,20 @@ if ($schedule -notmatch '^([01]\d|2[0-3]):[0-5]\d$') {
     throw "无效时间：$schedule，应为 HH:mm。"
 }
 
-$runScript = Join-Path $PSScriptRoot 'Run-Checkin.ps1'
+$schedulerScript = Join-Path $PSScriptRoot 'Start-UserScheduler.ps1'
 $shell = (Get-Command pwsh,powershell -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $shell) { throw '未找到 PowerShell 可执行文件。' }
-$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runScript`""
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$schedulerScript`" -Once"
 $action = New-ScheduledTaskAction -Execute $shell -Argument $arguments -WorkingDirectory $root
-$trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($schedule, 'HH:mm', $null))
+$scheduleTime = [datetime]::ParseExact($schedule, 'HH:mm', $null)
+$probeInterval = if ($null -ne $config.schedulerProbeIntervalMinutes) { [int]$config.schedulerProbeIntervalMinutes } else { 60 }
+$probeInterval = [Math]::Max(30, [Math]::Min(180, $probeInterval))
+$startMinutes = $scheduleTime.Hour * 60 + $scheduleTime.Minute
+$trigger = @(
+    for ($minute = $startMinutes; $minute -lt 24 * 60; $minute += $probeInterval) {
+        New-ScheduledTaskTrigger -Daily -At $scheduleTime.Date.AddMinutes($minute)
+    }
+)
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -54,7 +62,6 @@ catch {
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runKeyName = if ($config.schedulerRunKeyName) { [string]$config.schedulerRunKeyName } else { 'CodexBookmarkDailyCheckin' }
 Remove-ItemProperty -Path $runKey -Name $runKeyName -ErrorAction SilentlyContinue
-$schedulerScript = Join-Path $PSScriptRoot 'Start-UserScheduler.ps1'
 $schedulerScripts = @($schedulerScript, (Join-Path $PSScriptRoot 'Ensure-UserScheduler.ps1'))
 Get-CimInstance Win32_Process | Where-Object {
     $commandLine = [string]$_.CommandLine
@@ -63,4 +70,4 @@ Get-CimInstance Win32_Process | Where-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-Write-Output "计划任务已安装：$taskName，每天 $schedule（隐藏运行、需要网络、唤醒执行、错过后补跑）。"
+Write-Output "计划任务已安装：$taskName，从每天 $schedule 起每 $probeInterval 分钟探测一次，仅在需要时执行或补跑。"

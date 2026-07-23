@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { listBookmarkFolderCandidates, readBookmarkPlan } from "./bookmarks.mjs";
+import { listBookmarkFolderCandidatesWithBackup, readBookmarkPlanWithBackup } from "./bookmarks.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const defaults = JSON.parse(await fs.readFile(path.join(root, "config", "defaults.json"), "utf8"));
@@ -39,9 +39,9 @@ async function inspectProfiles(userDataDir) {
     const bookmarksPath = path.join(userDataDir, entry.name, "Bookmarks");
     if (!(await exists(bookmarksPath))) continue;
     try {
-      const folderCandidates = await listBookmarkFolderCandidates(bookmarksPath);
+      const folderReport = await listBookmarkFolderCandidatesWithBackup(bookmarksPath);
       const plan = scopeProvided
-        ? await readBookmarkPlan(bookmarksPath, {
+        ? await readBookmarkPlanWithBackup(bookmarksPath, {
           ...defaults,
           mobileFolderNames: requestedScope.mobileFolderNames,
           targetFolderNames: requestedScope.targetFolderNames,
@@ -50,7 +50,8 @@ async function inspectProfiles(userDataDir) {
       profiles.push({
         name: entry.name,
         bookmarksPath,
-        folderCandidates,
+        recoveredFromBackup: Boolean(folderReport.recoveredFromBackup || plan?.recoveredFromBackup),
+        folderCandidates: folderReport.candidates,
         scopeMatch: plan ? {
           sourceCount: plan.sources.length,
           exactUrlCount: plan.exactUrlCount,

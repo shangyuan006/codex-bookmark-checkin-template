@@ -43,12 +43,19 @@ try:
         if host_matches(str(row[origin_index]), allowed_hosts)
         or host_matches(str(row[realm_index]), allowed_hosts)
     ]
+    populated_hosts = {
+        allowed
+        for row in selected_rows
+        for allowed in allowed_hosts
+        if host_matches(str(row[origin_index]), {allowed})
+        or host_matches(str(row[realm_index]), {allowed})
+    }
 
     target.execute("begin immediate")
     existing = target.execute("select id, origin_url, signon_realm from logins").fetchall()
     delete_ids = [
         row[0] for row in existing
-        if host_matches(str(row[1]), allowed_hosts) or host_matches(str(row[2]), allowed_hosts)
+        if host_matches(str(row[1]), populated_hosts) or host_matches(str(row[2]), populated_hosts)
     ]
     if delete_ids:
         target.executemany("delete from logins where id = ?", [(value,) for value in delete_ids])
@@ -63,7 +70,7 @@ try:
     )
     target.executemany(insert_sql, selected_rows)
     target.commit()
-    print(json.dumps({"copied": len(selected_rows), "origins": len(allowed_hosts)}))
+    print(json.dumps({"copied": len(selected_rows), "origins": len(allowed_hosts), "populated_origins": len(populated_hosts)}))
 except Exception:
     target.rollback()
     raise

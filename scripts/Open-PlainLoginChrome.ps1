@@ -46,6 +46,8 @@ $arguments = @(
     '--new-window',
     '--no-first-run',
     '--no-default-browser-check',
+    '--disable-sync',
+    '--disable-component-update',
     '--force-renderer-accessibility',
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',

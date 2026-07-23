@@ -22,21 +22,17 @@ try {
   if (await password.count() !== 1 || await username.count() !== 1) {
     status = "unsupported";
   } else {
-    let filled = await page.evaluate(() => {
-      const secret = document.querySelector('input[type="password"]');
-      const identity = document.querySelector('input[type="email"], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[type="text"]');
-      return Boolean(secret?.value && identity?.value);
-    });
+    const fieldsFilled = async () => Boolean(
+      await username.evaluate((element) => Boolean(element.value))
+      && await password.evaluate((element) => Boolean(element.value))
+    );
+    let filled = await fieldsFilled();
     if (!filled) {
       await username.click();
       await username.press("ArrowDown").catch(() => {});
       await username.press("Enter").catch(() => {});
       await page.waitForTimeout(800);
-      filled = await page.evaluate(() => {
-        const secret = document.querySelector('input[type="password"]');
-        const identity = document.querySelector('input[type="email"], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[type="text"]');
-        return Boolean(secret?.value && identity?.value);
-      });
+      filled = await fieldsFilled();
     }
 
     if (!filled) {

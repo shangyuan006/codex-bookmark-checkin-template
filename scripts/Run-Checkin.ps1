@@ -14,6 +14,47 @@ $runnerStatus = 'failed'
 $runnerMessage = '签到任务尚未开始。'
 $nodeExitCode = 1
 $locationPushed = $false
+$resumeCandidate = $null
+
+function Get-FreshResumeReport([datetime]$NotBefore) {
+    $logsRoot = Join-Path $root 'logs'
+    if (-not (Test-Path -LiteralPath $logsRoot)) { return $null }
+    $candidates = @()
+    $latestPath = Join-Path $logsRoot 'latest.json'
+    if (Test-Path -LiteralPath $latestPath) { $candidates += Get-Item -LiteralPath $latestPath }
+    $candidates += @(Get-ChildItem -LiteralPath $logsRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        foreach ($name in @('result.json', 'progress.json')) {
+            $path = Join-Path $_.FullName $name
+            if (Test-Path -LiteralPath $path) { Get-Item -LiteralPath $path }
+        }
+    })
+    $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
+    foreach ($file in @($candidates | Where-Object { $_.LastWriteTime -ge $NotBefore.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending)) {
+        try {
+            $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $file.FullName | ConvertFrom-Json
+            if ([string]$value.runId -like "$todayPrefix*" -and $null -ne $value.results) {
+                return [pscustomobject]@{ Path = $file.FullName; Report = $value; LastWriteTime = $file.LastWriteTime }
+            }
+        }
+        catch { }
+    }
+    return $null
+}
+
+function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
+    $results = @($Report.results)
+    if ($null -ne $Report.total -and $results.Count -lt [int]$Report.total) { return $true }
+    $unresolved = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+    if ($unresolved.Count -eq 0) { return $false }
+    foreach ($result in $unresolved) {
+        if ([string]$result.status -ne 'deferred') { return $true }
+        try {
+            if (-not $result.nextEligibleAt -or [datetime]$result.nextEligibleAt -le $RetryAt) { return $true }
+        }
+        catch { return $true }
+    }
+    return $false
+}
 
 try {
     Push-Location $root
@@ -47,21 +88,20 @@ try {
     else {
         for ($attempt = 1; $attempt -le $runAttempts; $attempt++) {
             $runArguments = @($arguments)
-            $latestReport = Join-Path $root 'logs\latest.json'
-            if ($attempt -gt 1 -and (Test-Path -LiteralPath $latestReport)) {
-                $runArguments += @('--resume-report', $latestReport)
+            if ($attempt -gt 1 -and $null -ne $resumeCandidate) {
+                $runArguments += @('--resume-report', [string]$resumeCandidate.Path)
             }
             if (@($config.nativeWafPreflightUrls).Count -gt 0 -or @($config.nativeChallengePreflight).Count -gt 0) {
                 $preflightOrigins = @()
-                if ($attempt -gt 1 -and (Test-Path -LiteralPath $latestReport)) {
-                    $previous = Get-Content -Raw -Encoding UTF8 -LiteralPath $latestReport | ConvertFrom-Json
-                    $preflightOrigins = @($previous.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') } | ForEach-Object { [string]$_.origin })
+                if ($attempt -gt 1 -and $null -ne $resumeCandidate) {
+                    $preflightOrigins = @($resumeCandidate.Report.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') } | ForEach-Object { [string]$_.origin })
                 }
                 if ($preflightOrigins.Count -gt 0) { & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins }
                 elseif ($attempt -eq 1) { & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') }
             }
 
             Write-Output "开始签到任务级尝试 $attempt/$runAttempts。"
+            $attemptStartedAt = Get-Date
             $process = Start-Process -FilePath $node -ArgumentList $runArguments -NoNewWindow -PassThru
             $finishedInTime = $process.WaitForExit($timeoutMinutes * 60 * 1000)
             if (-not $finishedInTime) {
@@ -76,8 +116,16 @@ try {
                 $runnerStatus = 'completed'
                 $runnerMessage = "任务级尝试 $attempt/$runAttempts 已结束，退出码 $nodeExitCode。"
             }
+            $freshCandidate = Get-FreshResumeReport $attemptStartedAt
+            if ($null -ne $freshCandidate) { $resumeCandidate = $freshCandidate }
             if ($nodeExitCode -eq 0) { break }
-            if ($attempt -lt $runAttempts -and $retryDelayMinutes -gt 0) { Start-Sleep -Seconds ($retryDelayMinutes * 60) }
+            if ($attempt -lt $runAttempts) {
+                if ($null -ne $resumeCandidate -and -not (Test-HasImmediateRetry $resumeCandidate.Report ((Get-Date).AddMinutes($retryDelayMinutes)))) {
+                    Write-Warning '剩余站点尚未到可重试时间，本次不空转，交由调度器按 nextEligibleAt 定向补跑。'
+                    break
+                }
+                if ($retryDelayMinutes -gt 0) { Start-Sleep -Seconds ($retryDelayMinutes * 60) }
+            }
         }
     }
 }
@@ -90,11 +138,9 @@ catch {
 }
 finally {
     if (-not $DryRun -and -not $SuppressReport) {
-        $latestReport = Join-Path $root 'logs\latest.json'
-        $freshReport = Test-Path -LiteralPath $latestReport
-        if ($freshReport) { $freshReport = (Get-Item -LiteralPath $latestReport).LastWriteTime -ge $startedAt.AddSeconds(-2) }
         try {
-            if ($freshReport) { & $reporterScript -RunnerStatus $runnerStatus -RunnerMessage $runnerMessage -ReportPath $latestReport }
+            $notificationCandidate = Get-FreshResumeReport $startedAt
+            if ($null -ne $notificationCandidate) { & $reporterScript -RunnerStatus $runnerStatus -RunnerMessage $runnerMessage -ReportPath ([string]$notificationCandidate.Path) }
             else { & $reporterScript -RunnerStatus $runnerStatus -RunnerMessage $runnerMessage }
         }
         catch {

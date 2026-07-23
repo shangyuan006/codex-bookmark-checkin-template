@@ -27,6 +27,8 @@ $watchdogCount = @(Get-CimInstance Win32_Process | Where-Object {
     $_.Name -in @('pwsh.exe', 'powershell.exe') -and $_.CommandLine -like "*-File*$watchdogScript*"
 }).Count
 $latest = if (Test-Path -LiteralPath $latestPath) { Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json } else { $null }
+$schedulerStatePath = Join-Path $root 'data\scheduler-state.json'
+$schedulerState = if (Test-Path -LiteralPath $schedulerStatePath) { try { Get-Content -Raw -Encoding UTF8 -LiteralPath $schedulerStatePath | ConvertFrom-Json } catch { $null } } else { $null }
 $heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
 $heartbeat = if (Test-Path -LiteralPath $heartbeatPath) { Get-Content -Raw -Encoding UTF8 -LiteralPath $heartbeatPath | ConvertFrom-Json } else { $null }
 $heartbeatMaxAgeMinutes = if ($heartbeat -and [string]$heartbeat.phase -eq 'running_checkin') { ([int]$config.taskTimeoutMinutes) + 10 } else { 5 }
@@ -47,6 +49,7 @@ $checks = [ordered]@{
     schedulerHeartbeatFresh = [bool]$heartbeatFresh
     latestResultPresent = [bool]$latest
     latestResultConfirmed = $null -ne $problemCount -and $problemCount -eq 0
+    latestResultComplete = $null -ne $problemCount -and $problemCount -eq 0
     siteStatePresent = Test-Path -LiteralPath $statePath
 }
 [ordered]@{
@@ -58,5 +61,8 @@ $checks = [ordered]@{
     latestRunId = if ($latest) { [string]$latest.runId } else { $null }
     latestSiteCount = if ($latest) { @($latest.results).Count } else { $null }
     latestProblemCount = $problemCount
+    schedulerAttemptsToday = if ($schedulerState) { [int]$schedulerState.attemptsToday } else { 0 }
+    schedulerNextEligibleAt = if ($schedulerState) { [string]$schedulerState.nextEligibleAt } else { $null }
+    schedulerReportComplete = if ($schedulerState) { [bool]$schedulerState.reportComplete } else { $false }
     checks = $checks
 } | ConvertTo-Json -Depth 6

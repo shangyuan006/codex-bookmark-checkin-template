@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readBookmarkPlan } from "./bookmarks.mjs";
+import { readBookmarkPlanWithBackup } from "./bookmarks.mjs";
 import { atomicWriteJson, ensurePrivateDirectory } from "./security.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -42,7 +42,7 @@ async function discoverProfiles(userDataDir, options) {
     if (!entry.isDirectory()) continue;
     const bookmarksPath = path.join(userDataDir, entry.name, "Bookmarks");
     if (!(await exists(bookmarksPath))) continue;
-    const plan = await readBookmarkPlan(bookmarksPath, options).catch(() => null);
+    const plan = await readBookmarkPlanWithBackup(bookmarksPath, options).catch(() => null);
     if (plan) profiles.push({ name: entry.name, bookmarksPath, targetCount: plan.targetCount, sourceCount: plan.sources.length });
   }
   return profiles.sort((a, b) => b.targetCount - a.targetCount);

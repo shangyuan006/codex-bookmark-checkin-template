@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { findBookmarkTarget, listBookmarkFolderCandidates, readBookmarkPlan, readBookmarkPlanWithBackup } from "../src/bookmarks.mjs";
+import { findBookmarkTarget, listBookmarkFolderCandidates, listBookmarkFolderCandidatesWithBackup, readBookmarkPlan, readBookmarkPlanWithBackup } from "../src/bookmarks.mjs";
 
 test("不预设名称时列出候选书签目录供用户选择", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "checkin-candidates-"));
@@ -121,4 +121,7 @@ test("登录恢复可从 Bookmarks.bak 找到主文件缺失的目标", async ()
   });
   assert.equal(fallbackPlan.targetCount, 1);
   assert.equal(fallbackPlan.recoveredFromBackup, true);
+  const fallbackCandidates = await listBookmarkFolderCandidatesWithBackup(file);
+  assert.equal(fallbackCandidates.recoveredFromBackup, true);
+  assert.ok(fallbackCandidates.candidates.some((value) => value.name === "我的自动任务"));
 });

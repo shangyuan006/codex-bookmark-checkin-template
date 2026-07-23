@@ -37,11 +37,11 @@ try {
   await username.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
   let status = "unsupported";
   if (await password.count() >= 1 && await username.count() >= 1) {
-    let filled = await page.evaluate(() => {
-      const secret = document.querySelector('input[type="password"]');
-      const identity = document.querySelector('input[type="email"], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[type="text"]');
-      return Boolean(secret?.value && identity?.value);
-    });
+    const fieldsFilled = async () => Boolean(
+      await username.evaluate((element) => Boolean(element.value))
+      && await password.evaluate((element) => Boolean(element.value))
+    );
+    let filled = await fieldsFilled();
     if (!filled) {
       await username.click();
       await username.press("ArrowDown").catch(() => {});
@@ -53,11 +53,7 @@ try {
         await password.press("Enter").catch(() => {});
         await page.waitForTimeout(800);
       }
-      filled = await page.evaluate(() => {
-        const secret = document.querySelector('input[type="password"]');
-        const identity = document.querySelector('input[type="email"], input[name*="user" i], input[name*="login" i], input[name*="email" i], input[type="text"]');
-        return Boolean(secret?.value && identity?.value);
-      });
+      filled = await fieldsFilled();
     }
 
     if (filled) {
@@ -73,7 +69,14 @@ try {
       if (submit) {
         await submit.click();
         await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(1000);
+        await page.waitForFunction(() => {
+          const visiblePassword = [...document.querySelectorAll('input[type="password"]')].some((element) => {
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+          });
+          return !visiblePassword || !/(?:^|#\/)login(?:[/?#]|$)/i.test(location.href);
+        }, null, { timeout: 15000 }).catch(() => {});
         const stillHasPassword = await page.locator('input[type="password"]:visible').count() > 0;
         status = stillHasPassword ? "needs_attention" : "logged_in";
       } else {

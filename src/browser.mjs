@@ -6,6 +6,7 @@ import { assertBookmarkNavigation, safeErrorMessage, safeLogUrl } from "./securi
 import { recognizeOpenCdCaptcha } from "./captcha-ocr.mjs";
 import { solveU2VisualChallenge } from "./u2-vision.mjs";
 import { resolveQaByWebSearch } from "./qa-solver.mjs";
+import { withRetrySchedule } from "./retry-policy.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
@@ -54,6 +55,22 @@ async function waitForManagedChallenge(page, config) {
     await sleep(2000);
   }
   return { status: "managed_challenge_timeout", reason: "托管安全验证等待超时" };
+}
+
+async function acceptConfiguredTerms(page, state, activeOrigin, config) {
+  if (state.status !== "login_required"
+    || !(config.autoAcceptUpdatedTermsOrigins ?? []).includes(activeOrigin)) return state;
+  const bodyText = String(await page.locator("body").innerText({ timeout: 3000 }).catch(() => ""));
+  if (!/服务条款已.*更新|继续使用服务之前.*同意|同意并继续/.test(bodyText)) return state;
+  const acceptButton = page.locator("button").filter({ hasText: /^\s*同意并继续\s*$/ });
+  if (await acceptButton.count() !== 1 || !await acceptButton.isVisible().catch(() => false)) return state;
+  await acceptButton.click({ timeout: 10000 });
+  await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+  await sleep(Math.max(1000, Number(config.actionWaitMs) || 0));
+  const acceptedState = await snapshotState(page);
+  return acceptedState.status === "login_required"
+    ? { ...acceptedState, reason: "已同意新版服务条款，继续执行自动登录" }
+    : acceptedState;
 }
 
 async function passLeichiConfirmation(page, config) {
@@ -607,6 +624,7 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
     }
   }
   let state = await waitForManagedChallenge(page, config);
+  state = await acceptConfiguredTerms(page, state, activeOrigin, config);
   if (state.status !== "ready") return { ...state, url: safeLogUrl(page.url()) };
 
   const hddolbyResult = await tryHddolbyPostRedirectVerification(page, activeOrigin, config);
@@ -649,6 +667,7 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
       activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
       activeOrigin = new URL(activeUrl).origin;
       state = await waitForManagedChallenge(page, config);
+      state = await acceptConfiguredTerms(page, state, activeOrigin, config);
       if (state.status !== "ready") return { ...state, url: safeLogUrl(page.url()) };
       action = await findCheckinAction(page, allowedOrigins);
       if (action) break;
@@ -660,6 +679,7 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
     activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
     activeOrigin = new URL(activeUrl).origin;
     state = await waitForManagedChallenge(page, config);
+    state = await acceptConfiguredTerms(page, state, activeOrigin, config);
     if (["signed", "already_signed", "login_required", "interactive_challenge", "managed_challenge_timeout"].includes(state.status)) {
       return { ...state, action: action.text, url: safeLogUrl(page.url()) };
     }
@@ -746,7 +766,10 @@ export async function processTarget(context, target, config, qaRules, logDirecto
     const page = await context.newPage();
     try {
       for (const candidateUrl of target.candidates) {
-        const result = await processCandidate(page, target, candidateUrl, config, qaRules);
+        const result = withRetrySchedule(
+          await processCandidate(page, target, candidateUrl, config, qaRules),
+          config,
+        );
         lastResult = result;
         // A logical bookmark target can contain multiple related URLs.  One
         // public/API URL may require login while another dedicated check-in

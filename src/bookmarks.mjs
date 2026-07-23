@@ -56,6 +56,23 @@ export async function listBookmarkFolderCandidates(bookmarksPath) {
     .slice(0, 100);
 }
 
+export async function listBookmarkFolderCandidatesWithBackup(bookmarksPath) {
+  const failures = [];
+  for (let index = 0; index < 2; index += 1) {
+    const candidatePath = index === 0 ? bookmarksPath : `${bookmarksPath}.bak`;
+    try {
+      const candidates = await listBookmarkFolderCandidates(candidatePath);
+      if (candidates.length > 0) {
+        return { candidates, bookmarkPath: candidatePath, recoveredFromBackup: index > 0 };
+      }
+      failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"} 中没有可选目录`);
+    } catch (error) {
+      failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"}：${error.message}`);
+    }
+  }
+  throw new Error(`无法列出有效书签目录（${failures.join("；")}）`);
+}
+
 export function normalizeHttpUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);

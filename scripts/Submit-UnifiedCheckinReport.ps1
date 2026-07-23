@@ -30,34 +30,47 @@ $statuses = @($results | ForEach-Object { [string]$_.status })
 $done = @($statuses | Where-Object { $_ -in @('signed', 'already_signed') }).Count
 $notAvailable = @($statuses | Where-Object { $_ -eq 'not_available' }).Count
 $problems = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+$attentionCount = @($problems | Where-Object { $_.status -in @('interactive_challenge', 'login_required', 'needs_attention') }).Count
+$timeoutCount = @($problems | Where-Object { $_.status -eq 'managed_challenge_timeout' }).Count
+$hardFailureCount = @($problems | Where-Object { $_.status -in @('error', 'failed') }).Count
 
 if ($RunnerStatus -eq 'timeout') { $status = 'timeout' }
-elseif ($problems.status -contains 'interactive_challenge' -or $problems.status -contains 'login_required') { $status = 'needs_attention' }
-elseif ($problems.status -contains 'managed_challenge_timeout') { $status = 'timeout' }
-elseif ($problems.status -contains 'error' -or $problems.status -contains 'failed' -or $RunnerStatus -eq 'failed') { $status = 'failed' }
-elseif ($problems.Count -gt 0) { $status = 'unconfirmed' }
-elseif ($statuses -contains 'signed') { $status = 'success' }
-elseif ($statuses -contains 'already_signed') { $status = 'already_done' }
-else { $status = 'skipped' }
+elseif ($results.Count -gt 0 -and $problems.Count -eq 0 -and $statuses -contains 'signed') { $status = 'success' }
+elseif ($results.Count -gt 0 -and $problems.Count -eq 0 -and $statuses -contains 'already_signed') { $status = 'already_done' }
+elseif ($results.Count -gt 0 -and $problems.Count -eq 0) { $status = 'skipped' }
+elseif ($results.Count -gt 0 -and $attentionCount -gt 0) { $status = 'needs_attention' }
+elseif ($results.Count -gt 0 -and ($done -gt 0 -or $notAvailable -gt 0)) { $status = 'unconfirmed' }
+elseif ($results.Count -gt 0 -and $timeoutCount -eq $results.Count) { $status = 'timeout' }
+elseif ($results.Count -gt 0 -and $hardFailureCount -eq $results.Count) { $status = 'failed' }
+elseif ($results.Count -gt 0 -and $statuses -contains 'deferred') { $status = 'skipped' }
+elseif ($results.Count -gt 0) { $status = 'unconfirmed' }
+elseif ($RunnerStatus -eq 'failed') { $status = 'failed' }
+elseif ($RunnerStatus -eq 'skipped') { $status = 'skipped' }
+else { $status = 'unconfirmed' }
 
-$summary = if ($results.Count -gt 0) { "共 $($results.Count) 站：完成 $done，未开放 $notAvailable，异常 $($problems.Count)。" } else { Compress-Text $RunnerMessage 160 }
+$summary = if ($results.Count -gt 0) { "共 $($results.Count) 站：`n$done 个签到正常`n$notAvailable 个未开放签到" } else { Compress-Text $RunnerMessage 160 }
 if ($problems.Count -gt 0) {
-    $brief = @($problems | Select-Object -First 3 | ForEach-Object {
+    $summary += "`n需关注 $($problems.Count) 个："
+    $brief = @($problems | ForEach-Object {
         $hostName = try { ([uri]$_.origin).DnsSafeHost } catch { Compress-Text $_.origin 30 }
         $reason = switch ([string]$_.status) {
             'login_required' { '登录失效' }
             'interactive_challenge' { '需要验证' }
             'managed_challenge_timeout' { '验证超时' }
+            'deferred' {
+                if ($_.nextEligibleAt) { try { "限频，计划 $(([datetime]$_.nextEligibleAt).ToLocalTime().ToString('HH:mm')) 重试" } catch { '限频，已安排重试' } }
+                else { '限频，已安排重试' }
+            }
             'no_action' { '未找到入口' }
             'visited' { '结果未确认' }
             'clicked' { '结果未确认' }
             default { Compress-Text $_.reason 40 }
         }
-        "$hostName：$reason"
-    }) -join '；'
-    $summary += " 异常：$brief"
+        "- $hostName：$reason"
+    }) -join "`n"
+    $summary += "`n$brief"
 }
-$summary = Compress-Text $summary 300
+if ($summary.Length -gt 950) { $summary = $summary.Substring(0, 947) + "…`n（其余站点请查看本地日志）" }
 
 $notification = $config.notification
 $mode = if ($notification.mode) { [string]$notification.mode } else { 'none' }
