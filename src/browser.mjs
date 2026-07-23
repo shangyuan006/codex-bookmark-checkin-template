@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { classifyPageText, normalizeText, scoreActionText } from "./detector.mjs";
+import { classifyPageText, formatDailyReason, normalizeText, scoreActionText } from "./detector.mjs";
 import { assertBookmarkNavigation, safeErrorMessage, safeLogUrl } from "./security.mjs";
 import { recognizeOpenCdCaptcha } from "./captcha-ocr.mjs";
 import { solveU2VisualChallenge } from "./u2-vision.mjs";
@@ -106,6 +106,7 @@ async function findCheckinAction(page, allowedOrigins, excludedAction = null) {
         const href = new URL(candidate.href);
         if (!originSet.has(href.origin)) return false;
         if (/(attendance|check[-_]?in|showup|bakatest|sign|签到|簽到|申请额度|申請額度)/i.test(href.href)) return true;
+        if (/(?:领取|領取).*codex.*(?:权益|權益)|codex.*(?:权益|權益)/i.test(candidate.text)) return true;
         // Some NexusPHP trackers expose check-in as an onclick handler on a
         // same-page "#" link (for example onclick="signin(this)").  The
         // visible label remains the authoritative signal in that case.
@@ -134,7 +135,7 @@ async function clickCandidate(page, candidate) {
 async function tryQuotaRequestFlow(page, activeOrigin, config) {
   const rule = config.quotaRequestRules?.[activeOrigin];
   if (!rule) return null;
-  const reason = String(rule.reason || "今日正常使用服务，申请额度用于开发测试和日常体验，谢谢。");
+  const reason = formatDailyReason(String(rule.reason || "{date}正常使用服务，申请额度用于开发测试和日常体验，谢谢。"));
   const minimumLength = Math.max(10, Number(rule.minimumReasonLength) || 10);
   if ([...reason].length < minimumLength) throw new Error(`额度申请理由少于 ${minimumLength} 个字符`);
   const reasonFields = page.locator([
@@ -148,7 +149,7 @@ async function tryQuotaRequestFlow(page, activeOrigin, config) {
   if (await reasonFields.count() !== 1) return null;
   await reasonFields.fill(reason);
   let submit = null;
-  for (const label of ["提交申请", "确认申请", "确认提交", "提交", "确认"]) {
+  for (const label of ["领取", "領取", "提交申请", "确认申请", "确认提交", "提交", "确认"]) {
     const candidate = page.getByRole("button", { name: label, exact: true });
     if (await candidate.count() === 1 && await candidate.isVisible().catch(() => false)) { submit = candidate; break; }
     const input = page.locator(`input[type="submit"][value="${label}"], input[type="button"][value="${label}"]`);
@@ -161,7 +162,15 @@ async function tryQuotaRequestFlow(page, activeOrigin, config) {
   const state = await waitForManagedChallenge(page, config);
   if (["signed", "already_signed"].includes(state.status)) return state;
   const bodyText = String(await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-  if (/(额度申请已提交|申请额度成功|额度已发放|额度申请成功|申请成功.*额度|今日已申请|今天已申请)/i.test(bodyText)) return { status: "signed", reason: "额度申请已提交并获得页面确认" };
+  if (/(额度申请已提交|申请额度成功|额度已发放|额度申请成功|申请成功.*额度|今日已申请|今天已申请|codex\s*(?:权益|權益)\s*已(?:领取|領取)|(?:领取|領取)\s*codex\s*(?:权益|權益)\s*成功)/i.test(bodyText)) return { status: "signed", reason: "额度申请已提交并获得页面确认" };
+  const claimButton = page.getByRole("button", { name: "领取 Codex 权益", exact: true });
+  const claimButtonVisible = await claimButton.count() === 1 && await claimButton.isVisible().catch(() => false);
+  if (!claimButtonVisible
+    && /当前套餐\s*[-—:]?\s*Codex/i.test(bodyText)
+    && /剩余(?:额度|額度)|下次重置|有效期/i.test(bodyText)
+    && !/已过期|已過期/i.test(bodyText)) {
+    return { status: "signed", reason: "Codex 权益已领取，页面显示有效套餐" };
+  }
   return { status: "unconfirmed", reason: "额度申请已提交，但页面未确认结果" };
 }
 

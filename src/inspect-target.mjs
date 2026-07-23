@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readBookmarkPlan } from "./bookmarks.mjs";
+import { findBookmarkTarget } from "./bookmarks.mjs";
 import { launchAutomationContext } from "./browser.mjs";
 import { assertBookmarkNavigation, safeLogUrl } from "./security.mjs";
 
@@ -12,9 +12,7 @@ const requestedOrigin = process.argv[2];
 const requestedUrl = process.argv[3] || null;
 if (!requestedOrigin) throw new Error("用法: node src/inspect-target.mjs <origin>");
 
-const plan = await readBookmarkPlan(config.bookmarksPath, config);
-const target = plan.targets.find((candidate) => candidate.origin === requestedOrigin);
-if (!target) throw new Error("书签计划中没有找到指定站点");
+const { target } = await findBookmarkTarget(config.bookmarksPath, requestedOrigin, config);
 
 const context = await launchAutomationContext(config);
 try {

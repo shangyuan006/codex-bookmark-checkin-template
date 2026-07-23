@@ -28,7 +28,7 @@ function Test-LatestReportValid([datetime]$now, $config, [Nullable[datetime]]$no
     $latestPath = Join-Path $root 'logs\latest.json'
     if (-not (Test-Path -LiteralPath $latestPath)) { return $false }
     try {
-        if ($null -ne $notBefore -and (Get-Item -LiteralPath $latestPath).LastWriteTime -lt $notBefore.Value.AddSeconds(-2)) { return $false }
+        if ($null -ne $notBefore -and (Get-Item -LiteralPath $latestPath).LastWriteTime -lt ([datetime]$notBefore).AddSeconds(-2)) { return $false }
         $latest = Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json
         $minimumTargets = [Math]::Max(1, [int]$config.minimumBookmarkTargetCount)
         return [string]$latest.runId -like "$($now.ToString('yyyyMMdd'))-*" -and @($latest.results).Count -ge $minimumTargets

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readBookmarkPlan } from "./bookmarks.mjs";
+import { findBookmarkTarget } from "./bookmarks.mjs";
 import { launchAutomationContext } from "./browser.mjs";
 import { safeLogUrl } from "./security.mjs";
 
@@ -12,8 +12,7 @@ const requestedOrigin = process.argv[2];
 const provider = process.argv[3] || "LinuxDO";
 if (!requestedOrigin) throw new Error("用法: node src/oauth-login.mjs <origin> [provider]");
 const origin = new URL(requestedOrigin).origin;
-const plan = await readBookmarkPlan(config.bookmarksPath, config);
-if (!plan.targets.some((target) => target.origin === origin)) throw new Error("目标不在签到书签范围内");
+await findBookmarkTarget(config.bookmarksPath, origin, config);
 
 async function trySavedLinuxDoLogin(page) {
   const location = new URL(page.url());

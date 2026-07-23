@@ -192,6 +192,48 @@ export async function readBookmarkPlan(bookmarksPath, options = {}) {
   };
 }
 
+export async function findBookmarkTarget(bookmarksPath, requestedOrigin, options = {}) {
+  const origin = new URL(requestedOrigin).origin;
+  const candidates = [bookmarksPath, `${bookmarksPath}.bak`];
+  const failures = [];
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidatePath = candidates[index];
+    try {
+      const plan = await readBookmarkPlan(candidatePath, options);
+      const target = plan.targets.find((item) => item.origin === origin);
+      if (target) {
+        return {
+          plan: { ...plan, recoveredFromBackup: index > 0 },
+          target,
+          bookmarkPath: candidatePath,
+          recoveredFromBackup: index > 0,
+        };
+      }
+      failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"} 中没有目标站点`);
+    } catch (error) {
+      failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"}：${error.message}`);
+    }
+  }
+
+  throw new Error(`目标不在签到书签范围内（${failures.join("；")}）`);
+}
+
+export async function readBookmarkPlanWithBackup(bookmarksPath, options = {}) {
+  const candidates = [bookmarksPath, `${bookmarksPath}.bak`];
+  const failures = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    try {
+      const plan = await readBookmarkPlan(candidates[index], options);
+      if (plan.targetCount > 0) return { ...plan, recoveredFromBackup: index > 0 };
+      failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"} 中没有签到目标`);
+    } catch (error) {
+      failures.push(`${index > 0 ? "Bookmarks.bak" : "Bookmarks"}：${error.message}`);
+    }
+  }
+  throw new Error(`无法读取有效签到书签（${failures.join("；")}）`);
+}
+
 export function publicBookmarkReport(plan) {
   return {
     generatedAt: plan.generatedAt,

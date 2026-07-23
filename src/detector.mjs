@@ -4,12 +4,27 @@ const CHECKIN_EXACT = new Set([
   "福利站", "check in", "check-in", "daily check in", "daily check-in", "attendance",
   "开始转动", "開始轉動", "转动转盘", "轉動轉盤",
   "申请额度", "申請額度",
+  "领取 codex 权益", "領取 codex 權益", "领取codex权益", "領取codex權益",
 ]);
 
 const EXCLUDED_ACTIONS = /(签到记录|簽到記錄|签到排行|签到规则|补签|補簽|历史|history|rules?)/i;
 
 export function normalizeText(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+export function formatDailyReason(template, now = new Date()) {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+  }).formatToParts(now).reduce((result, part) => {
+    if (part.type !== "literal") result[part.type] = part.value;
+    return result;
+  }, {});
+  const date = `${parts.year}年${parts.month}月${parts.day}日`;
+  return String(template ?? "").replaceAll("{date}", date);
 }
 
 export function classifyPageText({ url = "", title = "", bodyText = "", hasPassword = false, challengeSelectors = false }) {
@@ -30,6 +45,10 @@ export function classifyPageText({ url = "", title = "", bodyText = "", hasPassw
     return { status: "login_required", reason: "页面要求通过 Linux DO 登录" };
   }
 
+  if (/(操作过于频繁|操作過於頻繁|请求过于频繁|請求過於頻繁|too many requests|rate limit|try again later|请稍后再试|請稍後再試)/i.test(text)) {
+    return { status: "deferred", reason: "站点触发频率限制，请稍后重试" };
+  }
+
   // Visible Turnstile/recaptcha widgets and an explicit checkbox prompt need
   // interaction.  Mere explanatory copy such as “完成人机验证即可签到” does
   // not prove that a challenge is currently active.
@@ -42,10 +61,10 @@ export function classifyPageText({ url = "", title = "", bodyText = "", hasPassw
   if ((/(^|\s)(登录|登入)(\s|$)/.test(text) && /注册/.test(text)) || (/(^|\s)log[ -]?in(\s|$)/i.test(text) && /sign[ -]?up/i.test(text))) {
     return { status: "login_required", reason: "页面仅显示登录/注册入口" };
   }
-  if (/(今日已签到|今天已签到|今天已经签到过|已经签到|已完成签到|已签到|已簽到|签到已得\s*\d*|簽到已得\s*\d*|查看(?:签到|簽到)(?:记录|記錄).{0,20}\d{1,2}(?:点|點)|無需重複簽到|无需重复签到|already checked[ -]?in|checked in today)/i.test(text)) {
+  if (/(今日已签到|今天已签到|今天已经签到过|已经签到|已完成签到|已签到|已簽到|签到已得\s*\d*|簽到已得\s*\d*|查看(?:签到|簽到)(?:记录|記錄).{0,20}\d{1,2}(?:点|點)|無需重複簽到|无需重复签到|codex\s*(?:权益|權益)\s*已(?:领取|領取)|already checked[ -]?in|checked in today)/i.test(text)) {
     return { status: "already_signed", reason: "今天已经签到" };
   }
-  if (/(签到成功|簽到成功|成功签到|成功簽到|打卡成功|回答正确|回答正確|本次签到获得|本次簽到獲得|申请额度成功|申請額度成功|额度已发放|額度已發放|额度申请成功|額度申請成功|额度申请已提交|額度申請已提交|申请已提交|申請已提交|申请成功.*额度|申請成功.*額度|successfully checked[ -]?in)/i.test(text)) {
+  if (/(签到成功|簽到成功|成功签到|成功簽到|打卡成功|回答正确|回答正確|本次签到获得|本次簽到獲得|申请额度成功|申請額度成功|额度已发放|額度已發放|额度申请成功|額度申請成功|额度申请已提交|額度申請已提交|申请已提交|申請已提交|申请成功.*额度|申請成功.*額度|(?:领取|領取)\s*codex\s*(?:权益|權益)\s*成功|codex\s*(?:权益|權益)\s*(?:领取|領取)成功|successfully checked[ -]?in)/i.test(text)) {
     return { status: "signed", reason: "页面显示签到成功" };
   }
   return { status: "ready", reason: "页面可继续处理" };
@@ -57,6 +76,7 @@ export function scoreActionText(rawText) {
     .replace(/\s*[\]】)）]+$/, "");
   if (!text || EXCLUDED_ACTIONS.test(text)) return -1;
   if (CHECKIN_EXACT.has(text)) return 100;
+  if (/^(?:领取|領取)\s*codex\s*(?:权益|權益)$/i.test(text)) return 100;
   if (/^(立即|每日|今日|去)?[签到簽到打卡]{2,6}$/.test(text)) return 95;
   if (/(领取|領取).*(每日|今日).*(奖励|獎勵)/.test(text)) return 85;
   if (/^(daily )?(check[ -]?in|attendance)$/.test(text)) return 90;

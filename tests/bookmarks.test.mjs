@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { listBookmarkFolderCandidates, readBookmarkPlan } from "../src/bookmarks.mjs";
+import { findBookmarkTarget, listBookmarkFolderCandidates, readBookmarkPlan, readBookmarkPlanWithBackup } from "../src/bookmarks.mjs";
 
 test("不预设名称时列出候选书签目录供用户选择", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "checkin-candidates-"));
@@ -88,4 +88,37 @@ test("仅从显式配置加入关联签到入口", async () => {
   });
   assert.deepEqual(plan.targets[0].candidates, ["https://old.example/console", "https://new.example/"]);
   assert.deepEqual(plan.targets[0].allowedOrigins, ["https://old.example", "https://new.example"]);
+});
+
+test("登录恢复可从 Bookmarks.bak 找到主文件缺失的目标", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "checkin-login-bookmarks-"));
+  const file = path.join(directory, "Bookmarks");
+  await fs.writeFile(file, JSON.stringify({
+    roots: { synced: { id: "1", type: "folder", name: "我的自动任务", children: [] } },
+  }));
+  await fs.writeFile(`${file}.bak`, JSON.stringify({
+    roots: {
+      synced: {
+        id: "1", type: "folder", name: "我的自动任务", children: [{
+          id: "2", type: "folder", name: "每日领取", children: [
+            { id: "3", type: "url", name: "Vibe Code", url: "https://service.example/dashboard" },
+          ],
+        }],
+      },
+    },
+  }));
+
+  const found = await findBookmarkTarget(file, "https://service.example", {
+    mobileFolderNames: ["我的自动任务"],
+    targetFolderNames: ["每日领取"],
+  });
+  assert.equal(found.target.origin, "https://service.example");
+  assert.equal(found.recoveredFromBackup, true);
+  assert.equal(found.plan.recoveredFromBackup, true);
+  const fallbackPlan = await readBookmarkPlanWithBackup(file, {
+    mobileFolderNames: ["我的自动任务"],
+    targetFolderNames: ["每日领取"],
+  });
+  assert.equal(fallbackPlan.targetCount, 1);
+  assert.equal(fallbackPlan.recoveredFromBackup, true);
 });

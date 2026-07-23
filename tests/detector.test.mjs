@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyPageText, scoreActionText, solveArithmeticQuestion } from "../src/detector.mjs";
+import { classifyPageText, formatDailyReason, scoreActionText, solveArithmeticQuestion } from "../src/detector.mjs";
 
 test("识别已签到状态", () => {
   assert.equal(classifyPageText({ bodyText: "您今日已签到，请明天再来" }).status, "already_signed");
@@ -17,6 +17,8 @@ test("识别签到成功状态", () => {
   assert.equal(classifyPageText({ bodyText: "回答正确，签到奖励已发放。" }).status, "signed");
   assert.equal(classifyPageText({ bodyText: "申请额度成功，额度已发放。" }).status, "signed");
   assert.equal(classifyPageText({ bodyText: "额度申请已提交，请稍后查看。" }).status, "signed");
+  assert.equal(classifyPageText({ bodyText: "领取 Codex 权益成功" }).status, "signed");
+  assert.equal(classifyPageText({ bodyText: "Codex 权益已领取" }).status, "already_signed");
 });
 
 test("带图片验证码的登录页仍识别为登录失效", () => {
@@ -50,6 +52,14 @@ test("识别带连字符的登录路径", () => {
   assert.equal(classifyPageText({ url: "https://example.test/sign-in?redirect=%2Fconsole" }).status, "login_required");
 });
 
+test("识别站点频率限制并延后处理", () => {
+  assert.equal(classifyPageText({ bodyText: "操作过于频繁，请稍后再试" }).status, "deferred");
+});
+
+test("额度申请理由按上海日期生成唯一文案", () => {
+  assert.equal(formatDailyReason("{date} 用于开发测试", new Date("2026-07-23T00:30:00Z")), "2026年7月23日 用于开发测试");
+});
+
 test("识别公开首页的登录注册入口", () => {
   assert.equal(classifyPageText({ bodyText: "首页 控制台 登录 注册 获取密钥" }).status, "login_required");
 });
@@ -60,6 +70,8 @@ test("只选择明确的签到动作", () => {
   assert.ok(scoreActionText("福利站") > 0);
   assert.ok(scoreActionText("开始转动") > 0);
   assert.ok(scoreActionText("申请额度") > 0);
+  assert.ok(scoreActionText("领取 Codex 权益") > 0);
+  assert.ok(scoreActionText("領取Codex權益") > 0);
   assert.equal(scoreActionText("签到记录"), -1);
   assert.equal(scoreActionText("购买"), -1);
 });

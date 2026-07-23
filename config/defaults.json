@@ -5,7 +5,7 @@
   "quotaRequestRules": {
     "https://new.sharedchat.cc": {
       "minimumReasonLength": 10,
-      "reason": "今日正常使用服务，申请额度用于开发测试和日常体验，谢谢。"
+      "reason": "{date}正常使用服务，申请额度用于开发测试和日常体验，谢谢。"
     }
   },
   "relatedCandidateUrls": {},

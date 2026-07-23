@@ -1,13 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readBookmarkPlan } from "./bookmarks.mjs";
+import { readBookmarkPlanWithBackup } from "./bookmarks.mjs";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
 const config = JSON.parse(await fs.readFile(path.join(rootDirectory, "config", "config.json"), "utf8"));
 const latest = JSON.parse(await fs.readFile(path.join(rootDirectory, "logs", "latest.json"), "utf8"));
-const plan = await readBookmarkPlan(config.bookmarksPath, config);
+const plan = await readBookmarkPlanWithBackup(config.bookmarksPath, config);
 const completed = new Set(["signed", "already_signed", "visited", "clicked"]);
 
 const items = [];
