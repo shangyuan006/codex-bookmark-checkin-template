@@ -39,6 +39,8 @@ pwsh -NoProfile -File .\scripts\Test-Environment.ps1 `
 - 主 Chrome 配置只作为只读来源；后台运行始终使用独立配置，并为原生登录窗口禁用同步。
 - 默认不配置外部通知。用户可选择安全的命令型通知器，敏感值应从环境变量或凭据管理器读取。
 
+Chrome 保存密码和 OAuth 都无法恢复的站点，可选择使用 Windows DPAPI 凭据。运行 `scripts\Set-ProtectedSiteCredential.ps1 -Origin https://example.com` 交互录入，用户名和密码不会显示；密文只写入被 Git 忽略的 `data\credentials\`，且仅能由当前 Windows 用户解密。随后在本机 `config/config.json` 的 `protectedCredentialOrigins` 中加入站点，并按需配置 `protectedLoginVerificationPaths` 和 `siteStorageBootstrap`。登录器只通过子进程标准输入接收临时明文，不写命令行或日志。
+
 ## 目录边界
 
 - `config/site-rules.public.json`：可公开复用的站点规则。

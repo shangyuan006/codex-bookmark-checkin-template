@@ -45,3 +45,18 @@ test("本机配置、结果和凭据目录被 Git 忽略", async () => {
     assert.match(ignore, new RegExp(pattern.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
   }
 });
+
+test("DPAPI 凭据恢复默认关闭且强制同源验证", async () => {
+  const defaults = JSON.parse(await fs.readFile(new URL("../config/defaults.json", import.meta.url), "utf8"));
+  const loginSource = await fs.readFile(new URL("../src/credential-login.mjs", import.meta.url), "utf8");
+  const setter = await fs.readFile(new URL("../scripts/Set-ProtectedSiteCredential.ps1", import.meta.url), "utf8");
+  const recovery = await fs.readFile(new URL("../scripts/Recover-ProtectedLogin.ps1", import.meta.url), "utf8");
+
+  assert.deepEqual(defaults.protectedCredentialOrigins, []);
+  assert.deepEqual(defaults.protectedLoginVerificationPaths, {});
+  assert.match(loginSource, /new URL\(loginUrl\)\.origin !== origin/);
+  assert.match(loginSource, /verificationUrl\.origin !== origin/);
+  assert.match(setter, /ConvertFrom-SecureString/);
+  assert.match(recovery, /RedirectStandardInput = \$true/);
+  assert.doesNotMatch(recovery, /ArgumentList\.Add\(\$passwordPlain\)/);
+});

@@ -1,0 +1,143 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { findBookmarkTarget } from "./bookmarks.mjs";
+import { launchAutomationContext } from "./browser.mjs";
+import { assertBookmarkNavigation, safeLogUrl } from "./security.mjs";
+
+const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
+const rootDirectory = path.dirname(sourceDirectory);
+const config = JSON.parse(await fs.readFile(path.join(rootDirectory, "config", "config.json"), "utf8"));
+const requestedOrigin = process.argv[2];
+const requestedLoginUrl = process.argv[3];
+if (!requestedOrigin || !requestedLoginUrl) throw new Error("用法: credential-login.mjs <origin> <login-url>");
+const origin = new URL(requestedOrigin).origin;
+const { target } = await findBookmarkTarget(config.bookmarksPath, origin, config);
+const loginUrl = assertBookmarkNavigation(requestedLoginUrl, target.allowedOrigins ?? [origin]);
+if (new URL(loginUrl).origin !== origin) throw new Error("受保护登录地址必须与凭据来源同源");
+
+let input = "";
+for await (const chunk of process.stdin) {
+  input += chunk;
+  if (input.length > 16 * 1024) throw new Error("凭据输入超过安全上限");
+}
+const credential = JSON.parse(input);
+if (typeof credential.username !== "string" || credential.username.length < 1 || credential.username.length > 320
+  || typeof credential.password !== "string" || credential.password.length < 1 || credential.password.length > 1024) {
+  throw new Error("凭据输入格式无效");
+}
+
+function isLoginUrl(value) {
+  try { return /\/(?:log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)|#\/(?:log[-_]?in|sign[-_]?in)(?:[/?#]|$)/i.test(new URL(value).href); }
+  catch { return true; }
+}
+
+async function persistConfiguredStorage(activePage) {
+  const relativeFile = config.siteStorageBootstrap?.[origin];
+  if (!relativeFile || new URL(activePage.url()).origin !== origin) return false;
+  const storagePath = path.resolve(rootDirectory, String(relativeFile));
+  const allowedRoot = path.resolve(rootDirectory, "data");
+  if (!storagePath.startsWith(`${allowedRoot}${path.sep}`)) throw new Error("会话引导文件不在私有数据目录内");
+  const storage = await activePage.evaluate(() => ({
+    local: Object.entries(localStorage),
+    session: Object.entries(sessionStorage),
+  }));
+  await fs.mkdir(path.dirname(storagePath), { recursive: true });
+  const temporary = `${storagePath}.${process.pid}.tmp`;
+  const current = await fs.readFile(storagePath).catch(() => null);
+  if (current) await fs.writeFile(`${storagePath}.bak`, current, { mode: 0o600 });
+  await fs.writeFile(temporary, `${JSON.stringify({
+    version: 1,
+    origin,
+    capturedAt: new Date().toISOString(),
+    ...storage,
+  }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await fs.rename(temporary, storagePath);
+  return true;
+}
+
+const loginConfig = { ...config, siteStorageBootstrap: { ...(config.siteStorageBootstrap ?? {}) } };
+delete loginConfig.siteStorageBootstrap[origin];
+const context = await launchAutomationContext(loginConfig);
+let status = "failed";
+let page;
+let storageSaved = false;
+let authCheckStatus = null;
+try {
+  page = await context.newPage();
+  await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
+  await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+  const password = page.locator('input[type="password"]:visible');
+  if (await password.count() < 1) {
+    status = isLoginUrl(page.url()) ? "unsupported" : "logged_in";
+  } else {
+    const usernames = page.locator('input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"])');
+    if (await usernames.count() < 1) status = "unsupported";
+    else {
+      await usernames.first().fill(credential.username);
+      await password.first().fill(credential.password);
+      let submit = null;
+      for (const label of ["登录", "登入", "用户登录", "用戶登入", "Log in", "Sign in"]) {
+        const candidate = page.getByRole("button", { name: label, exact: true });
+        if (await candidate.count() === 1 && await candidate.isVisible()) { submit = candidate; break; }
+      }
+      if (!submit) {
+        const fallback = page.locator('button[type="submit"]:visible, input[type="submit"]:visible');
+        if (await fallback.count() >= 1) submit = fallback.first();
+      }
+      if (!submit) status = "unsupported";
+      else {
+        await submit.click({ timeout: 10000 }).catch(() => {});
+        const deadline = Date.now() + Math.max(30000, Math.min(90000, Number(config.cloudflareWaitMs) || 60000));
+        while (Date.now() < deadline) {
+          const stillHasPassword = await page.locator('input[type="password"]:visible').count() > 0;
+          if (!stillHasPassword && !isLoginUrl(page.url())) { status = "logged_in"; break; }
+          const cap = page.locator('cap-widget:visible, [data-cap-api-endpoint]:visible');
+          if (await cap.count() === 1) await cap.click({ timeout: 5000 }).catch(() => {});
+          await page.waitForTimeout(1000);
+        }
+        if (status !== "logged_in") {
+          const text = String(await page.locator("body").innerText().catch(() => ""));
+          status = /(密码错误|账号或密码|invalid credentials|incorrect password)/i.test(text)
+            ? "invalid_credential"
+            : (await page.locator('cap-widget:visible, .cf-turnstile:visible, .h-captcha:visible').count() > 0
+              ? "needs_attention"
+              : "failed");
+        }
+      }
+    }
+  }
+  if (status === "logged_in") {
+    await page.waitForTimeout(1200);
+    await page.reload({ waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs }).catch(() => {});
+    const passwordVisible = await page.locator('input[type="password"]:visible').count() > 0;
+    if (passwordVisible || isLoginUrl(page.url())) status = "failed";
+    else {
+      const verificationPath = config.protectedLoginVerificationPaths?.[origin];
+      const verificationUrl = verificationPath ? new URL(verificationPath, origin) : null;
+      if (verificationUrl && (verificationUrl.protocol !== "https:" || verificationUrl.origin !== origin)) {
+        throw new Error("登录验证端点必须与凭据来源同源");
+      }
+      authCheckStatus = verificationUrl ? await page.evaluate(async (pathValue) => {
+        const token = localStorage.getItem("auth_token");
+        const headers = { Accept: "application/json" };
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const response = await fetch(pathValue, { credentials: "include", headers }).catch(() => null);
+        return response?.status ?? 0;
+      }, verificationUrl.href) : 200;
+      if (authCheckStatus === 200) storageSaved = await persistConfiguredStorage(page);
+      else status = "failed";
+    }
+  }
+  process.stdout.write(JSON.stringify({ status, origin, finalUrl: safeLogUrl(page.url()), storageSaved, authCheckStatus }));
+  if (status !== "logged_in") process.exitCode = 2;
+} catch (error) {
+  status = /Timeout|timed out/i.test(String(error?.message ?? error)) ? "timeout" : "failed";
+  process.stdout.write(JSON.stringify({ status, origin }));
+  process.exitCode = 2;
+} finally {
+  credential.username = "";
+  credential.password = "";
+  await context.close();
+}

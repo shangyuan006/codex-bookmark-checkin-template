@@ -268,6 +268,13 @@ try {
         const target = selectedTargets[resultIndex];
         const provider = config.automaticOAuthProviders?.[current.origin];
         const methods = [];
+        if ((config.protectedCredentialOrigins ?? []).includes(current.origin)) {
+          methods.push({
+            method: "protected_credential",
+            executable: config.powershellExecutable || "pwsh.exe",
+            args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-ProtectedLogin.ps1"), "-Origin", current.origin, "-LoginUrl", current.url ?? `${current.origin}/login`],
+          });
+        }
         if (provider) methods.push({ method: "oauth", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, provider] });
         else if (config.autoDetectLinuxDoOAuth !== false && target.folderNames.includes("公益站")) {
           methods.push({ method: "oauth_autodetect", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, "LinuxDO"] });
