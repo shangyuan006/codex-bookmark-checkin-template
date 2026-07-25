@@ -5,13 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { powershellExecutable } from "./helpers/powershell.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const cleaner = path.join(root, "scripts", "Clear-AutomationChromeCache.ps1");
 
 async function runCleaner(configPath, apply = false) {
-  const { stdout } = await execFileAsync("pwsh.exe", [
+  const { stdout } = await execFileAsync(powershellExecutable, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
     "-File", cleaner, "-ConfigPath", configPath, ...(apply ? ["-Apply"] : []),
   ], { cwd: root, encoding: "utf8" });

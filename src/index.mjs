@@ -37,6 +37,7 @@ const localQaConfig = await fs.readFile(path.join(rootDirectory, "config", "qa-r
     throw error;
   });
 const dryRun = process.argv.includes("--dry-run");
+const listPreflightTargets = process.argv.includes("--list-preflight-targets");
 const ignoreNativePreflight = process.argv.includes("--ignore-native-preflight");
 const limitIndex = process.argv.indexOf("--limit");
 const offsetIndex = process.argv.indexOf("--offset");
@@ -107,7 +108,12 @@ try {
   const reportPath = path.join(rootDirectory, "outputs", "bookmark-comparison.json");
   await atomicWriteJson(reportPath, report);
 
-  if (dryRun) {
+  if (listPreflightTargets) {
+    console.log(JSON.stringify(plan.targets.map((target) => ({
+      origin: target.origin,
+      allowedOrigins: target.allowedOrigins ?? [target.origin],
+    }))));
+  } else if (dryRun) {
     console.log(JSON.stringify(report, null, 2));
   } else {
     const profileMarker = path.join(config.automationUserDataDir, "Local State");

@@ -1,5 +1,7 @@
 ﻿[CmdletBinding()]
 param(
+    [ValidateSet('Auto', 'Chrome', 'Edge')]
+    [string]$Browser = 'Auto',
     [string[]]$ContainerFolderNames = @(),
     [string[]]$TargetFolderNames = @()
 )
@@ -31,7 +33,7 @@ if (-not $nodeCommand) {
     return
 }
 
-$nodeArguments = @((Join-Path $root 'src\preflight.mjs'))
+$nodeArguments = @((Join-Path $root 'src\preflight.mjs'), '--browser', $Browser)
 if ($resolvedContainerNames.Count -gt 0 -or $resolvedTargetNames.Count -gt 0) {
     if ($resolvedContainerNames.Count -eq 0 -or $resolvedTargetNames.Count -eq 0) {
         throw 'ContainerFolderNames 和 TargetFolderNames 必须同时提供。'

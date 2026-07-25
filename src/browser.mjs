@@ -789,14 +789,16 @@ async function saveFailureScreenshot(page, logDirectory, target) {
 }
 
 export async function launchAutomationContext(config) {
-  await fs.access(config.chromeExecutable);
+  const browserExecutable = config.browserExecutable ?? config.chromeExecutable;
+  if (!browserExecutable) throw new Error("Browser executable is not configured");
+  await fs.access(browserExecutable);
   const disabledFeatures = [
     "Translate",
     "MediaRouter",
     ...(config.disableOptimizationGuideOnDeviceModel === false ? [] : ["OptimizationGuideOnDeviceModel"]),
   ];
   const context = await chromium.launchPersistentContext(config.automationUserDataDir, {
-    executablePath: config.chromeExecutable,
+    executablePath: browserExecutable,
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain", "--enable-automation"],
     headless: config.headless,
     locale: "zh-CN",

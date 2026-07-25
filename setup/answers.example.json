@@ -1,10 +1,11 @@
 {
-  "chromeProfile": "Auto",
+  "browser": "Auto",
+  "browserProfile": "Auto",
   "mobileFolderNames": [],
   "targetFolderNames": [],
   "schedule": "08:05",
   "useBuiltInSiteRules": true,
-  "syncChromeSavedLogins": false,
+  "syncBrowserSavedLogins": false,
   "autoDetectLinuxDoOAuth": true,
   "qaWebSearchEnabled": false,
   "checkinMessage": "今日天气不错",

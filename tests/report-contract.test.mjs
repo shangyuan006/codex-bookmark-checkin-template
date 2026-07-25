@@ -5,12 +5,12 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { powershellExecutable } from "./helpers/powershell.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const logsRoot = path.join(root, "logs");
 const reporter = path.join(root, "scripts", "Submit-UnifiedCheckinReport.ps1");
-const powershell = process.platform === "win32" ? "pwsh.exe" : "pwsh";
 
 async function previewReport(report, runnerStatus = "completed") {
   await fs.mkdir(logsRoot, { recursive: true });
@@ -18,7 +18,7 @@ async function previewReport(report, runnerStatus = "completed") {
   const reportPath = path.join(directory, "report.json");
   try {
     await fs.writeFile(reportPath, JSON.stringify(report), "utf8");
-    const { stdout } = await execFileAsync(powershell, [
+    const { stdout } = await execFileAsync(powershellExecutable, [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
       "-File", reporter,
       "-RunnerStatus", runnerStatus,

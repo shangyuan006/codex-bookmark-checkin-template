@@ -41,7 +41,7 @@ $settings = New-ScheduledTaskSettingsSet `
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
 $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
-    -Description '后台读取 Chrome 的签到与公益站书签，使用独立无界面浏览器每日签到。'
+    -Description '后台读取 Chrome 或 Edge 的签到与公益站书签，使用独立无界面浏览器每日签到。'
 
 try {
     Register-ScheduledTask -TaskName $taskName -InputObject $task -Force -ErrorAction Stop | Out-Null

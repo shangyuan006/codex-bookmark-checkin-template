@@ -27,3 +27,48 @@ function Resolve-CheckinPython {
     param($Config, [switch]$Optional)
     return Resolve-CheckinExecutable -Configured ([string]$Config.pythonExecutable) -CommandNames @('python.exe', 'python3.exe', 'python', 'python3') -Optional:$Optional
 }
+
+function Resolve-CheckinBrowser {
+    param($Config, [switch]$OptionalExecutable)
+
+    $configured = if ($Config.browserExecutable) {
+        [string]$Config.browserExecutable
+    }
+    else {
+        [string]$Config.chromeExecutable
+    }
+    $browserId = if ($Config.browser) { [string]$Config.browser } else { 'chrome' }
+    $commandNames = if ($browserId -eq 'edge') { @('msedge.exe') } else { @('chrome.exe') }
+    $executable = Resolve-CheckinExecutable -Configured $configured -CommandNames $commandNames -Optional:$OptionalExecutable
+    $processName = if ($Config.browserProcessName) {
+        [string]$Config.browserProcessName
+    }
+    else {
+        if ($executable) { [System.IO.Path]::GetFileName($executable) } else { [string]$commandNames[0] }
+    }
+    $displayName = if ($Config.browserDisplayName) {
+        [string]$Config.browserDisplayName
+    }
+    elseif ($browserId -eq 'edge') {
+        'Microsoft Edge'
+    }
+    else {
+        'Google Chrome'
+    }
+    return [pscustomobject]@{
+        Id = $browserId
+        DisplayName = $displayName
+        Executable = $executable
+        ProcessName = $processName
+    }
+}
+
+function Get-CheckinAutomationBrowserProcesses {
+    param($Config)
+
+    $browser = Resolve-CheckinBrowser $Config -OptionalExecutable
+    $profilePath = [System.IO.Path]::GetFullPath([string]$Config.automationUserDataDir)
+    return @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profilePath*"
+    })
+}

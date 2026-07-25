@@ -29,7 +29,7 @@ async function trySavedLinuxDoLogin(page) {
     return Boolean(user?.value && secret?.value);
   });
   if (!filled) {
-    // A real focus/keyboard gesture asks Chrome Password Manager to apply the
+    // A real focus/keyboard gesture asks the browser password manager to apply the
     // encrypted credential copied into this dedicated profile.  Values are
     // never read or logged by the automation.
     await username.click();
@@ -43,7 +43,7 @@ async function trySavedLinuxDoLogin(page) {
     });
   }
   if (!filled) {
-    // LinuxDO also exposes a Google login button.  Once the dedicated Chrome
+    // LinuxDO also exposes a Google login button.  Once the dedicated browser
     // has a valid Google session this is the simplest unattended recovery
     // path and does not require handling a password or Windows Hello prompt.
     const googleButton = page.getByRole("button", { name: "使用 Google 登录", exact: true });

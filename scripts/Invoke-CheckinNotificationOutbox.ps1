@@ -11,6 +11,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256Hex([byte[]]$Bytes) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash($Bytes)
+        return -join @($hash | ForEach-Object { $_.ToString('x2') })
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
 $root = Split-Path -Parent $PSScriptRoot
 $localConfigPath = Join-Path $root 'config\config.json'
 $defaultsPath = Join-Path $root 'config\defaults.json'
@@ -82,8 +93,7 @@ function Get-PayloadHash([object]$Item) {
         [string]$Item.eventKey, [string]$Item.taskId, [string]$Item.name,
         [string]$Item.source, [string]$Item.status, [string]$Item.summary
     ) -join "`n"
-    $hash = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($material))
-    return [System.Convert]::ToHexString($hash).ToLowerInvariant()
+    return Get-Sha256Hex ([System.Text.Encoding]::UTF8.GetBytes($material))
 }
 
 function Get-RetryDelayMinutes([int]$Attempts) {
@@ -110,12 +120,19 @@ function Invoke-NotificationCommand([string]$ExecutablePath, [string[]]$Argument
     try {
         $process = Start-Process -FilePath $ExecutablePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        # Cache the native process handle before waiting. Windows PowerShell 5.1
+        # otherwise exposes a null ExitCode after the child has terminated.
+        $null = $process.Handle
         $finished = $process.WaitForExit($TimeoutSeconds * 1000)
         if (-not $finished) {
             try { $process.Kill($true) } catch { try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch { } }
             [void]$process.WaitForExit(5000)
             return [pscustomobject]@{ TimedOut = $true; ExitCode = 124; Output = @(); Error = @() }
         }
+        # Windows PowerShell 5.1 needs the parameterless wait to flush redirected
+        # streams and Refresh to expose the final exit code reliably.
+        $process.WaitForExit()
+        $process.Refresh()
         return [pscustomobject]@{
             TimedOut = $false
             ExitCode = $process.ExitCode

@@ -18,4 +18,4 @@ if (Test-Path -LiteralPath $statePath) {
 }
 
 Start-Process -FilePath $node -ArgumentList @((Join-Path $root 'src\manual-session.mjs')) -WorkingDirectory $root -WindowStyle Hidden
-Write-Output '正在打开机器人专用 Chrome 登录窗口。'
+Write-Output '正在打开机器人专用浏览器登录窗口。'

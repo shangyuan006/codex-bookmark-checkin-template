@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readBookmarkPlanWithBackup } from "./bookmarks.mjs";
+import { discoverInstalledBrowsers, normalizeBrowserChoice } from "./browser-platform.mjs";
 import { atomicWriteJson, ensurePrivateDirectory } from "./security.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -33,26 +34,21 @@ async function findOnPath(executableName) {
   return null;
 }
 
-async function findChrome() {
-  const configured = process.env.CHROME_EXECUTABLE;
-  const roots = [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA].filter(Boolean);
-  const candidates = [configured, ...roots.flatMap((base) => [
-    path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(base, "Chromium", "Application", "chrome.exe"),
-  ])].filter(Boolean);
-  for (const candidate of candidates) if (await exists(candidate)) return path.resolve(candidate);
-  throw new Error("未找到 Chrome，可先运行环境预检并由用户决定是否安装");
-}
-
-async function discoverProfiles(userDataDir, options) {
-  const entries = await fs.readdir(userDataDir, { withFileTypes: true });
+async function discoverProfiles(browser, options) {
+  const entries = await fs.readdir(browser.userDataDir, { withFileTypes: true }).catch(() => []);
   const profiles = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    const bookmarksPath = path.join(userDataDir, entry.name, "Bookmarks");
+    const bookmarksPath = path.join(browser.userDataDir, entry.name, "Bookmarks");
     if (!(await exists(bookmarksPath))) continue;
     const plan = await readBookmarkPlanWithBackup(bookmarksPath, options).catch(() => null);
-    if (plan) profiles.push({ name: entry.name, bookmarksPath, targetCount: plan.targetCount, sourceCount: plan.sources.length });
+    if (plan) profiles.push({
+      browser,
+      name: entry.name,
+      bookmarksPath,
+      targetCount: plan.targetCount,
+      sourceCount: plan.sources.length,
+    });
   }
   return profiles.sort((a, b) => b.targetCount - a.targetCount);
 }
@@ -61,11 +57,11 @@ const answersIndex = process.argv.indexOf("--answers");
 const answersPath = answersIndex >= 0 ? path.resolve(process.argv[answersIndex + 1]) : path.join(root, "setup", "answers.json");
 const defaults = await readJson(path.join(root, "config", "defaults.json"));
 const answers = await readJson(answersPath);
-if (!answers) throw new Error(`未找到问卷答案：${answersPath}`);
-if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(answers.schedule ?? defaults.schedule))) throw new Error("schedule 必须为 HH:mm");
+if (!answers) throw new Error(`Missing questionnaire answers: ${answersPath}`);
+if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(answers.schedule ?? defaults.schedule))) throw new Error("schedule must use HH:mm");
 for (const [field, value] of [["mobileFolderNames", answers.mobileFolderNames], ["targetFolderNames", answers.targetFolderNames]]) {
   if (!Array.isArray(value) || value.length === 0 || value.some((name) => !String(name).trim())) {
-    throw new Error(`${field} 必须由用户提前确认，并至少包含一个非空文件夹名称`);
+    throw new Error(`${field} must contain at least one user-confirmed folder name`);
   }
 }
 
@@ -78,37 +74,53 @@ let config = deepMerge(deepMerge(deepMerge(defaults, publicRules), {
   targetFolderNames: answers.targetFolderNames,
   schedule: answers.schedule,
   autoDetectLinuxDoOAuth: answers.autoDetectLinuxDoOAuth,
-  syncBookmarkSavedLogins: answers.syncChromeSavedLogins,
+  syncBookmarkSavedLogins: answers.syncBrowserSavedLogins ?? answers.syncChromeSavedLogins,
   qaWebSearchEnabled: answers.qaWebSearchEnabled,
   checkinMessage: answers.checkinMessage,
   u2Message: answers.checkinMessage,
   notification: answers.notification,
 }), localRules);
 
-const sourceUserDataDir = path.join(process.env.LOCALAPPDATA ?? "", "Google", "Chrome", "User Data");
-const profiles = await discoverProfiles(sourceUserDataDir, config);
-if (profiles.length === 0) throw new Error("没有找到可读取的 Chrome 书签配置文件");
+const legacyChromeAnswers = answers.browser === undefined && answers.chromeProfile !== undefined;
+const browserChoice = normalizeBrowserChoice(answers.browser ?? (legacyChromeAnswers ? "chrome" : "auto"));
+const installedBrowsers = await discoverInstalledBrowsers({ choice: browserChoice });
+if (installedBrowsers.length === 0) {
+  throw new Error(`No supported ${browserChoice === "auto" ? "Chrome or Edge" : browserChoice} installation was found`);
+}
+const profiles = (await Promise.all(installedBrowsers.map((browser) => discoverProfiles(browser, config))))
+  .flat()
+  .sort((a, b) => b.targetCount - a.targetCount);
+if (profiles.length === 0) throw new Error("No readable Chrome or Edge bookmark profile was found");
+
+const requestedProfile = answers.browserProfile ?? answers.chromeProfile ?? "Auto";
 let selected;
-if (answers.chromeProfile && answers.chromeProfile !== "Auto") {
-  selected = profiles.find((profile) => profile.name.toLowerCase() === String(answers.chromeProfile).toLowerCase());
-  if (!selected) throw new Error(`Chrome 配置文件不存在：${answers.chromeProfile}`);
+if (requestedProfile !== "Auto") {
+  const matches = profiles.filter((profile) => profile.name.toLowerCase() === String(requestedProfile).toLowerCase());
+  if (matches.length === 0) throw new Error(`Browser profile does not exist: ${requestedProfile}`);
+  if (matches.length > 1) throw new Error(`Profile ${requestedProfile} exists in multiple browsers; select Chrome or Edge explicitly`);
+  [selected] = matches;
 } else {
   const bestCount = profiles[0].targetCount;
   const tied = profiles.filter((profile) => profile.targetCount === bestCount);
-  if (tied.length > 1) throw new Error(`Auto 找到多个同优先级配置：${tied.map((value) => value.name).join(", ")}，请明确选择`);
-  selected = profiles[0];
+  if (tied.length > 1) {
+    throw new Error(`Auto found multiple equally ranked browser profiles: ${tied.map((value) => `${value.browser.displayName}/${value.name}`).join(", ")}`);
+  }
+  [selected] = profiles;
 }
-if (selected.targetCount === 0) throw new Error("所选 Chrome 配置中没有找到目标书签目录，请检查目录名称后重试");
+if (selected.targetCount === 0) throw new Error("The selected browser profile does not contain the confirmed bookmark folders");
 
 const windowsPowerShell = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 const preferredPowerShell = await findOnPath("pwsh.exe")
   ?? (await exists(windowsPowerShell) ? windowsPowerShell : "pwsh.exe");
 config = deepMerge(config, {
+  browser: selected.browser.id,
+  browserDisplayName: selected.browser.displayName,
+  browserExecutable: selected.browser.executable,
+  browserProcessName: selected.browser.processName,
   bookmarksPath: selected.bookmarksPath,
-  sourceUserDataDir,
+  sourceUserDataDir: selected.browser.userDataDir,
   sourceProfileDirectory: selected.name,
-  automationUserDataDir: path.join(root, "data", "chrome-user-data"),
-  chromeExecutable: await findChrome(),
+  automationUserDataDir: path.join(root, "data", `${selected.browser.id}-user-data`),
   nodeExecutable: process.execPath,
   pythonExecutable: answers.pythonExecutable ?? "",
   powershellExecutable: answers.powershellExecutable || preferredPowerShell,
@@ -120,6 +132,8 @@ for (const directory of ["data", "logs", "tmp", "outputs"]) await ensurePrivateD
 await atomicWriteJson(path.join(root, "config", "config.json"), config);
 console.log(JSON.stringify({
   configured: true,
+  browser: selected.browser.id,
+  browserDisplayName: selected.browser.displayName,
   profile: selected.name,
   bookmarkSources: selected.sourceCount,
   targets: selected.targetCount,

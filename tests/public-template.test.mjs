@@ -18,10 +18,24 @@ test("保存密码同步必须经过显式总开关授权", async () => {
   assert.doesNotMatch(runner, /syncSavedLoginOrigins\)\.Count -gt 0 -or/);
 });
 
-test("机器人 Chrome 缓存清理有目录边界和会话数据保护", async () => {
+test("原生预热只能访问当前书签目标或其显式关联 origin", async () => {
+  const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
+  const preheater = await fs.readFile(new URL("../scripts/Prepare-NativeWafSession.ps1", import.meta.url), "utf8");
+  const indexSource = await fs.readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
+  const preheatCalls = [...runner.matchAll(/Prepare-NativeWafSession\.ps1'\)([^\r\n]*)/g)];
+
+  assert.match(indexSource, /--list-preflight-targets/);
+  assert.match(runner, /--list-preflight-targets/);
+  assert.ok(preheatCalls.length > 0);
+  for (const [, argumentsText] of preheatCalls) assert.match(argumentsText, /-Origins\s+\$preflightOrigins/);
+  assert.match(preheater, /\[Parameter\(Mandatory\)\][\s\S]*?\[string\[\]\]\$Origins/);
+  assert.doesNotMatch(preheater, /if \(\$Origins\.Count -gt 0\)/);
+});
+
+test("机器人浏览器缓存清理有目录边界和会话数据保护", async () => {
   const cleaner = await fs.readFile(new URL("../scripts/Clear-AutomationChromeCache.ps1", import.meta.url), "utf8");
   assert.match(cleaner, /Join-Path \$root 'data'/);
-  assert.match(cleaner, /机器人 Chrome 正在运行/);
+  assert.match(cleaner, /机器人 .*正在运行/);
   assert.match(cleaner, /\[switch\]\$Apply/);
   assert.match(cleaner, /FileAttributes\]::ReparsePoint/);
   assert.match(cleaner, /Assert-NoReparsePointInPath \$profileRoot \$allowedParent/);

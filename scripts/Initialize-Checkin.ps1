@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $AnswersPath) { $AnswersPath = Join-Path $root 'setup\answers.json' }
 $node = (Get-Command node -ErrorAction Stop).Source
-$npm = (Get-Command npm -ErrorAction Stop).Source
+$npm = (Get-Command npm.cmd,npm -ErrorAction Stop | Select-Object -First 1).Source
 if (-not (Test-Path -LiteralPath $AnswersPath)) {
     throw "缺少问卷答案：$AnswersPath。请先复制 setup\answers.example.json 并填写非敏感选项。"
 }

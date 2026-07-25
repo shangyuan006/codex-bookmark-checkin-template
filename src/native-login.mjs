@@ -14,7 +14,7 @@ try {
   page = browser.contexts().flatMap((context) => context.pages()).find((candidate) => {
     try { return new URL(candidate.url()).origin === expectedOrigin; } catch { return false; }
   });
-  if (!page) throw new Error("原生 Chrome 中没有找到目标登录页");
+  if (!page) throw new Error("原生浏览器中没有找到目标登录页");
   await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   const password = page.locator('input[type="password"]:visible');

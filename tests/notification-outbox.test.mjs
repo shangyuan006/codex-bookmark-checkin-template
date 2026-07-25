@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { powershellExecutable } from "./helpers/powershell.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -14,7 +15,7 @@ const reporter = path.join(root, "scripts", "Submit-UnifiedCheckinReport.ps1");
 const worker = path.join(root, "scripts", "Invoke-CheckinNotificationOutbox.ps1");
 
 async function runPowerShell(script, args = []) {
-  const { stdout } = await execFileAsync("pwsh.exe", [
+  const { stdout } = await execFileAsync(powershellExecutable, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, ...args,
   ], { cwd: root, encoding: "utf8" });
   return stdout.trim();

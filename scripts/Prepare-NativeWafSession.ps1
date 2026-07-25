@@ -1,7 +1,9 @@
 ﻿[CmdletBinding()]
 param(
     [int]$LoadTimeoutSeconds = 20,
-    [string[]]$Origins = @()
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$Origins
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +12,7 @@ $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\
 $profilePath = [string]$config.automationUserDataDir
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 $node = Resolve-CheckinNode $config
+$browser = Resolve-CheckinBrowser $config
 $inspector = Join-Path $root 'src\native-browser-inspect.mjs'
 $items = @($config.nativeWafPreflightUrls | ForEach-Object {
     $rawUrl = if ($_ -is [string]) { [string]$_ } else { [string]$_.url }
@@ -29,28 +32,30 @@ $items += @($config.nativeChallengePreflight | ForEach-Object {
     [pscustomobject]@{ url = $uri.AbsoluteUri; waitSeconds = $waitSeconds; trustAsSigned = $false; passiveOnly = $passiveOnly }
 })
 
-if ($Origins.Count -gt 0) {
-    $originSet = @{};
-    foreach ($origin in $Origins) { $originSet[([uri]$origin).GetLeftPart([System.UriPartial]::Authority)] = $true }
-    $items = @($items | Where-Object { $originSet.ContainsKey(([uri]$_.url).GetLeftPart([System.UriPartial]::Authority)) })
+$originSet = @{};
+foreach ($origin in $Origins) {
+    $originUri = [uri][string]$origin
+    if (-not $originUri.IsAbsoluteUri -or $originUri.Scheme -notin @('http', 'https') -or -not $originUri.Host) {
+        throw "预热目标 origin 无效：$origin"
+    }
+    $originSet[$originUri.GetLeftPart([System.UriPartial]::Authority)] = $true
 }
+$items = @($items | Where-Object { $originSet.ContainsKey(([uri]$_.url).GetLeftPart([System.UriPartial]::Authority)) })
 
 if ($items.Count -eq 0) { return }
 
-function Get-AutomationChromeProcesses {
-    @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
-        $_.CommandLine -like "*$profilePath*"
-    })
+function Get-AutomationBrowserProcesses {
+    @(Get-CheckinAutomationBrowserProcesses $config)
 }
 
-if ((Get-AutomationChromeProcesses).Count -gt 0) {
-    throw '机器人专用 Chrome 配置正被占用，无法执行原生 WAF 预热。'
+if ((Get-AutomationBrowserProcesses).Count -gt 0) {
+    throw "机器人专用 $($browser.DisplayName) 配置正被占用，无法执行原生 WAF 预热。"
 }
 
 $preflightResults = @()
 
-function Close-AutomationChrome {
-    $targets = @(Get-AutomationChromeProcesses)
+function Close-AutomationBrowser {
+    $targets = @(Get-AutomationBrowserProcesses)
     $targetIds = @($targets.ProcessId)
     $roots = @($targets | Where-Object { $targetIds -notcontains $_.ParentProcessId })
     foreach ($processInfo in $roots) {
@@ -61,12 +66,12 @@ function Close-AutomationChrome {
     $closeDeadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 500
-        $remaining = @(Get-AutomationChromeProcesses)
+        $remaining = @(Get-AutomationBrowserProcesses)
     } while ($remaining.Count -gt 0 -and (Get-Date) -lt $closeDeadline)
     if ($remaining.Count -gt 0) { throw '原生 WAF 预热窗口未能正常退出。' }
 }
 
-# Chrome 会节流离屏的非活动标签页，因此逐站打开并正常关闭，确保每个
+# Chromium 浏览器会节流离屏的非活动标签页，因此逐站打开并正常关闭，确保每个
 # 雷池通行 Cookie 都在独立配置中完成落盘。
 foreach ($item in $items) {
     $url = [string]$item.url
@@ -76,20 +81,20 @@ foreach ($item in $items) {
     if ([bool]$item.passiveOnly) {
         $passivePrepared = $false
         try {
-            # 被动模式只启动真实有头 Chrome，不开放调试端口，也不连接 CDP。
+            # 被动模式只启动真实有头浏览器，不开放调试端口，也不连接 CDP。
             # 等待本身不是签到成功证据，因此这里只能报告 prepared/unconfirmed。
             & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -Urls @($url)
             Start-Sleep -Seconds 2
-            if ((Get-AutomationChromeProcesses).Count -gt 0) {
+            if ((Get-AutomationBrowserProcesses).Count -gt 0) {
                 Start-Sleep -Seconds ([int]$item.waitSeconds)
-                $passivePrepared = (Get-AutomationChromeProcesses).Count -gt 0
+                $passivePrepared = (Get-AutomationBrowserProcesses).Count -gt 0
             }
         }
         catch {
             $passivePrepared = $false
         }
         finally {
-            if ((Get-AutomationChromeProcesses).Count -gt 0) { Close-AutomationChrome }
+            if ((Get-AutomationBrowserProcesses).Count -gt 0) { Close-AutomationBrowser }
         }
 
         if (-not $passivePrepared) {
@@ -100,9 +105,9 @@ foreach ($item in $items) {
             url = $url
             status = if ($passivePrepared) { 'prepared' } else { 'unconfirmed' }
             reason = if ($passivePrepared) {
-                '原生 Chrome 已完成被动等待，等待自动化复查'
+                "原生 $($browser.DisplayName) 已完成被动等待，等待自动化复查"
             } else {
-                '原生 Chrome 被动等待未完成'
+                "原生 $($browser.DisplayName) 被动等待未完成"
             }
             inspectionStatus = if ($passivePrepared) { 'passive_wait' } else { 'unavailable' }
         }
@@ -128,7 +133,7 @@ foreach ($item in $items) {
             }
         }
         catch { $inspection = $null }
-        Close-AutomationChrome
+        Close-AutomationBrowser
         if ($null -eq $inspection -and $inspectionAttempt -lt 2) { Start-Sleep -Seconds 1 }
     }
     $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed')
@@ -145,11 +150,11 @@ foreach ($item in $items) {
         url = $url
         status = if ($explicitlyConfirmed -or $endpointConfirmed) { 'signed' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
         reason = if ($explicitlyConfirmed) {
-            '原生 Chrome 已通过 WAF，并由页面明确确认今天已签到'
+            "原生 $($browser.DisplayName) 已通过 WAF，并由页面明确确认今天已签到"
         } elseif ($endpointConfirmed) {
-            '原生 Chrome 已通过 WAF，并确认签到端点完整加载'
+            "原生 $($browser.DisplayName) 已通过 WAF，并确认签到端点完整加载"
         } elseif ($prepared) {
-            '原生 Chrome 已完成验证预热，等待自动化复查'
+            "原生 $($browser.DisplayName) 已完成验证预热，等待自动化复查"
         } else {
             '原生验证页面未能确认签到结果'
         }

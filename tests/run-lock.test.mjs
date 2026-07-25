@@ -6,6 +6,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { acquireRunLock, classifyLockOwner, releaseRunLock } from "../src/run-lock.mjs";
+import { powershellExecutable } from "./helpers/powershell.mjs";
 
 const execFileAsync = promisify(execFile);
 const startedAt = "2026-07-23T08:00:00.000Z";
@@ -55,8 +56,8 @@ test("PowerShell 超时清理仅删除匹配 PID 与启动时间的锁", { skip:
   const helperPath = path.resolve("scripts", "RunLock.ps1");
   await fs.writeFile(lockPath, JSON.stringify({ pid: 4242, nonce: "owned", processStartedAt: startedAt }), "utf8");
 
-  const invoke = async (pid, processStart) => execFileAsync("pwsh.exe", [
-    "-NoProfile", "-NonInteractive", "-Command",
+  const invoke = async (pid, processStart) => execFileAsync(powershellExecutable, [
+    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
     `. '${helperPath.replaceAll("'", "''")}'; Remove-RunLockOwnedByProcess -LockPath '${lockPath.replaceAll("'", "''")}' -ProcessId ${pid} -ProcessStartedAt ([datetime]'${processStart}')`,
   ], { encoding: "utf8" });
 

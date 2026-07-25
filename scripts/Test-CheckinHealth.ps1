@@ -9,6 +9,7 @@ if (-not (Test-Path -LiteralPath $configPath)) {
     return
 }
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
+$browserExecutable = if ($config.browserExecutable) { [string]$config.browserExecutable } else { [string]$config.chromeExecutable }
 $latestPath = Join-Path $root 'logs\latest.json'
 $statePath = Join-Path $root 'data\site-state.json'
 $notificationQuarantinePath = Join-Path $root 'data\notification-outbox\quarantine'
@@ -43,7 +44,7 @@ $notificationReady = $config.notification.mode -in @($null, '', 'none') -or (
 $checks = [ordered]@{
     configPresent = $true
     bookmarksReadable = Test-Path -LiteralPath ([string]$config.bookmarksPath)
-    chromeExecutablePresent = Test-Path -LiteralPath ([string]$config.chromeExecutable)
+    browserExecutablePresent = Test-Path -LiteralPath $browserExecutable
     automationProfilePresent = Test-Path -LiteralPath (Join-Path ([string]$config.automationUserDataDir) 'Local State')
     notificationReady = [bool]$notificationReady
     notificationOutboxClean = $notificationQuarantinedCount -eq 0

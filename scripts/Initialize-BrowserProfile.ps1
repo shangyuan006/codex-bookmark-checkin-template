@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+$browser = Resolve-CheckinBrowser $config
 $sourceRoot = [System.IO.Path]::GetFullPath([string]$config.sourceUserDataDir)
 $targetRoot = [System.IO.Path]::GetFullPath([string]$config.automationUserDataDir)
 $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $root 'data'))
@@ -16,7 +17,7 @@ if (-not $targetRoot.StartsWith($expectedParent, [System.StringComparison]::Ordi
     throw "安全检查失败：目标会话目录必须位于 $expectedParent"
 }
 if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'Local State'))) {
-    throw "未找到 Chrome Local State：$sourceRoot"
+    throw "未找到 $($browser.DisplayName) Local State：$sourceRoot"
 }
 if (Test-Path -LiteralPath $targetRoot) {
     if (-not $Force) { throw '独立登录会话已存在。使用 -Force 时会先保留时间戳备份。' }
@@ -28,13 +29,13 @@ if (Test-Path -LiteralPath $targetRoot) {
 }
 
 New-Item -ItemType Directory -Path (Join-Path $targetRoot 'Default') -Force | Out-Null
-# Local State contains Chrome's OS-protected encryption metadata.  It stays in
+# Local State contains the browser's OS-protected encryption metadata. It stays in
 # ignored local data and lets selectively copied saved-login rows remain usable.
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'Local State') -Destination (Join-Path $targetRoot 'Local State') -Force
 
-$chrome = [string]$config.chromeExecutable
-if (-not (Test-Path -LiteralPath $chrome)) { throw "未找到 Chrome：$chrome" }
-$process = Start-Process -FilePath $chrome -ArgumentList @(
+$browserExecutable = [string]$browser.Executable
+if (-not (Test-Path -LiteralPath $browserExecutable)) { throw "未找到 $($browser.DisplayName)：$browserExecutable" }
+$process = Start-Process -FilePath $browserExecutable -ArgumentList @(
     "--user-data-dir=$targetRoot", '--profile-directory=Default', '--headless=new',
     '--no-first-run', '--no-default-browser-check',
     '--disable-features=OptimizationGuideOnDeviceModel', 'about:blank'
@@ -46,13 +47,12 @@ try {
     }
 }
 finally {
-    Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
-        $_.CommandLine -like "*$targetRoot*"
-    } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-CheckinAutomationBrowserProcesses $config |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $targetRoot 'Default\Login Data'))) {
-    throw 'Chrome 未能初始化独立配置。'
+    throw "$($browser.DisplayName) 未能初始化独立配置。"
 }
 
 if (-not $SkipSavedLoginSync -and $config.syncBookmarkSavedLogins -ne $false) {

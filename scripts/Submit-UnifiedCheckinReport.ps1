@@ -10,6 +10,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256Hex([byte[]]$Bytes) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash($Bytes)
+        return -join @($hash | ForEach-Object { $_.ToString('x2') })
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
 $root = Split-Path -Parent $PSScriptRoot
 $localConfigPath = Join-Path $root 'config\config.json'
 $defaultsPath = Join-Path $root 'config\defaults.json'
@@ -121,8 +132,7 @@ $stateParts = @($results | Sort-Object origin | ForEach-Object {
 })
 $stateMaterial = if ($stateParts.Count -gt 0) { "$status|$reportRunState|$($stateParts -join '|')" } else { "$status|$RunnerStatus" }
 $stateBytes = [System.Text.Encoding]::UTF8.GetBytes($stateMaterial)
-$stateHashBytes = [System.Security.Cryptography.SHA256]::HashData($stateBytes)
-$stateHash = [System.Convert]::ToHexString($stateHashBytes).Substring(0, 16).ToLowerInvariant()
+$stateHash = (Get-Sha256Hex $stateBytes).Substring(0, 16)
 $eventKey = "external:$source`:$taskId`:$((Get-Date).ToString('yyyy-MM-dd')):$stateHash"
 $payload = [ordered]@{
     status = $status
@@ -147,12 +157,10 @@ if (-not $OutboxPath) { $OutboxPath = Join-Path $root 'data\notification-outbox'
 [System.IO.Directory]::CreateDirectory($OutboxPath) | Out-Null
 
 $eventBytes = [System.Text.Encoding]::UTF8.GetBytes($eventKey)
-$eventHashBytes = [System.Security.Cryptography.SHA256]::HashData($eventBytes)
-$eventHash = [System.Convert]::ToHexString($eventHashBytes).ToLowerInvariant()
+$eventHash = Get-Sha256Hex $eventBytes
 $itemPath = Join-Path $OutboxPath "$eventHash.json"
 $payloadMaterial = @($eventKey, $taskId, $name, $source, $status, $summary) -join "`n"
-$payloadHashBytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($payloadMaterial))
-$payloadHash = [System.Convert]::ToHexString($payloadHashBytes).ToLowerInvariant()
+$payloadHash = Get-Sha256Hex ([System.Text.Encoding]::UTF8.GetBytes($payloadMaterial))
 $now = [DateTimeOffset]::UtcNow
 $existing = $null
 if (Test-Path -LiteralPath $itemPath) {

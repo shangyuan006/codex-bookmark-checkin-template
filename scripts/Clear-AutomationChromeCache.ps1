@@ -8,11 +8,13 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $effectiveConfigPath = if ($ConfigPath) { [System.IO.Path]::GetFullPath($ConfigPath) } else { Join-Path $root 'config\config.json' }
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $effectiveConfigPath | ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+$browser = Resolve-CheckinBrowser $config -OptionalExecutable
 $profileRoot = [System.IO.Path]::GetFullPath([string]$config.automationUserDataDir).TrimEnd('\')
 $allowedParent = [System.IO.Path]::GetFullPath((Join-Path $root 'data')).TrimEnd('\')
 
 if (-not $profileRoot.StartsWith("$allowedParent\", [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw '安全检查失败：只允许清理项目 data 下的机器人 Chrome。'
+    throw '安全检查失败：只允许清理项目 data 下的机器人浏览器。'
 }
 
 function Assert-NoReparsePointInPath([string]$Path, [string]$Boundary) {
@@ -54,10 +56,8 @@ function Assert-NoReparsePointTree([string]$Path) {
 
 Assert-NoReparsePointInPath $profileRoot $allowedParent
 
-$running = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
-    $_.CommandLine -like "*$profileRoot*"
-})
-if ($running.Count -gt 0) { throw '机器人 Chrome 正在运行，拒绝清理缓存。' }
+$running = @(Get-CheckinAutomationBrowserProcesses $config)
+if ($running.Count -gt 0) { throw "机器人 $($browser.DisplayName) 正在运行，拒绝清理缓存。" }
 
 $relativeTargets = @(
     'OptGuideOnDeviceModel',

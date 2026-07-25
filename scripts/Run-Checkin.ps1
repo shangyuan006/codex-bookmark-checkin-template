@@ -142,10 +142,21 @@ try {
     $retryDelayMinutes = if ($null -ne $config.taskRetryDelayMinutes) { [int]$config.taskRetryDelayMinutes } else { 3 }
     if ($retryDelayMinutes -lt 0 -or $retryDelayMinutes -gt 30) { throw '任务级重试间隔必须为 0 到 30 分钟。' }
 
-    $arguments = @((Join-Path $root 'src\index.mjs'))
+    $indexScript = Join-Path $root 'src\index.mjs'
+    $arguments = @($indexScript)
     if ($DryRun) { $arguments += '--dry-run' }
 
     if (-not $DryRun) { $resumeCandidate = Get-TodayResumeReport }
+
+    $preflightConfigured = @($config.nativeWafPreflightUrls).Count -gt 0 -or @($config.nativeChallengePreflight).Count -gt 0
+    $currentPreflightTargets = @()
+    if (-not $DryRun -and $preflightConfigured) {
+        $targetOutput = @(& $node $indexScript '--list-preflight-targets')
+        if ($LASTEXITCODE -ne 0) { throw '无法读取当前书签预热目标。' }
+        try { $currentPreflightTargets = @(($targetOutput -join [Environment]::NewLine) | ConvertFrom-Json) }
+        catch { throw "当前书签预热目标格式无效：$($_.Exception.Message)" }
+        if ($currentPreflightTargets.Count -eq 0) { throw '当前书签没有可用的预热目标。' }
+    }
 
     $shouldSyncSavedLogins = -not $DryRun `
         -and (Test-NeedsSavedLoginSync $resumeCandidate (Get-Date)) `
@@ -166,13 +177,29 @@ try {
             if ($null -ne $resumeCandidate) {
                 $runArguments += @('--resume-report', [string]$resumeCandidate.Path)
             }
-            if (@($config.nativeWafPreflightUrls).Count -gt 0 -or @($config.nativeChallengePreflight).Count -gt 0) {
-                $preflightOrigins = @()
+            if ($preflightConfigured) {
+                $preflightTargets = @($currentPreflightTargets)
                 if ($null -ne $resumeCandidate) {
-                    $preflightOrigins = @($resumeCandidate.Report.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') } | ForEach-Object { [string]$_.origin })
+                    $previousOriginSet = @{}
+                    $pendingOriginSet = @{}
+                    foreach ($result in @($resumeCandidate.Report.results)) {
+                        $resultOrigin = [string]$result.origin
+                        $previousOriginSet[$resultOrigin] = $true
+                        if ([string]$result.status -notin @('signed', 'already_signed', 'not_available')) {
+                            $pendingOriginSet[$resultOrigin] = $true
+                        }
+                    }
+                    $preflightTargets = @($currentPreflightTargets | Where-Object {
+                        $targetOrigin = [string]$_.origin
+                        -not $previousOriginSet.ContainsKey($targetOrigin) -or $pendingOriginSet.ContainsKey($targetOrigin)
+                    })
                 }
-                if ($preflightOrigins.Count -gt 0) { & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins }
-                elseif ($attempt -eq 1) { & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') }
+                $preflightOrigins = @($preflightTargets | ForEach-Object {
+                    if (@($_.allowedOrigins).Count -gt 0) { @($_.allowedOrigins) } else { [string]$_.origin }
+                } | Sort-Object -Unique)
+                if ($preflightOrigins.Count -gt 0) {
+                    & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins
+                }
             }
 
             Write-Output "开始签到任务级尝试 $attempt/$runAttempts。"

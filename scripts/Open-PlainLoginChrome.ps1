@@ -10,6 +10,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 $node = Resolve-CheckinNode $config
+$browser = Resolve-CheckinBrowser $config
 $closeSignal = Join-Path $root 'tmp\close-manual-session.signal'
 
 if (Test-Path -LiteralPath (Join-Path $root 'tmp\manual-session.json')) {
@@ -24,10 +25,8 @@ if (Test-Path -LiteralPath (Join-Path $root 'tmp\manual-session.json')) {
     if ($manual) { throw '旧的 Playwright 手动会话未能正常退出。' }
 }
 
-$existing = Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -eq 'chrome.exe' -and $_.CommandLine -like "*$($config.automationUserDataDir)*"
-}
-if ($existing) { throw '机器人专用 Chrome 配置仍被其他进程占用。' }
+$existing = @(Get-CheckinAutomationBrowserProcesses $config)
+if ($existing.Count -gt 0) { throw "机器人专用 $($browser.DisplayName) 配置仍被其他进程占用。" }
 
 $items = if ($Urls.Count -gt 0) {
     @($Urls | ForEach-Object {
@@ -62,5 +61,5 @@ if ($RemoteDebuggingPort -gt 0) {
 }
 $arguments += @($items | ForEach-Object { [string]$_.url })
 
-Start-Process -FilePath ([string]$config.chromeExecutable) -ArgumentList $arguments
-Write-Output "已使用无自动化标记的原生 Chrome 打开 $(@($items).Count) 个待处理站点。"
+Start-Process -FilePath ([string]$browser.Executable) -ArgumentList $arguments
+Write-Output "已使用无自动化标记的原生 $($browser.DisplayName) 打开 $(@($items).Count) 个待处理站点。"

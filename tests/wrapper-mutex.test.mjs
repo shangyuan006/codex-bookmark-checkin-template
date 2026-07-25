@@ -5,6 +5,7 @@ import test from "node:test";
 import { once } from "node:events";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { powershellExecutable } from "./helpers/powershell.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -19,7 +20,7 @@ test("第二个 wrapper 在命名互斥被占用时快速退出且不启动签�
     "[Console]::Out.Flush()",
     "try { Start-Sleep -Seconds 20 } finally { if($owned){$mutex.ReleaseMutex()};$mutex.Dispose() }",
   ].join("; ");
-  const holder = spawn("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", holderCommand], {
+  const holder = spawn(powershellExecutable, ["-NoProfile", "-NonInteractive", "-Command", holderCommand], {
     cwd: root, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
   });
   try {
@@ -31,7 +32,7 @@ test("第二个 wrapper 在命名互斥被占用时快速退出且不启动签�
       .finally(() => clearTimeout(startupTimer));
     assert.match(String(ready), /READY/);
     const started = Date.now();
-    const { stdout } = await execFileAsync("pwsh.exe", [
+    const { stdout } = await execFileAsync(powershellExecutable, [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
       "-File", runner, "-DryRun", "-SuppressReport",
     ], { cwd: root, encoding: "utf8", windowsHide: true });

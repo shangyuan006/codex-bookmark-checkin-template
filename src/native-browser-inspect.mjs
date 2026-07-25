@@ -19,7 +19,7 @@ while (!browser && Date.now() < connectDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }
-if (!browser) throw new Error("无法连接原生 Chrome 调试端口");
+if (!browser) throw new Error("无法连接原生浏览器调试端口");
 try {
   const deadline = Date.now() + maxWaitSeconds * 1000;
   let page = null;
@@ -29,7 +29,7 @@ try {
     });
     if (!page) await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  if (!page) throw new Error("原生 Chrome 中没有找到目标站点页面");
+  if (!page) throw new Error("原生浏览器中没有找到目标站点页面");
 
   let output = null;
   do {

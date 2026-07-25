@@ -6,7 +6,10 @@ $root = Split-Path -Parent $PSScriptRoot
 $git = Get-Command git -ErrorAction SilentlyContinue
 
 if ($git -and (Test-Path -LiteralPath (Join-Path $root '.git'))) {
-    $relativeFiles = @(& $git.Source -C $root ls-files)
+    $relativeFiles = @(
+        & $git.Source -C $root ls-files
+        & $git.Source -C $root ls-files --others --exclude-standard
+    ) | Select-Object -Unique
 }
 else {
     $relativeFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object {
