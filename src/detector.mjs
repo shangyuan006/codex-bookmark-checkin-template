@@ -27,8 +27,19 @@ export function formatDailyReason(template, now = new Date()) {
   return String(template ?? "").replaceAll("{date}", date);
 }
 
-export function classifyPageText({ url = "", title = "", bodyText = "", hasPassword = false, challengeSelectors = false }) {
-  const text = normalizeText(`${title}\n${bodyText}`).slice(0, 30000);
+export function classifyPageText({
+  url = "",
+  title = "",
+  bodyText = "",
+  hasPassword = false,
+  challengeSelectors = false,
+  resolvedChallengeSelectors = false,
+  confirmedCheckinControl = false,
+}) {
+  const normalizedBodyText = normalizeText(bodyText).slice(0, 30000);
+  const text = normalizeText(`${title}\n${normalizedBodyText}`).slice(0, 30000);
+  const unsignedPattern = /(?:尚未|还未|還未|未|没有|沒有|not|hasn['’]?t|haven['’]?t)\s*(?:完成)?\s*(?:签到|簽到|打卡|checked[ -]?in|signed[ -]?in)/i;
+  const explicitlyUnsigned = unsignedPattern.test(text);
   const lowerUrl = String(url).toLowerCase();
 
   // A login form can legitimately contain an image CAPTCHA.  Treating every
@@ -37,6 +48,12 @@ export function classifyPageText({ url = "", title = "", bodyText = "", hasPassw
   if (hasPassword || /\/(log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)/i.test(lowerUrl)) {
     const suffix = challengeSelectors ? "，登录页包含验证码" : "";
     return { status: "login_required", reason: `登录状态失效${suffix}` };
+  }
+  if (confirmedCheckinControl && explicitlyUnsigned) {
+    return { status: "needs_attention", reason: "页面同时显示未签到和已签到控件" };
+  }
+  if (confirmedCheckinControl) {
+    return { status: "already_signed", reason: "签到控件确认今日已签到" };
   }
   if (/(未登录|尚未登录|请先登录|請先登入|not logged in|sign in to continue)/i.test(text)) {
     return { status: "login_required", reason: "页面要求先登录" };
@@ -52,7 +69,8 @@ export function classifyPageText({ url = "", title = "", bodyText = "", hasPassw
   // Visible Turnstile/recaptcha widgets and an explicit checkbox prompt need
   // interaction.  Mere explanatory copy such as “完成人机验证即可签到” does
   // not prove that a challenge is currently active.
-  if (challengeSelectors || /(请验证您是真人|請驗證您是真人|verify you are human)/i.test(text)) {
+  if (challengeSelectors || (!resolvedChallengeSelectors
+    && /(请验证您是真人|請驗證您是真人|拖动滑块验证|拖動滑塊驗證|drag (?:the )?slider|verify you are human)/i.test(text))) {
     return { status: "interactive_challenge", reason: "检测到交互式安全验证" };
   }
   if (/(just a moment|performing security verification|请稍候.*安全|正在验证您是否是真人)/i.test(text)) {
@@ -61,7 +79,14 @@ export function classifyPageText({ url = "", title = "", bodyText = "", hasPassw
   if ((/(^|\s)(登录|登入)(\s|$)/.test(text) && /注册/.test(text)) || (/(^|\s)log[ -]?in(\s|$)/i.test(text) && /sign[ -]?up/i.test(text))) {
     return { status: "login_required", reason: "页面仅显示登录/注册入口" };
   }
-  if (/(今日已签到|今天已签到|今天已经签到过|已经签到|已完成签到|已签到|已簽到|签到已得\s*\d*|簽到已得\s*\d*|查看(?:签到|簽到)(?:记录|記錄).{0,20}\d{1,2}(?:点|點)|無需重複簽到|无需重复签到|codex\s*(?:权益|權益)\s*已(?:领取|領取)|already checked[ -]?in|checked in today)/i.test(text)) {
+  if (/(?:正在|仍在|请稍候)?\s*(?:加载|加載)\s*(?:每日)?\s*(?:签到|簽到)(?:状态|狀態)?|(?:签到|簽到)(?:状态|狀態)?\s*(?:正在)?\s*(?:加载|加載)(?:中)?/i.test(text)) {
+    return { status: "unconfirmed", reason: "签到状态仍在加载" };
+  }
+  if (explicitlyUnsigned) {
+    return { status: "ready", reason: "页面明确显示尚未签到" };
+  }
+  if (/^(?:已签到|已簽到)$/i.test(normalizedBodyText)
+    || /(?:今日\s*已\s*(?:签到|簽到)|今天\s*已\s*(?:签到|簽到)|今天\s*已经\s*(?:签到|簽到)过|\[\s*已(?:签到|簽到)\s*\]|签到已得\s*\d*|簽到已得\s*\d*|查看(?:签到|簽到)(?:记录|記錄).{0,20}\d{1,2}(?:点|點)|無需重複簽到|无需重复签到|codex\s*(?:权益|權益)\s*已(?:领取|領取)|already checked[ -]?in|checked in today)/i.test(text)) {
     return { status: "already_signed", reason: "今天已经签到" };
   }
   if (/(签到成功|簽到成功|成功签到|成功簽到|打卡成功|回答正确|回答正確|本次签到获得|本次簽到獲得|申请额度成功|申請額度成功|额度已发放|額度已發放|额度申请成功|額度申請成功|额度申请已提交|額度申請已提交|申请已提交|申請已提交|申请成功.*额度|申請成功.*額度|(?:领取|領取)\s*codex\s*(?:权益|權益)\s*成功|codex\s*(?:权益|權益)\s*(?:领取|領取)成功|successfully checked[ -]?in)/i.test(text)) {

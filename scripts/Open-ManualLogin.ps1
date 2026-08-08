@@ -1,21 +1,46 @@
 ﻿[CmdletBinding()]
-param()
+param(
+    [string[]]$Origins = @(),
+    [int[]]$Selection = @()
+)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
-$node = Resolve-CheckinNode $config
 $statePath = Join-Path $root 'tmp\manual-session.json'
 
-if (Test-Path -LiteralPath $statePath) {
-    $state = Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json
-    if (Get-Process -Id $state.pid -ErrorAction SilentlyContinue) {
-        Write-Output "手动登录窗口已经运行，PID=$($state.pid)。"
-        exit 0
-    }
-    Remove-Item -LiteralPath $statePath -Force
+if ($Origins.Count -gt 0 -and $Selection.Count -gt 0) {
+    throw 'Origins 和 Selection 不能同时使用。'
 }
 
-Start-Process -FilePath $node -ArgumentList @((Join-Path $root 'src\manual-session.mjs')) -WorkingDirectory $root -WindowStyle Hidden
-Write-Output '正在打开机器人专用浏览器登录窗口。'
+if (Test-Path -LiteralPath $statePath) {
+    $state = try { Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json } catch { $null }
+    $existing = @(Get-CheckinAutomationBrowserProcesses $config)
+    $legacyProcess = if ($state -and [string]$state.mode -ne 'native') {
+        Get-Process -Id $state.pid -ErrorAction SilentlyContinue
+    }
+    else { $null }
+    if ($existing.Count -gt 0 -or $legacyProcess) {
+        if ($Origins.Count -gt 0 -or $Selection.Count -gt 0) {
+            throw '手动登录窗口已经运行；请先关闭当前会话，再按新的站点选择打开。'
+        }
+        Write-Output '原生手动登录窗口已经运行。'
+        exit 0
+    }
+    & (Join-Path $PSScriptRoot 'Close-ManualLogin.ps1')
+    if (Test-Path -LiteralPath $statePath) {
+        throw '上一个手动登录会话没有完成安全收尾。'
+    }
+}
+
+$occupied = @(Get-CheckinAutomationBrowserProcesses $config)
+if ($occupied.Count -gt 0) { throw '机器人专用浏览器配置正被其他进程占用。' }
+
+$launchOptions = @{
+    NativeMinimal = $true
+    TrackManualSession = $true
+}
+if ($Origins.Count -gt 0) { $launchOptions.Origins = @($Origins) }
+if ($Selection.Count -gt 0) { $launchOptions.Selection = @($Selection) }
+& (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') @launchOptions

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { listBookmarkFolderCandidates, listBookmarkFolderCandidatesWithBackup, readBookmarkPlanWithBackup } from "./bookmarks.mjs";
+import { listBookmarkFolderCandidatesWithBackup, readBookmarkPlanWithBackup } from "./bookmarks.mjs";
 import { discoverInstalledBrowsers, getBrowserDefinitions, normalizeBrowserChoice } from "./browser-platform.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -41,32 +41,43 @@ async function inspectProfiles(browser) {
           targetFolderNames: requestedScope.targetFolderNames,
         })
         : null;
-      const folderReport = plan
-        ? {
-          candidates: await listBookmarkFolderCandidates(plan.bookmarkPath),
-          recoveredFromBackup: plan.recoveredFromBackup,
-        }
-        : await listBookmarkFolderCandidatesWithBackup(bookmarksPath);
-      profiles.push({
-        browser: browser.id,
-        browserDisplayName: browser.displayName,
-        name: entry.name,
-        bookmarksPath,
-        recoveredFromBackup: Boolean(folderReport.recoveredFromBackup || plan?.recoveredFromBackup),
-        folderCandidates: folderReport.candidates,
-        scopeMatch: plan ? {
+      if (plan) {
+        profiles.push({
+          browser: browser.id,
+          browserDisplayName: browser.displayName,
+          name: entry.name,
+          recoveredFromBackup: Boolean(plan.recoveredFromBackup),
+          scopeMatch: {
           sourceCount: plan.sources.length,
           exactUrlCount: plan.exactUrlCount,
           targetCount: plan.targetCount,
-        } : null,
-      });
+            sources: plan.sources.map((source) => ({
+              path: source.path,
+              counts: Object.fromEntries(Object.entries(source.sections)
+                .map(([name, entries]) => [name, entries.length])),
+            })),
+          },
+        });
+      } else {
+        const folderReport = await listBookmarkFolderCandidatesWithBackup(bookmarksPath);
+        profiles.push({
+          browser: browser.id,
+          browserDisplayName: browser.displayName,
+          name: entry.name,
+          bookmarksPath,
+          recoveredFromBackup: Boolean(folderReport.recoveredFromBackup),
+          folderCandidates: folderReport.candidates,
+          scopeMatch: null,
+        });
+      }
     } catch (error) {
       profiles.push({
         browser: browser.id,
         browserDisplayName: browser.displayName,
         name: entry.name,
-        bookmarksPath,
-        error: String(error?.message ?? error),
+        ...(scopeProvided
+          ? { error: "bookmark_scope_unreadable" }
+          : { bookmarksPath, error: String(error?.message ?? error) }),
       });
     }
   }
@@ -127,7 +138,9 @@ console.log(JSON.stringify({
   platform: { os: os.release(), platform: process.platform, arch: process.arch, node: process.versions.node },
   requestedBrowser: browserChoice === "auto" ? null : browserChoice,
   requestedScope: scopeProvided ? requestedScope : null,
-  browsers: browserReports.map(({ profiles: ignored, ...browser }) => browser),
+  browsers: browserReports.map(({ profiles: ignored, userDataDir, ...browser }) => (
+    scopeProvided ? browser : { ...browser, userDataDir }
+  )),
   checks,
   profiles,
   guidance: {

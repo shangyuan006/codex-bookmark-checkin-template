@@ -112,7 +112,7 @@ export function deferUnresolvedLogin(result, config = {}, now = new Date()) {
     ...result,
     status: "deferred",
     retryCause: "login_required",
-    reason: "自动登录恢复未成功，已安排低频重试",
+    reason: "自动登录恢复未成功，等待后续符合条件的运行重试",
   }, {
     deferredRetryDelayMs: config.loginRetryDelayMs ?? config.deferredRetryDelayMs,
   }, now);
@@ -123,6 +123,13 @@ export function isRetryEligible(result, now = new Date()) {
   if (result.status !== "deferred") return true;
   const next = Date.parse(result.nextEligibleAt ?? "");
   return !Number.isFinite(next) || next <= now.getTime();
+}
+
+export function isResumeRetryEligible(result, reauthOrigins, now = new Date()) {
+  if (isRetryEligible(result, now)) return true;
+  return result?.status === "needs_attention"
+    && reauthOrigins instanceof Set
+    && reauthOrigins.has(result.origin);
 }
 
 export function nextDeferredRetryAt(results, now = new Date()) {

@@ -3,12 +3,52 @@ import assert from "node:assert/strict";
 import { classifyPageText, formatDailyReason, scoreActionText, solveArithmeticQuestion } from "../src/detector.mjs";
 
 test("识别已签到状态", () => {
+  assert.equal(classifyPageText({ title: "用户中心", bodyText: "已签到" }).status, "already_signed");
   assert.equal(classifyPageText({ bodyText: "您今日已签到，请明天再来" }).status, "already_signed");
   assert.equal(classifyPageText({ bodyText: "邀请 [发送]: 0 [已签到] 分享率" }).status, "already_signed");
   assert.equal(classifyPageText({ bodyText: "[查看签到记录] [21点]" }).status, "already_signed");
   assert.equal(classifyPageText({ bodyText: "[查看簽到記錄] [21點]" }).status, "already_signed");
   assert.equal(classifyPageText({ bodyText: "抱歉 您今天已经签到过了，请勿重复刷新。" }).status, "already_signed");
   assert.equal(classifyPageText({ bodyText: "鲸币 [使用]: 154,464.0 (签到已得350)" }).status, "already_signed");
+});
+
+test("权威已签到控件优先于公告中的登录注册说明", () => {
+  assert.deepEqual(classifyPageText({
+    url: "https://example.test/dashboard",
+    bodyText: "公告：注册后可以登录使用服务",
+    confirmedCheckinControl: true,
+  }), {
+    status: "already_signed",
+    reason: "签到控件确认今日已签到",
+  });
+});
+
+test("明确未签到与已签到控件冲突时不得判定成功", () => {
+  assert.deepEqual(classifyPageText({
+    bodyText: "今日未签到",
+    confirmedCheckinControl: true,
+  }), {
+    status: "needs_attention",
+    reason: "页面同时显示未签到和已签到控件",
+  });
+});
+
+test("异步签到状态加载中不得提前判定为无动作", () => {
+  assert.deepEqual(classifyPageText({ bodyText: "每日签到 正在加载签到状态... 加载中..." }), {
+    status: "unconfirmed",
+    reason: "签到状态仍在加载",
+  });
+  assert.equal(classifyPageText({ bodyText: "签到状态加载中" }).status, "unconfirmed");
+});
+
+test("未签到否定文案不得误判为已签到", () => {
+  assert.equal(classifyPageText({ bodyText: "今日未签到" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "尚未完成簽到" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "Not checked in today" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "今日未签到 26 已签到" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "今日未签到 26 [已签到]" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "今日未签到，页面说明：签到成功后可获得积分" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "今日未签到，历史记录：昨日签到成功" }).status, "ready");
 });
 
 test("识别签到成功状态", () => {
@@ -34,6 +74,8 @@ test("说明文字不被误判为当前人机挑战", () => {
 test("签到功能说明和历史入口不被误判为已完成", () => {
   assert.equal(classifyPageText({ bodyText: "每日签到可获得随机额度奖励" }).status, "ready");
   assert.equal(classifyPageText({ bodyText: "查看签到记录" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "签到说明：已签到用户可获得额外积分" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "历史记录：昨日已签到" }).status, "ready");
 });
 
 test("识别 Linux DO 登录入口", () => {
@@ -42,6 +84,28 @@ test("识别 Linux DO 登录入口", () => {
 
 test("可见的 Cloudflare 复选框优先识别为交互挑战", () => {
   assert.equal(classifyPageText({ bodyText: "正在进行安全验证 请验证您是真人" }).status, "interactive_challenge");
+});
+
+test("滑块验证提示识别为交互挑战", () => {
+  assert.equal(classifyPageText({ bodyText: "请拖动滑块验证" }).status, "interactive_challenge");
+  assert.equal(classifyPageText({ bodyText: "Drag the slider to continue" }).status, "interactive_challenge");
+  assert.equal(classifyPageText({ bodyText: "请先进行验证" }).status, "ready");
+  assert.equal(classifyPageText({
+    bodyText: "请先进行验证",
+    challengeSelectors: true,
+  }).status, "interactive_challenge");
+});
+
+test("已解决的验证控件不会因残留提示文案再次阻止签到", () => {
+  assert.equal(classifyPageText({
+    bodyText: "请先进行验证 今日未签到",
+    resolvedChallengeSelectors: true,
+  }).status, "ready");
+  assert.equal(classifyPageText({
+    bodyText: "请先进行验证 今日未签到",
+    challengeSelectors: true,
+    resolvedChallengeSelectors: true,
+  }).status, "interactive_challenge");
 });
 
 test("无复选框的托管验证继续等待", () => {

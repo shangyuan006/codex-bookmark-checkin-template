@@ -1,4 +1,5 @@
 node_modules/
+*.traineddata
 config/config.json
 config/config.local.json
 config/qa-rules.local.json

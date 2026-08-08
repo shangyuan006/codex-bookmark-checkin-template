@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { classifyPageText, formatDailyReason, normalizeText, scoreActionText } from "./detector.mjs";
 import { assertBookmarkNavigation, safeErrorMessage, safeLogUrl } from "./security.mjs";
-import { recognizeOpenCdCaptcha } from "./captcha-ocr.mjs";
+import { recognizeAlphanumericCaptcha, recognizeOpenCdCaptcha } from "./captcha-ocr.mjs";
 import { solveU2VisualChallenge } from "./u2-vision.mjs";
 import { resolveQaByWebSearch } from "./qa-solver.mjs";
 import { withRetrySchedule } from "./retry-policy.mjs";
@@ -16,7 +16,6 @@ const rootDirectory = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const COMPLETED = new Set(["signed", "already_signed", "not_available"]);
 const CHALLENGE = new Set(["interactive_challenge", "managed_challenge_timeout"]);
 const UNCONFIRMED = new Set(["visited", "clicked"]);
-const STORAGE_CONFIRMED = new Set(["signed", "already_signed"]);
 const CANDIDATE_STATUS_PRIORITY = new Map([
   ["signed", 100],
   ["already_signed", 100],
@@ -33,10 +32,54 @@ const CANDIDATE_STATUS_PRIORITY = new Map([
   ["error", 30],
   ["no_action", 20],
 ]);
-export const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, [data-cap-api-endpoint], [class*="captcha" i]';
+export const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, altcha-widget, .altcha, [data-altcha], [data-cap-api-endpoint], [class*="captcha" i]';
+const CALENDAR_DAY_ACTION_SELECTOR = 'button, [role="button"], a[href], input[type="button"], input[type="submit"], [onclick], [tabindex]:not([tabindex="-1"]), [role="gridcell"], td, li, [data-date], [aria-current="date"], [data-today], [data-is-today]';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const MIN_TARGET_TIMEOUT_MS = 30_000;
+const MAX_TARGET_TIMEOUT_MS = 10 * 60_000;
+
+export function getTargetTimeoutMs(config) {
+  return Math.max(
+    MIN_TARGET_TIMEOUT_MS,
+    Math.min(MAX_TARGET_TIMEOUT_MS, Number(config?.targetTimeoutMs) || 180_000),
+  );
+}
+
+export class TargetTimeoutError extends Error {
+  constructor(timeoutMs) {
+    super(`单站处理超过 ${Math.ceil(timeoutMs / 1000)} 秒`);
+    this.name = "TargetTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+// page.evaluate() has no Playwright timeout option. Race every target against
+// a deadline and close its page so a blocked renderer cannot hold the run open.
+export async function runWithTargetTimeout(operation, timeoutMs, onTimeout = null) {
+  const boundedTimeoutMs = Math.max(1, Number(timeoutMs) || 1);
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try { void Promise.resolve(onTimeout?.()).catch(() => {}); } catch { /* timeout still wins */ }
+      reject(new TargetTimeoutError(boundedTimeoutMs));
+    }, boundedTimeoutMs);
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function closePageBounded(page, timeoutMs = 5000) {
+  await Promise.race([
+    page.close({ runBeforeUnload: false }).catch(() => {}),
+    sleep(timeoutMs),
+  ]);
 }
 
 export function preferCandidateResult(current, candidate) {
@@ -45,10 +88,6 @@ export function preferCandidateResult(current, candidate) {
   const currentPriority = CANDIDATE_STATUS_PRIORITY.get(current.status) ?? 0;
   const candidatePriority = CANDIDATE_STATUS_PRIORITY.get(candidate.status) ?? 0;
   return candidatePriority > currentPriority ? candidate : current;
-}
-
-export function shouldPersistSiteStorage(result) {
-  return STORAGE_CONFIRMED.has(result?.status);
 }
 
 export function candidateHistoryEntry(candidateUrl, result, attempt) {
@@ -65,6 +104,182 @@ function targetUsesConfiguredOrigins(target, configuredOrigins) {
   return (target.allowedOrigins ?? [target.origin]).some((origin) => configured.has(origin));
 }
 
+function targetUsesConfiguredActiveOrigin(target, activeOrigin, configuredOrigins) {
+  if (!activeOrigin || !(target.allowedOrigins ?? [target.origin]).includes(activeOrigin)) return false;
+  return (configuredOrigins ?? []).includes(activeOrigin);
+}
+
+function currentAllowedLocation(page, allowedOrigins) {
+  const activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
+  return { activeUrl, activeOrigin: new URL(activeUrl).origin };
+}
+
+export function targetNeedsManualChallenge(target, activeOrigin, config) {
+  return targetUsesConfiguredActiveOrigin(target, activeOrigin, config?.manualChallengeOrigins);
+}
+
+export function challengeEvidenceIsUnresolved(evidence) {
+  return Boolean(evidence?.visible)
+    && evidence?.challengeLike !== false
+    && !Boolean(evidence?.resolvedState)
+    && !Boolean(evidence?.responsePresent);
+}
+
+export function shouldBlockManualChallengeAction(target, activeOrigin, config, state) {
+  return targetNeedsManualChallenge(target, activeOrigin, config)
+    && Boolean(state?.unresolvedChallenge);
+}
+
+export function getConfiguredChallengeInteractionRule(target, activeOrigin, config, phase = null) {
+  if (!(target?.allowedOrigins ?? [target?.origin]).includes(activeOrigin)) return null;
+  const raw = config?.challengeInteractionRules?.[activeOrigin];
+  if (!raw) return null;
+  const type = String(raw.type || "").toLowerCase();
+  const configuredPhase = String(raw.phase || "before").toLowerCase();
+  if (!["click", "slide", "wait"].includes(type)) throw new Error("验证交互规则类型无效");
+  if (!["before", "after"].includes(configuredPhase)) throw new Error("验证交互规则阶段无效");
+  if (phase && configuredPhase !== phase) return null;
+  return {
+    type,
+    phase: configuredPhase,
+    waitMs: Math.max(1000, Math.min(60_000, Number(raw.waitMs) || 30_000)),
+    settleMs: Math.max(500, Math.min(10_000, Number(raw.settleMs) || 3000)),
+    retryAction: raw.retryAction === true,
+    retryActionWaitMs: raw.retryAction === true
+      ? Math.max(500, Math.min(20_000, Number(raw.retryActionWaitMs) || 5000))
+      : 0,
+  };
+}
+
+export function getConfiguredCheckinCaptchaDialogRule(target, activeOrigin, config) {
+  if (!(target?.allowedOrigins ?? [target?.origin]).includes(activeOrigin)) return null;
+  const raw = config?.checkinCaptchaDialogRules?.[activeOrigin];
+  if (!raw) return null;
+  const dialogSelector = String(raw.dialogSelector || "").trim();
+  const imageSelector = String(raw.imageSelector || "").trim();
+  const inputSelector = String(raw.inputSelector || "").trim();
+  const confirmTexts = [...new Set((raw.confirmTexts ?? []).map((value) => normalizeText(value)).filter(Boolean))];
+  const refreshTexts = [...new Set((raw.refreshTexts ?? []).map((value) => normalizeText(value)).filter(Boolean))];
+  if (!dialogSelector || !imageSelector || !inputSelector || confirmTexts.length === 0) {
+    throw new Error("签到图片验证码规则缺少选择器或确认按钮文本");
+  }
+  const minLength = Math.max(1, Math.min(12, Number(raw.minLength) || 4));
+  const maxLength = Math.max(minLength, Math.min(12, Number(raw.maxLength) || 8));
+  return {
+    dialogSelector,
+    imageSelector,
+    inputSelector,
+    confirmTexts,
+    refreshTexts,
+    minLength,
+    maxLength,
+    minImageWidth: Math.max(8, Math.min(500, Number(raw.minImageWidth) || 40)),
+    minImageHeight: Math.max(8, Math.min(300, Number(raw.minImageHeight) || 20)),
+    minConfidence: Math.max(0, Math.min(100, Number(raw.minConfidence) || 30)),
+    waitMs: Math.max(1000, Math.min(10_000, Number(raw.waitMs) || 5000)),
+    maxAttempts: Math.max(1, Math.min(3, Number(raw.maxAttempts) || 1)),
+  };
+}
+
+export function configuredCaptchaImageIsReady(metrics, rule) {
+  if (!metrics || !rule) return false;
+  if (Number(metrics.width) < rule.minImageWidth || Number(metrics.height) < rule.minImageHeight) return false;
+  if (!metrics.isImage) return true;
+  return metrics.complete === true
+    && Number(metrics.naturalWidth) >= rule.minImageWidth
+    && Number(metrics.naturalHeight) >= rule.minImageHeight;
+}
+
+export function selectSliderDragGeometry(candidates) {
+  const values = Array.isArray(candidates) ? candidates : [];
+  const tracks = values.filter((candidate) => candidate.parentCandidateIndex === -1
+    && candidate.width >= 180 && candidate.height >= 20 && candidate.height <= 100
+    && candidate.hasPointerChild);
+  if (tracks.length !== 1) return null;
+  const track = tracks[0];
+  const handles = values.filter((candidate) => candidate.parentCandidateIndex === track.index
+    && candidate.pointerCursor && candidate.width >= 20 && candidate.width <= 100
+    && candidate.height >= 20 && candidate.height <= track.height + 4);
+  if (handles.length !== 1) return null;
+  const handle = handles[0];
+  return {
+    startX: handle.x + handle.width / 2,
+    startY: handle.y + handle.height / 2,
+    endX: track.x + track.width - handle.width / 2 - 2,
+    endY: handle.y + handle.height / 2,
+  };
+}
+
+export function targetUsesCalendarDayCheckin(target, activeUrl, config) {
+  let url;
+  try {
+    url = new URL(activeUrl);
+  } catch {
+    return false;
+  }
+  if (!targetUsesConfiguredActiveOrigin(target, url.origin, config?.calendarDayCheckinOrigins)) return false;
+  const configuredPaths = config?.calendarDayCheckinPaths?.[url.origin];
+  const allowedPaths = Array.isArray(configuredPaths) && configuredPaths.length > 0
+    ? configuredPaths
+    : ["/user/attendance"];
+  const activePath = url.pathname.replace(/\/+$/, "") || "/";
+  return allowedPaths.some((value) => {
+    const normalized = String(value || "").replace(/\/+$/, "") || "/";
+    return normalized.startsWith("/") && activePath === normalized;
+  });
+}
+
+export function assertCalendarDayCheckinLocation(target, activeUrl, config) {
+  const destination = assertBookmarkNavigation(activeUrl, target.allowedOrigins ?? [target.origin]);
+  if (!targetUsesCalendarDayCheckin(target, destination, config)) {
+    throw new Error("日历签到导航离开了配置的来源或精确路径");
+  }
+  return destination;
+}
+
+export function isConfiguredGrowthCheckinPage(target, activeUrl, config) {
+  let url;
+  try {
+    url = new URL(activeUrl);
+  } catch {
+    return false;
+  }
+  if (!targetNeedsManualChallenge(target, url.origin, config) || !url.hash.startsWith("#/")) return false;
+  const route = new URL(url.hash.slice(1), "https://bookmark-route.invalid");
+  return route.pathname.toLowerCase() === "/user/growth"
+    && String(route.searchParams.get("tab") || "").toLowerCase() === "checkin";
+}
+
+const GROWTH_COMPLETED_CONTROL_TEXT = /^(?:(?:今日|今天|当日|當日)\s*)?已\s*(?:完成\s*)?(?:签到|簽到)(?:\s*[,，、;；]?\s*(?:明日|明天)\s*(?:继续|繼續))?$|^(?:签到|簽到)\s*(?:成功|已完成)$/i;
+
+export function matchesConfiguredGrowthCompletedControlText(value) {
+  return GROWTH_COMPLETED_CONTROL_TEXT.test(normalizeText(value));
+}
+
+export function classifyConfiguredGrowthCheckinEvidence(target, activeUrl, config, evidence) {
+  if (!isConfiguredGrowthCheckinPage(target, activeUrl, config)) return null;
+  const hasConfirmedSuccess = Number(evidence?.completedControlCount) > 0
+    || Number(evidence?.todaySuccessfulRecordCount) > 0;
+  if (evidence?.explicitlyUnsigned && hasConfirmedSuccess) {
+    return { status: "needs_attention", reason: "成长签到页同时显示未签到和成功证据" };
+  }
+  if (!evidence?.explicitlyUnsigned && hasConfirmedSuccess) {
+    return { status: "already_signed", reason: "成长签到页确认今日已签到" };
+  }
+  return null;
+}
+
+export function reconcileConfiguredGrowthCheckinState(target, activeUrl, config, state, evidence) {
+  if (!isConfiguredGrowthCheckinPage(target, activeUrl, config)) return state;
+  if (!["ready", "signed", "already_signed"].includes(state?.status)) return state;
+  const confirmed = classifyConfiguredGrowthCheckinEvidence(target, activeUrl, config, evidence);
+  if (confirmed) return confirmed;
+  if (["signed", "already_signed"].includes(state.status)) {
+    return { status: "ready", reason: "成长签到页的通用成功文案缺少今日证据" };
+  }
+  return state;
+}
+
 async function snapshotState(page) {
   const state = await page.evaluate((challengeSelector) => {
     const bodyText = String(document.body?.innerText ?? "").slice(0, 30000);
@@ -74,23 +289,128 @@ async function snapshotState(page) {
         const rect = element.getBoundingClientRect();
         return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
       });
-    const challengeSelectors = [...document.querySelectorAll(challengeSelector)].some((element) => {
+    const challengeMatches = [...document.querySelectorAll(challengeSelector)];
+    const challengeRoots = challengeMatches.filter((element) => !challengeMatches.some((candidate) => (
+      candidate !== element && candidate.contains(element)
+    )));
+    const challengeEvidence = challengeRoots.map((element) => {
       const style = getComputedStyle(element);
       const rect = element.getBoundingClientRect();
-      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+      const visible = style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+      const roots = [element, element.shadowRoot].filter(Boolean);
+      const stateElements = [element, ...roots.flatMap((root) => [...root.querySelectorAll(
+        'input[type="checkbox"], [aria-checked], [data-state], [data-status], [class*="success" i], [class*="verified" i], [class*="solved" i], [class*="complete" i], [class*="passed" i]',
+      )])];
+      const resolvedState = stateElements.some((candidate) => {
+        const className = typeof candidate.className === "string" ? candidate.className : "";
+        const stateText = [
+          candidate.getAttribute("data-state"),
+          candidate.getAttribute("data-status"),
+          className,
+        ].filter(Boolean).join(" ");
+        return candidate.checked === true
+          || candidate.getAttribute("aria-checked") === "true"
+          || /(?:^|[-_\s])(?:success|verified|solved|complete|completed|passed)(?:$|[-_\s])/i.test(stateText);
+      });
+      const responseElements = roots.flatMap((root) => [...root.querySelectorAll(
+        'textarea[name*="response" i], input[name*="response" i], textarea[name*="captcha" i], input[name*="captcha" i], input[name="altcha" i], [data-response]',
+      )]);
+      const responsePresent = responseElements.some((candidate) => {
+        const value = "value" in candidate ? candidate.value : candidate.getAttribute("data-response");
+        return String(value || "").trim().length > 0;
+      });
+      const explicitWidget = element.matches(
+        'iframe, .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, altcha-widget, [data-altcha], [data-cap-api-endpoint]',
+      );
+      const challengeLike = explicitWidget || responseElements.length > 0 || roots.some((root) => root.querySelector(
+        'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], img[src*="captcha" i], img[alt*="captcha" i], canvas, input[type="checkbox"], [role="checkbox"], input[type="text"][name*="captcha" i], input[type="text"][id*="captcha" i], [data-sitekey]',
+      ));
+      return { visible, challengeLike, resolvedState, responsePresent };
     });
-    return { bodyText, passwordInputs, challengeSelectors };
+    const confirmedCheckinControl = [...document.querySelectorAll(
+      'button, [role="button"], input[type="button"], input[type="submit"]',
+    )].some((element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return false;
+      const text = String(
+        element.innerText || element.value || element.getAttribute("aria-label") || "",
+      ).replace(/\s+/g, " ").trim();
+      return /^(?:(?:今日|今天|当日|當日)\s*)?已\s*(?:完成\s*)?(?:签到|簽到)$/i.test(text);
+    });
+    return { bodyText, passwordInputs, challengeEvidence, confirmedCheckinControl };
   }, CHALLENGE_SELECTOR);
-  return classifyPageText({
+  const challengeEvidence = Array.isArray(state.challengeEvidence) ? state.challengeEvidence : [];
+  const unresolvedChallenge = challengeEvidence.some(challengeEvidenceIsUnresolved);
+  const resolvedChallenge = challengeEvidence.some((evidence) => (
+    evidence.visible && !challengeEvidenceIsUnresolved(evidence)
+  ));
+  const classification = classifyPageText({
     url: page.url(),
     title: await page.title(),
     bodyText: state.bodyText,
     hasPassword: state.passwordInputs,
-    challengeSelectors: state.challengeSelectors,
+    challengeSelectors: unresolvedChallenge,
+    resolvedChallengeSelectors: resolvedChallenge && !unresolvedChallenge,
+    confirmedCheckinControl: state.confirmedCheckinControl,
   });
+  return unresolvedChallenge ? { ...classification, unresolvedChallenge: true } : classification;
+}
+
+export async function waitForPendingCheckinState(page, config) {
+  const waitMs = Math.max(10, Math.min(20_000, Number(config.checkinStateWaitMs) || 10_000));
+  const pollMs = Math.max(5, Math.min(1_000, Number(config.checkinStatePollMs) || 500));
+  const deadline = Date.now() + waitMs;
+  let state = await snapshotState(page);
+  while (state.status === "unconfirmed" && state.reason === "签到状态仍在加载") {
+    if (Date.now() >= deadline) {
+      return { status: "unconfirmed", reason: "签到状态在有限等待内未加载完成" };
+    }
+    await sleep(pollMs);
+    state = await snapshotState(page);
+  }
+  return state;
+}
+
+export function getCheckinConfirmationWaitMs(waitMs = 5000) {
+  return Math.max(10, Math.min(60_000, Number(waitMs) || 5000));
+}
+
+export async function waitForConfirmedCheckinState(page, config, waitMs = 5000) {
+  const boundedWaitMs = getCheckinConfirmationWaitMs(waitMs);
+  const pollMs = Math.max(5, Math.min(1000, Number(config.checkinStatePollMs) || 500));
+  const deadline = Date.now() + boundedWaitMs;
+  let state = await snapshotState(page);
+  while (!["signed", "already_signed"].includes(state.status) && Date.now() < deadline) {
+    await sleep(pollMs);
+    state = await snapshotState(page);
+  }
+  return state;
+}
+
+async function confirmConfiguredCheckinAfterWait(page, allowedOrigins, config, rule, state) {
+  if (!rule || state.status !== "ready") return state;
+  const waitMs = Math.max(
+    getCheckinConfirmationWaitMs(rule.waitMs),
+    getCheckinConfirmationWaitMs(config.checkinStateWaitMs),
+  );
+  let confirmed = await waitForConfirmedCheckinState(page, config, waitMs);
+  if (["signed", "already_signed"].includes(confirmed.status)) return confirmed;
+
+  // Some sites finish the verification request server-side but update the
+  // check-in control only on the next document load. Refresh once, within the
+  // current bookmark origin, before returning an unresolved result.
+  assertBookmarkNavigation(page.url(), allowedOrigins);
+  await page.reload({ waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs }).catch(() => {});
+  await sleep(Math.max(500, Number(config.actionWaitMs) || 0));
+  assertBookmarkNavigation(page.url(), allowedOrigins);
+  confirmed = await waitForConfirmedCheckinState(page, config, waitMs);
+  return confirmed;
 }
 
 async function waitForManagedChallenge(page, config) {
+  const pendingState = await waitForPendingCheckinState(page, config);
+  if (pendingState.status !== "managed_challenge") return pendingState;
   const deadline = Date.now() + config.cloudflareWaitMs;
   while (Date.now() < deadline) {
     const state = await snapshotState(page);
@@ -105,6 +425,478 @@ async function waitForManagedChallenge(page, config) {
   }, {
     deferredRetryDelayMs: config.challengeRetryDelayMs ?? config.deferredRetryDelayMs,
   });
+}
+
+async function waitForConfiguredChallengeState(page, allowedOrigins, config, rule, sawChallenge = false) {
+  const deadline = Date.now() + rule.waitMs;
+  let latest = await snapshotState(page);
+  let challengeObserved = sawChallenge || latest.status === "interactive_challenge";
+  let resolvedAt = null;
+  while (true) {
+    assertBookmarkNavigation(page.url(), allowedOrigins);
+    if (["signed", "already_signed", "login_required", "deferred", "needs_attention"].includes(latest.status)) {
+      return latest;
+    }
+    if (latest.status === "interactive_challenge") {
+      challengeObserved = true;
+      resolvedAt = null;
+    } else if (challengeObserved) {
+      resolvedAt ??= Date.now();
+      if (Date.now() - resolvedAt >= rule.settleMs) return latest;
+    }
+    if (Date.now() >= deadline && resolvedAt === null) break;
+    if (Date.now() >= deadline && Date.now() - resolvedAt >= rule.settleMs) break;
+    await sleep(Math.max(100, Math.min(1000, Number(config.checkinStatePollMs) || 500)));
+    latest = await snapshotState(page);
+  }
+  if (latest.status === "interactive_challenge") {
+    return { ...latest, reason: "自动安全验证在有限等待内未完成" };
+  }
+  return latest;
+}
+
+async function clickConfiguredChallengeControl(page, rule) {
+  const selector = [
+    'altcha-widget input[type="checkbox"]',
+    'altcha-widget [role="checkbox"]',
+    '.h-captcha input[type="checkbox"]',
+    '.cf-turnstile input[type="checkbox"]',
+    '.g-recaptcha input[type="checkbox"]',
+  ].join(", ");
+  const deadline = Date.now() + Math.min(5000, rule.waitMs);
+  do {
+    const controls = page.locator(selector);
+    const visibleIndexes = [];
+    for (let index = 0; index < await controls.count(); index += 1) {
+      if (await controls.nth(index).isVisible().catch(() => false)) visibleIndexes.push(index);
+    }
+    if (visibleIndexes.length > 1) {
+      return { status: "needs_attention", reason: "自动验证找到多个可点击控件，已拒绝操作" };
+    }
+    if (visibleIndexes.length === 1) {
+      const control = controls.nth(visibleIndexes[0]);
+      try {
+        if (await control.evaluate((element) => element.matches('input[type="checkbox"]'))) {
+          await control.evaluate((element) => element.click());
+        } else {
+          await control.click({ timeout: 10000 });
+        }
+        return null;
+      } catch {
+        return { status: "needs_attention", reason: "自动验证控件点击失败" };
+      }
+    }
+    await sleep(250);
+  } while (Date.now() < deadline);
+  return { status: "needs_attention", reason: "自动验证未找到唯一可点击控件" };
+}
+
+async function inspectConfiguredSlider(page) {
+  return page.evaluate(() => {
+    const selector = 'input[type="range"], [role="slider"], [class*="slider" i], [class*="slide" i], [class*="verify" i], [class*="drag" i], [id*="slider" i], [id*="slide" i], [id*="verify" i], [id*="drag" i]';
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const elements = [...document.querySelectorAll(selector)].filter(visible).slice(0, 20);
+    return elements.map((element, index) => {
+      const rect = element.getBoundingClientRect();
+      const cursor = getComputedStyle(element).cursor;
+      return {
+        index,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        pointerCursor: cursor === "pointer" || cursor === "grab",
+        hasPointerChild: [...element.querySelectorAll("*")].some((candidate) => {
+          const childCursor = getComputedStyle(candidate).cursor;
+          return visible(candidate) && (childCursor === "pointer" || childCursor === "grab");
+        }),
+        parentCandidateIndex: elements.findIndex((candidate) => candidate !== element && candidate.contains(element)),
+      };
+    });
+  });
+}
+
+async function runConfiguredChallengePhase(page, target, activeOrigin, config, phase) {
+  const rule = getConfiguredChallengeInteractionRule(target, activeOrigin, config, phase);
+  if (!rule) return null;
+  const allowedOrigins = target.allowedOrigins ?? [target.origin];
+  assertBookmarkNavigation(page.url(), allowedOrigins);
+  const initial = await snapshotState(page);
+  if (["signed", "already_signed", "login_required", "deferred", "needs_attention"].includes(initial.status)) {
+    return initial;
+  }
+  if (rule.type === "click") {
+    const failure = await clickConfiguredChallengeControl(page, rule);
+    if (failure) return failure;
+    return waitForConfiguredChallengeState(page, allowedOrigins, config, rule, true);
+  }
+  if (rule.type === "slide") {
+    const geometry = selectSliderDragGeometry(await inspectConfiguredSlider(page));
+    if (!geometry || geometry.endX <= geometry.startX) {
+      return { status: "needs_attention", reason: "自动验证未找到唯一可拖动滑块" };
+    }
+    await page.mouse.move(geometry.startX, geometry.startY);
+    await page.mouse.down();
+    await page.mouse.move(geometry.endX, geometry.endY, { steps: 30 });
+    await page.mouse.up();
+    return waitForConfiguredChallengeState(page, allowedOrigins, config, rule, true);
+  }
+  return waitForConfiguredChallengeState(page, allowedOrigins, config, rule);
+}
+
+async function waitForExtendedDiscoveryContent(page, config) {
+  await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+  const renderWaitMs = Math.max(1000, Math.min(5000, Number(config.actionWaitMs) || 1000));
+  await sleep(renderWaitMs);
+}
+
+function shanghaiCalendarDate(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now).reduce((result, part) => {
+    if (part.type !== "literal") result[part.type] = part.value;
+    return result;
+  }, {});
+  const month = String(Number(parts.month));
+  const day = String(Number(parts.day));
+  const longMonth = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    month: "long",
+  }).format(now);
+  const shortMonth = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    month: "short",
+  }).format(now);
+  return {
+    day,
+    fullDateTokens: [
+      `${parts.year}-${parts.month}-${parts.day}`,
+      `${parts.year}-${month}-${day}`,
+      `${parts.year}/${parts.month}/${parts.day}`,
+      `${parts.year}/${month}/${day}`,
+      `${parts.year}.${parts.month}.${parts.day}`,
+      `${parts.year}.${month}.${day}`,
+      `${parts.year}年${month}月${day}日`,
+      `${longMonth} ${day}, ${parts.year}`,
+      `${shortMonth} ${day}, ${parts.year}`,
+    ],
+    periodTokens: [
+      `${parts.year}-${parts.month}`,
+      `${parts.year}-${month}`,
+      `${parts.year}/${parts.month}`,
+      `${parts.year}/${month}`,
+      `${parts.year}.${parts.month}`,
+      `${parts.year}.${month}`,
+      `${parts.year}年${month}月`,
+      `${longMonth} ${parts.year}`,
+      `${shortMonth} ${parts.year}`,
+    ],
+  };
+}
+
+function shanghaiDateTokens(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now).reduce((result, part) => {
+    if (part.type !== "literal") result[part.type] = part.value;
+    return result;
+  }, {});
+  const month = String(Number(parts.month));
+  const day = String(Number(parts.day));
+  return [
+    `${parts.year}-${parts.month}-${parts.day}`,
+    `${parts.year}/${parts.month}/${parts.day}`,
+    `${parts.year}年${month}月${day}日`,
+    `${month}月${day}日`,
+  ];
+}
+
+async function inspectConfiguredGrowthCheckin(page, dateTokens) {
+  return page.evaluate(({ expectedDates, completedControlPattern }) => {
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const textOf = (element) => String(
+      element.innerText
+      || element.value
+      || element.getAttribute("aria-label")
+      || element.title
+      || "",
+    ).replace(/\s+/g, " ").trim();
+    const bodyText = String(document.body?.innerText || "").replace(/\s+/g, " ");
+    const explicitlyUnsigned = /(?:今日|今天|当日|當日)?\s*(?:尚未|还未|還未|未)\s*(?:完成)?\s*(?:签到|簽到)/i.test(bodyText);
+    const completedControlCount = [...document.querySelectorAll(
+      'button, [role="button"], input[type="button"], input[type="submit"]',
+    )].filter((element) => {
+      if (!visible(element)) return false;
+      const text = textOf(element);
+      if (!new RegExp(completedControlPattern, "i").test(text)) return false;
+      const state = String(element.getAttribute("data-state") || "").toLowerCase();
+      return Boolean(element.disabled)
+        || element.getAttribute("aria-disabled") === "true"
+        || element.getAttribute("aria-checked") === "true"
+        || element.getAttribute("aria-pressed") === "true"
+        || ["checked", "complete", "completed", "success"].includes(state);
+    }).length;
+    const todaySuccessfulRecordCount = [...document.querySelectorAll(
+      'tr, [role="row"], li, .ant-table-row, .el-table__row',
+    )].filter((element) => {
+      if (!visible(element)) return false;
+      const text = textOf(element);
+      return expectedDates.some((date) => text.includes(date))
+        && /(?:签到|簽到)\s*(?:成功|已完成)|已\s*(?:签到|簽到)/i.test(text);
+    }).length;
+    return { explicitlyUnsigned, completedControlCount, todaySuccessfulRecordCount };
+  }, {
+    expectedDates: dateTokens,
+    completedControlPattern: GROWTH_COMPLETED_CONTROL_TEXT.source,
+  });
+}
+
+async function reconcileConfiguredGrowthCheckinPage(page, target, activeUrl, config, state) {
+  if (!isConfiguredGrowthCheckinPage(target, activeUrl, config)) return state;
+  const evidence = await inspectConfiguredGrowthCheckin(page, shanghaiDateTokens());
+  return reconcileConfiguredGrowthCheckinState(target, activeUrl, config, state, evidence);
+}
+
+async function inspectCalendarDayCheckin(page, expectedDate) {
+  return page.evaluate(({ actionSelector, expectedDay, fullDateTokens, periodTokens }) => {
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const compact = (value) => String(value || "").replace(/\s+/g, "").toLowerCase();
+    const containsToken = (value, tokens) => {
+      const candidate = compact(value);
+      return tokens.some((token) => candidate.includes(compact(token)));
+    };
+    const dateCellSelector = '[role="gridcell"], td, li, [data-date], [aria-current="date"], [data-today], [data-is-today]';
+    const hasTodayMarker = (element) => {
+      const candidates = [element, element.closest(dateCellSelector)].filter(Boolean);
+      return candidates.some((candidate) => {
+        const state = String(candidate.getAttribute("data-state") || "").toLowerCase();
+        const className = typeof candidate.className === "string" ? candidate.className : "";
+        const dataToday = candidate.getAttribute("data-today");
+        const dataIsToday = candidate.getAttribute("data-is-today");
+        return candidate.getAttribute("aria-current") === "date"
+          || (dataToday !== null && !/^(?:false|0)$/i.test(dataToday))
+          || (dataIsToday !== null && !/^(?:false|0)$/i.test(dataIsToday))
+          || state === "today"
+          || /(?:^|[-_\s])(?:is[-_])?today(?:$|[-_\s])/i.test(className);
+      });
+    };
+    const hasFullDateIdentity = (element) => {
+      const cell = element.closest(dateCellSelector);
+      const candidates = [element, cell, ...element.querySelectorAll("[datetime], [data-date], [aria-label], [title]")]
+        .filter(Boolean);
+      return candidates.some((candidate) => containsToken([
+        candidate.getAttribute("datetime"),
+        candidate.getAttribute("data-date"),
+        candidate.getAttribute("aria-label"),
+        candidate.getAttribute("title"),
+      ].filter(Boolean).join(" "), fullDateTokens));
+    };
+    const hasCurrentPeriodContext = (element) => {
+      const calendarRoot = element.closest(
+        '[role="grid"], [role="table"], table, [class*="calendar" i], [class*="attendance" i], [class*="date-picker" i], [class*="datepicker" i], [class*="picker-panel" i]',
+      );
+      let current = calendarRoot || element.parentElement;
+      const maxDepth = calendarRoot ? 5 : 8;
+      for (let depth = 0; current && current !== document.body && depth < maxDepth; depth += 1, current = current.parentElement) {
+        if (containsToken(current.innerText, periodTokens)) return true;
+      }
+      return false;
+    };
+    const cellText = (element) => String(
+      element.closest(dateCellSelector)?.innerText || element.innerText || "",
+    ).replace(/\s+/g, " ");
+    const unsignedPattern = /(?:尚未|还未|還未|未)\s*(?:完成)?\s*(?:签到|簽到)/i;
+    const signedPattern = /(?:已\s*(?:完成)?|成功)\s*(?:签到|簽到)/i;
+    const normalized = String(document.body?.innerText || "").replace(/\s+/g, " ");
+    const allControls = [...document.querySelectorAll(actionSelector)];
+    const matchingControls = allControls.map((element, index) => ({ element, index })).filter(({ element }) => {
+      if (!visible(element)) return false;
+      const lines = String(element.innerText || element.value || "")
+        .split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      return lines.includes(expectedDay);
+    });
+    const dayButtons = matchingControls.filter(({ element }) => !matchingControls.some(({ element: candidate }) => (
+      candidate !== element && element.contains(candidate)
+    )));
+    const currentDateButtons = dayButtons.filter(({ element }) => (
+      hasTodayMarker(element) || hasFullDateIdentity(element) || hasCurrentPeriodContext(element)
+    ));
+    const disabled = (element) => element.disabled || element.getAttribute("aria-disabled") === "true";
+    return {
+      explicitTodayUnsigned: /(?:今日|今天|当日|當日)\s*(?:尚未|还未|還未|未)\s*(?:完成)?\s*(?:签到|簽到)/i.test(normalized),
+      currentDateCellUnsignedCount: currentDateButtons.filter(({ element }) => unsignedPattern.test(cellText(element))).length,
+      currentDateCellSignedCount: currentDateButtons.filter(({ element }) => signedPattern.test(cellText(element))).length,
+      explicitSuccess: /(?:今日|今天|当日|當日)\s*已\s*(?:签到|簽到)/i.test(normalized),
+      buttonCount: dayButtons.length,
+      currentDateEvidenceCount: currentDateButtons.length,
+      enabledCurrentDateButtonCount: currentDateButtons.filter(({ element }) => !disabled(element)).length,
+      disabledCurrentDateButtonCount: currentDateButtons.filter(({ element }) => disabled(element)).length,
+      currentButtonIndex: currentDateButtons.length === 1 ? currentDateButtons[0].index : -1,
+    };
+  }, {
+    actionSelector: CALENDAR_DAY_ACTION_SELECTOR,
+    expectedDay: expectedDate.day,
+    fullDateTokens: expectedDate.fullDateTokens,
+    periodTokens: expectedDate.periodTokens,
+  });
+}
+
+export function classifyCalendarDayCheckinEvidence(evidence, { afterClick = false } = {}) {
+  if (Number(evidence?.buttonCount) === 0) {
+    return { status: "needs_attention", reason: afterClick
+      ? "点击当天日期后未获得持久化签到确认"
+      : "日历签到页未找到当天日期按钮" };
+  }
+  const hasCurrentUnsignedState = evidence?.explicitTodayUnsigned
+    || Number(evidence?.currentDateCellUnsignedCount) > 0;
+  const hasCurrentSignedState = Number(evidence?.currentDateCellSignedCount) === 1;
+  const confirmed = (evidence?.explicitSuccess || hasCurrentSignedState)
+    && !hasCurrentUnsignedState
+    && Number(evidence?.currentDateEvidenceCount) === 1
+    && (Number(evidence?.disabledCurrentDateButtonCount) === 1 || hasCurrentSignedState);
+  if (confirmed) {
+    return {
+      status: afterClick ? "signed" : "already_signed",
+      reason: afterClick ? "点击当天日期后刷新确认签到成功" : "日历签到页确认今日已签到",
+    };
+  }
+  if (afterClick) return { status: "needs_attention", reason: "点击当天日期后未获得持久化签到确认" };
+  if (Number(evidence?.currentDateEvidenceCount) !== 1
+    || Number(evidence?.enabledCurrentDateButtonCount) !== 1) {
+    return { status: "needs_attention", reason: "日历签到页未找到可证明属于今天的唯一日期按钮" };
+  }
+  if (!hasCurrentUnsignedState) {
+    return { status: "needs_attention", reason: "日历签到页缺少明确的今日未签到证据" };
+  }
+  return { status: "ready", reason: "日历签到页找到唯一可点击的当天日期" };
+}
+
+async function tryCalendarDayCheckin(page, target, activeUrl, config) {
+  const allowedOrigins = target.allowedOrigins ?? [target.origin];
+  const currentUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
+  if (!targetUsesCalendarDayCheckin(target, currentUrl, config)) return null;
+  if (currentUrl !== activeUrl) {
+    throw new Error("日历签到页地址在执行前发生变化");
+  }
+  await waitForExtendedDiscoveryContent(page, config);
+  assertCalendarDayCheckinLocation(target, page.url(), config);
+  const expectedDate = shanghaiCalendarDate();
+  const before = await inspectCalendarDayCheckin(page, expectedDate);
+  const beforeState = classifyCalendarDayCheckinEvidence(before);
+  if (beforeState.status !== "ready") return beforeState;
+
+  const action = page.locator(CALENDAR_DAY_ACTION_SELECTOR).nth(before.currentButtonIndex);
+  if (!Number.isInteger(before.currentButtonIndex)
+    || before.currentButtonIndex < 0
+    || !await action.isVisible().catch(() => false)
+    || !await action.isEnabled().catch(() => false)) {
+    return { status: "needs_attention", reason: "日历签到当天日期按钮不唯一" };
+  }
+  await action.click({ timeout: 10000 });
+  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+  await sleep(Math.max(1000, Number(config.actionWaitMs) || 0));
+  assertCalendarDayCheckinLocation(target, page.url(), config);
+  await page.reload({ waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
+  await waitForExtendedDiscoveryContent(page, config);
+  assertCalendarDayCheckinLocation(target, page.url(), config);
+
+  const after = await inspectCalendarDayCheckin(page, expectedDate);
+  return classifyCalendarDayCheckinEvidence(after, { afterClick: true });
+}
+
+export function getConfiguredPreCheckinDismissRule(target, activeOrigin, config) {
+  if (!(target?.allowedOrigins ?? [target?.origin]).includes(activeOrigin)) return null;
+  const raw = config?.preCheckinDismissRules?.[activeOrigin];
+  if (!raw || raw.enabled === false) return null;
+  const buttonTexts = [...new Set((raw.buttonTexts ?? [])
+    .map((value) => normalizeText(value))
+    .filter((value) => value && value.length <= 80))];
+  const selectors = [...new Set((raw.selectors ?? [])
+    .map((value) => String(value).trim())
+    .filter((value) => value && value.length <= 200))];
+  if (buttonTexts.length + selectors.length === 0) {
+    throw new Error("签到前公告关闭规则缺少按钮文本或选择器");
+  }
+  return {
+    buttonTexts,
+    selectors,
+    waitMs: Math.max(0, Math.min(10_000, Number(raw.waitMs) || 3_000)),
+    maxDismissals: Math.max(1, Math.min(5, Number(raw.maxDismissals) || 3)),
+  };
+}
+
+async function visibleCandidates(locators) {
+  const visible = [];
+  for (const locator of locators) {
+    const count = Math.min(20, await locator.count());
+    for (let index = 0; index < count; index += 1) {
+      const candidate = locator.nth(index);
+      if (await candidate.isVisible().catch(() => false)) visible.push(candidate);
+    }
+  }
+  return visible;
+}
+
+async function waitForConfiguredDismissCandidates(selectorLocators, textLocators, waitMs) {
+  const deadline = Date.now() + waitMs;
+  do {
+    let candidates = await visibleCandidates(selectorLocators);
+    if (candidates.length === 0) candidates = await visibleCandidates(textLocators);
+    if (candidates.length > 0 || Date.now() >= deadline) return candidates;
+    await sleep(250);
+  } while (true);
+}
+
+export async function dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config) {
+  const rule = getConfiguredPreCheckinDismissRule(target, activeOrigin, config);
+  if (!rule) return false;
+  const selectorLocators = rule.selectors.map((selector) => page.locator(selector));
+  const textLocators = rule.buttonTexts.map((text) => page.getByRole("button", { name: text, exact: true }));
+  let dismissed = 0;
+  for (; dismissed < rule.maxDismissals; dismissed += 1) {
+    const candidates = await waitForConfiguredDismissCandidates(
+      selectorLocators,
+      textLocators,
+      rule.waitMs,
+    );
+    if (candidates.length === 0) break;
+    // Announcement stacks commonly reuse one close button or expose more than
+    // one exact close control. Work from the topmost DOM candidate and keep the
+    // operation bounded by maxDismissals.
+    await candidates[candidates.length - 1].click({ timeout: 10_000 });
+    await sleep(Math.max(500, Number(config.actionWaitMs) || 0));
+  }
+  const remaining = await waitForConfiguredDismissCandidates(
+    selectorLocators,
+    textLocators,
+    rule.waitMs,
+  );
+  if (remaining.length > 0) {
+    throw new Error(`签到前公告在有限的 ${rule.maxDismissals} 次关闭后仍然可见`);
+  }
+  return dismissed > 0;
+}
+
+export function getVisitCheckinWaitMs(config) {
+  return Math.max(0, Math.min(60_000, Number(config?.visitCheckinWaitMs) || 15_000));
 }
 
 async function acceptConfiguredTerms(page, state, activeOrigin, config) {
@@ -194,9 +986,164 @@ async function findCheckinAction(page, allowedOrigins, excludedAction = null) {
     .sort((a, b) => b.score - a.score)[0] ?? null;
 }
 
-async function clickCandidate(page, candidate) {
+async function clickCandidate(page, candidate, { domClick = false } = {}) {
   const locator = page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]').nth(candidate.index);
-  await locator.click({ timeout: 10000 });
+  if (domClick) await locator.evaluate((element) => element.click());
+  else await locator.click({ timeout: 10000 });
+}
+
+async function visibleLocatorIndexes(locator) {
+  const indexes = [];
+  for (let index = 0; index < await locator.count(); index += 1) {
+    if (await locator.nth(index).isVisible().catch(() => false)) indexes.push(index);
+  }
+  return indexes;
+}
+
+async function waitForConfiguredCaptchaImage(dialog, rule) {
+  const deadline = Date.now() + rule.waitMs;
+  do {
+    const images = dialog.locator(rule.imageSelector);
+    const ready = [];
+    for (let index = 0; index < Math.min(20, await images.count()); index += 1) {
+      const candidate = images.nth(index);
+      if (!await candidate.isVisible().catch(() => false)) continue;
+      const metrics = await candidate.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const isImage = element.tagName === "IMG";
+        return {
+          width: rect.width,
+          height: rect.height,
+          isImage,
+          complete: isImage ? Boolean(element.complete) : true,
+          naturalWidth: isImage ? Number(element.naturalWidth) : rect.width,
+          naturalHeight: isImage ? Number(element.naturalHeight) : rect.height,
+        };
+      }).catch(() => null);
+      if (configuredCaptchaImageIsReady(metrics, rule)) ready.push(candidate);
+    }
+    if (ready.length > 1) {
+      return { error: "签到验证码出现多个达到稳定尺寸的可见图像，已拒绝操作" };
+    }
+    if (ready.length === 1) return { image: ready[0] };
+    await sleep(150);
+  } while (Date.now() < deadline);
+  return { error: "签到验证码图像未在有限等待内达到稳定尺寸" };
+}
+
+async function readConfiguredCaptchaImage(image) {
+  const bytes = await image.evaluate(async (element) => {
+    const source = String(element.currentSrc || element.src || "");
+    if (!source) return null;
+    let url;
+    try { url = new URL(source, location.href); } catch { return null; }
+    if (!["data:", "blob:"].includes(url.protocol) && url.origin !== location.origin) return null;
+    try {
+      if (!element.complete || element.naturalWidth <= 0 || element.naturalHeight <= 0) return null;
+      const canvas = document.createElement("canvas");
+      canvas.width = element.naturalWidth;
+      canvas.height = element.naturalHeight;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) return null;
+      context.drawImage(element, 0, 0);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) return null;
+      const value = new Uint8Array(await blob.arrayBuffer());
+      if (value.length < 8 || value.length > 1_000_000) return null;
+      return Array.from(value);
+    } catch {
+      return null;
+    }
+  }).catch(() => null);
+  if (Array.isArray(bytes) && bytes.length > 0) return Buffer.from(bytes);
+  return image.screenshot();
+}
+
+async function tryConfiguredCheckinCaptchaDialog(page, target, activeOrigin, config) {
+  const rule = getConfiguredCheckinCaptchaDialogRule(target, activeOrigin, config);
+  if (!rule) return null;
+  const deadline = Date.now() + rule.waitMs;
+  let dialog = null;
+  do {
+    const dialogs = page.locator(rule.dialogSelector);
+    const visibleDialogs = await visibleLocatorIndexes(dialogs);
+    if (visibleDialogs.length > 1) {
+      return { status: "needs_attention", reason: "签到验证码出现多个可见弹窗，已拒绝操作" };
+    }
+    if (visibleDialogs.length === 1) {
+      dialog = dialogs.nth(visibleDialogs[0]);
+      break;
+    }
+    await sleep(250);
+  } while (Date.now() < deadline);
+  if (!dialog) return null;
+
+  const inputs = dialog.locator(rule.inputSelector);
+  const visibleInputs = await visibleLocatorIndexes(inputs);
+  const buttons = dialog.locator('button, [role="button"], input[type="button"], input[type="submit"]');
+  const buttonCandidates = await buttons.evaluateAll((elements, texts) => elements.map((element, index) => ({
+    index,
+    text: String(element.innerText || element.value || element.getAttribute("aria-label") || "")
+      .replace(/\s+/g, " ").trim(),
+    visible: (() => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    })(),
+  })).filter((candidate) => candidate.visible && texts.includes(candidate.text)), rule.confirmTexts);
+  const refreshCandidates = await buttons.evaluateAll((elements, texts) => elements.map((element, index) => ({
+    index,
+    text: String(element.innerText || element.value || element.getAttribute("aria-label") || "")
+      .replace(/\s+/g, " ").trim(),
+    visible: (() => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    })(),
+  })).filter((candidate) => candidate.visible && texts.includes(candidate.text)), rule.refreshTexts);
+  if (visibleInputs.length !== 1 || buttonCandidates.length !== 1) {
+    return { status: "needs_attention", reason: "签到验证码弹窗结构不唯一，已拒绝操作" };
+  }
+  if (rule.maxAttempts > 1 && refreshCandidates.length !== 1) {
+    return { status: "needs_attention", reason: "签到验证码缺少唯一刷新控件，已拒绝重复识别" };
+  }
+
+  for (let attempt = 1; attempt <= rule.maxAttempts; attempt += 1) {
+    const captchaImage = await waitForConfiguredCaptchaImage(dialog, rule);
+    if (!captchaImage.image) {
+      return { status: "needs_attention", reason: captchaImage.error };
+    }
+    const recognition = await recognizeAlphanumericCaptcha(
+      await readConfiguredCaptchaImage(captchaImage.image),
+      { minLength: rule.minLength, maxLength: rule.maxLength },
+    );
+    const codePattern = new RegExp(`^[A-Z0-9]{${rule.minLength},${rule.maxLength}}$`);
+    const reliable = codePattern.test(recognition.code) && Number(recognition.confidence) >= rule.minConfidence;
+    if (reliable) {
+      await inputs.nth(visibleInputs[0]).fill(recognition.code);
+      await buttons.nth(buttonCandidates[0].index).click({ timeout: 10000 });
+      await sleep(Math.max(1000, Number(config.actionWaitMs) || 0));
+      const state = await waitForConfirmedCheckinState(page, config, rule.waitMs);
+      if (["signed", "already_signed"].includes(state.status)) {
+        return { ...state, reason: `本地图片验证码提交后页面确认签到成功（置信度 ${Math.round(recognition.confidence)}）` };
+      }
+      if (!await dialog.isVisible().catch(() => false)) {
+        return { status: "needs_attention", reason: "签到图片验证码提交后页面未确认成功" };
+      }
+    }
+    if (attempt < rule.maxAttempts) {
+      await buttons.nth(refreshCandidates[0].index).click({ timeout: 10000 });
+      await sleep(750);
+      continue;
+    }
+    if (!reliable) {
+      return {
+        status: "interactive_challenge",
+        reason: `签到图片验证码本地识别结果不可靠（字符数 ${recognition.code.length}，置信度 ${Math.round(Number(recognition.confidence) || 0)}）`,
+      };
+    }
+  }
+  return { status: "interactive_challenge", reason: "签到图片验证码在有限次数内未通过" };
 }
 
 async function detectActiveQuotaBenefit(page, activeOrigin, config, status = "already_signed") {
@@ -249,11 +1196,22 @@ async function tryQuotaRequestFlow(page, activeOrigin, config) {
   return { status: "unconfirmed", reason: "额度申请已提交，但页面未确认结果" };
 }
 
+export function isSafeDiscoveredHref(rawHref) {
+  const value = String(rawHref || "").trim();
+  if (!value || /[\u0000-\u001f\u007f<>"'`]/.test(value)) return false;
+  try {
+    return !/[<>"'`]/.test(decodeURIComponent(value));
+  } catch {
+    return false;
+  }
+}
+
 async function findCheckinDiscoveryUrls(page, expectedOrigin) {
   const links = await page.locator("a[href]").evaluateAll((elements) => elements.slice(0, 300).map((element) => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return {
+      rawHref: element.getAttribute("href"),
       href: element.href,
       text: String(element.innerText || element.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim(),
       visible: style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0,
@@ -261,7 +1219,7 @@ async function findCheckinDiscoveryUrls(page, expectedOrigin) {
   }));
 
   return links
-    .filter((link) => link.visible && link.href)
+    .filter((link) => link.visible && link.href && isSafeDiscoveredHref(link.rawHref))
     .map((link) => {
       try {
         const url = new URL(link.href);
@@ -331,10 +1289,24 @@ async function applyQaRule(page, rule) {
   return true;
 }
 
+export function extractSingleChoiceQuestion(containerText, optionTexts) {
+  const options = optionTexts.map((value) => normalizeText(value)).filter(Boolean);
+  if (options.length < 2) return null;
+  let question = normalizeText(containerText);
+  const firstOptionIndex = question.indexOf(options[0]);
+  if (firstOptionIndex <= 0) return null;
+  question = question.slice(0, firstOptionIndex);
+  const markers = [question.lastIndexOf("请问"), question.lastIndexOf("請問"), question.lastIndexOf("[单选]"), question.lastIndexOf("[單選]")];
+  const marker = Math.max(...markers);
+  if (marker >= 0) question = question.slice(marker);
+  const normalized = normalizeText(question);
+  return normalized ? normalized.slice(-320) : null;
+}
+
 async function readSingleChoiceChallenge(page) {
   const radios = page.locator('input[type="radio"]');
   if (await radios.count() < 2) return null;
-  return radios.evaluateAll((elements) => {
+  const challenge = await radios.evaluateAll((elements) => {
     const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
     const options = elements.map((element, index) => {
       let text = "";
@@ -347,14 +1319,11 @@ async function readSingleChoiceChallenge(page) {
     }).filter((option) => option.text);
     if (options.length < 2) return null;
     const container = elements[0].closest("form") || elements[0].closest("table") || elements[0].parentElement;
-    let question = normalize(container?.innerText || "");
-    const firstOptionIndex = question.indexOf(options[0].text);
-    if (firstOptionIndex > 0) question = question.slice(0, firstOptionIndex);
-    const markers = [question.lastIndexOf("请问"), question.lastIndexOf("請問"), question.lastIndexOf("[单选]"), question.lastIndexOf("[單選]")];
-    const marker = Math.max(...markers);
-    if (marker >= 0) question = question.slice(marker);
-    return { question: normalize(question).slice(-320), options: options.map((option) => option.text) };
+    return { containerText: normalize(container?.innerText || ""), options: options.map((option) => option.text) };
   });
+  if (!challenge) return null;
+  const question = extractSingleChoiceQuestion(challenge.containerText, challenge.options);
+  return question ? { question, options: challenge.options } : null;
 }
 
 async function clickQaChange(page, config) {
@@ -483,15 +1452,14 @@ async function tryNewApiCheckin(page) {
     let checkinBody;
     try { checkinBody = await checkinResponse.json(); } catch { return null; }
     if (checkinBody?.success) {
-      const quota = checkinBody?.data?.quota_awarded;
       return {
         status: "signed",
-        reason: quota == null ? "已通过站点签到接口完成" : `已通过站点签到接口完成，奖励额度 ${quota}`,
+        reason: "已通过站点签到接口完成，奖励额度已到账",
       };
     }
     const checkinMessage = String(checkinBody?.message || "");
     if (/已签到|已簽到|already/i.test(checkinMessage)) {
-      return { status: "already_signed", reason: checkinMessage.slice(0, 200) };
+      return { status: "already_signed", reason: "站点签到接口确认今日已签到" };
     }
     if (/turnstile|captcha|人机|人機/i.test(checkinMessage)) {
       return { status: "interactive_challenge", reason: "站点签到接口要求人机验证" };
@@ -641,7 +1609,7 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
   const destination = assertBookmarkNavigation(candidateUrl, allowedOrigins);
   await page.goto(destination, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
   if (useExtendedDiscovery) {
-    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+    await waitForExtendedDiscoveryContent(page, config);
   }
   let activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
   let activeOrigin = new URL(activeUrl).origin;
@@ -661,6 +1629,9 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
   const u2Result = await tryU2Captcha(page, activeOrigin, config);
   if (u2Result) return { ...u2Result, url: safeLogUrl(page.url()) };
 
+  await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
+  ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+
   // New API exposes an authoritative current-day status endpoint.  Query it
   // before interpreting generic page copy such as “每日签到可获得奖励”, which is
   // a feature description rather than proof that today's check-in succeeded.
@@ -675,9 +1646,16 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
       return { ...initialApiResult, reason: "站点签到接口确认未启用", url: safeLogUrl(page.url()) };
     }
   }
-  let state = await waitForManagedChallenge(page, config);
+  let state = await runConfiguredChallengePhase(page, target, activeOrigin, config, "before")
+    ?? await waitForManagedChallenge(page, config);
+  ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
   state = await acceptConfiguredTerms(page, state, activeOrigin, config);
+  ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+  state = await reconcileConfiguredGrowthCheckinPage(page, target, activeUrl, config, state);
   if (state.status !== "ready") return { ...state, url: safeLogUrl(page.url()) };
+
+  const calendarDayResult = await tryCalendarDayCheckin(page, target, activeUrl, config);
+  if (calendarDayResult) return { ...calendarDayResult, url: safeLogUrl(page.url()) };
 
   const hddolbyResult = await tryHddolbyPostRedirectVerification(page, activeOrigin, config);
   if (hddolbyResult) return { ...hddolbyResult, url: safeLogUrl(page.url()) };
@@ -715,24 +1693,53 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
     for (const discoveryUrl of discoveryUrls) {
       if (discoveryUrl === page.url()) continue;
       await page.goto(assertBookmarkNavigation(discoveryUrl, allowedOrigins), { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
-      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+      await waitForExtendedDiscoveryContent(page, config);
       activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
       activeOrigin = new URL(activeUrl).origin;
+      await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
+      ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
       state = await waitForManagedChallenge(page, config);
+      ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
       state = await acceptConfiguredTerms(page, state, activeOrigin, config);
+      ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+      state = await reconcileConfiguredGrowthCheckinPage(page, target, activeUrl, config, state);
       if (state.status !== "ready") return { ...state, url: safeLogUrl(page.url()) };
+      const discoveredCalendarResult = await tryCalendarDayCheckin(page, target, activeUrl, config);
+      if (discoveredCalendarResult) return { ...discoveredCalendarResult, url: safeLogUrl(page.url()) };
       action = await findCheckinAction(page, allowedOrigins);
       if (action) break;
     }
   }
+  if (action && shouldBlockManualChallengeAction(target, activeOrigin, config, state)) {
+    return {
+      status: "interactive_challenge",
+      reason: "站点签到需要人工完成安全验证",
+      action: action.text,
+      url: safeLogUrl(page.url()),
+    };
+  }
   if (action) {
-    await clickCandidate(page, action);
-    await sleep(config.actionWaitMs);
+    const captchaDialogRule = getConfiguredCheckinCaptchaDialogRule(target, activeOrigin, config);
+    await clickCandidate(page, action, { domClick: Boolean(captchaDialogRule) });
     activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
     activeOrigin = new URL(activeUrl).origin;
-    state = await waitForManagedChallenge(page, config);
+    const captchaDialogResult = await tryConfiguredCheckinCaptchaDialog(page, target, activeOrigin, config);
+    if (captchaDialogResult) return { ...captchaDialogResult, action: action.text, url: safeLogUrl(page.url()) };
+    const configuredAfterRule = getConfiguredChallengeInteractionRule(target, activeOrigin, config, "after");
+    state = await runConfiguredChallengePhase(page, target, activeOrigin, config, "after");
+    if (!state) {
+      await sleep(config.actionWaitMs);
+      state = await waitForManagedChallenge(page, config);
+    }
     state = await acceptConfiguredTerms(page, state, activeOrigin, config);
-    if (["signed", "already_signed", "login_required", "interactive_challenge", "managed_challenge_timeout", "deferred"].includes(state.status)) {
+    state = await confirmConfiguredCheckinAfterWait(
+      page,
+      allowedOrigins,
+      config,
+      configuredAfterRule,
+      state,
+    );
+    if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred", "unconfirmed"].includes(state.status)) {
       return { ...state, action: action.text, url: safeLogUrl(page.url()) };
     }
     if (state.status === "ready") {
@@ -745,15 +1752,31 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
     const nexusCaptchaResult = await tryNexusImageCaptcha(page);
     if (nexusCaptchaResult) return { ...nexusCaptchaResult, action: action.text, url: safeLogUrl(page.url()) };
 
-    const secondAction = await findCheckinAction(page, allowedOrigins, action);
+    const afterRule = configuredAfterRule;
+    let secondAction = await findCheckinAction(page, allowedOrigins, afterRule?.retryAction ? null : action);
+    if (!secondAction && afterRule?.retryAction) {
+      const retryDeadline = Date.now() + afterRule.retryActionWaitMs;
+      do {
+        await sleep(Math.max(100, Math.min(1000, Number(config.checkinStatePollMs) || 500)));
+        assertBookmarkNavigation(page.url(), allowedOrigins);
+        state = await snapshotState(page);
+        if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "deferred", "unconfirmed"].includes(state.status)) {
+          return { ...state, action: action.text, url: safeLogUrl(page.url()) };
+        }
+        secondAction = await findCheckinAction(page, allowedOrigins, null);
+      } while (!secondAction && Date.now() < retryDeadline);
+    }
     if (secondAction) {
       await clickCandidate(page, secondAction);
-      await sleep(/转动|轉動/.test(secondAction.text) ? Math.max(config.actionWaitMs, 8000) : config.actionWaitMs);
       activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
       activeOrigin = new URL(activeUrl).origin;
-      state = await waitForManagedChallenge(page, config);
+      state = await runConfiguredChallengePhase(page, target, activeOrigin, config, "after");
+      if (!state) {
+        await sleep(/转动|轉動/.test(secondAction.text) ? Math.max(config.actionWaitMs, 8000) : config.actionWaitMs);
+        state = await waitForManagedChallenge(page, config);
+      }
       state = await acceptConfiguredTerms(page, state, activeOrigin, config);
-      if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred"].includes(state.status)) {
+      if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred", "unconfirmed"].includes(state.status)) {
         return { ...state, action: `${action.text} → ${secondAction.text}`, url: safeLogUrl(page.url()) };
       }
       return {
@@ -763,10 +1786,28 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
         url: safeLogUrl(page.url()),
       };
     }
+    if (afterRule) {
+      return { status: "needs_attention", reason: "验证完成后页面未确认签到成功", action: action.text, url: safeLogUrl(page.url()) };
+    }
     return { status: "clicked", reason: "已点击明确的签到控件", action: action.text, url: safeLogUrl(page.url()) };
   }
 
   if (/(attendance|check[-_]?in|showup)\.(php|asp)|\/(attendance|check[-_]?in|showup)(?:[/?#]|$)/i.test(activeUrl)) {
+    const waitMs = getVisitCheckinWaitMs(config);
+    if (waitMs > 0) {
+      let confirmation = await waitForConfirmedCheckinState(page, config, waitMs);
+      if (["signed", "already_signed"].includes(confirmation.status)) {
+        return { ...confirmation, url: safeLogUrl(page.url()) };
+      }
+      // Open-and-sign pages can update the success text after the initial
+      // response. Refresh once before falling through to related candidates.
+      await page.reload({ waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs }).catch(() => {});
+      await sleep(Math.max(500, Number(config.actionWaitMs) || 0));
+      confirmation = await waitForConfirmedCheckinState(page, config, waitMs);
+      if (["signed", "already_signed"].includes(confirmation.status)) {
+        return { ...confirmation, url: safeLogUrl(page.url()) };
+      }
+    }
     return { status: "visited", reason: "已访问打开即签到的网址", url: safeLogUrl(page.url()) };
   }
 
@@ -776,6 +1817,9 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
   }
   if ((config.knownNoCheckinFeatureOrigins ?? []).includes(activeOrigin)) {
     return { status: "not_available", reason: "站点当前版本未提供签到功能", url: safeLogUrl(page.url()) };
+  }
+  if (isConfiguredGrowthCheckinPage(target, activeUrl, config)) {
+    return { status: "needs_attention", reason: "成长签到页未提供可验证的今日成功状态", url: safeLogUrl(page.url()) };
   }
 
   return { status: "no_action", reason: "未发现明确签到控件", url: safeLogUrl(page.url()) };
@@ -818,70 +1862,14 @@ export async function launchAutomationContext(config) {
       ...(config.backgroundWindowMode === "visible" ? ["--window-position=80,80", "--window-size=1365,900"] : []),
     ],
   });
-  for (const [origin, relativeFile] of Object.entries(config.siteStorageBootstrap ?? {})) {
-    const storagePath = path.resolve(rootDirectory, String(relativeFile));
-    const allowedRoot = path.resolve(rootDirectory, "data");
-    if (!storagePath.startsWith(`${allowedRoot}${path.sep}`)) continue;
-    const value = await fs.readFile(storagePath, "utf8").then(JSON.parse).catch(() => null);
-    if (value?.origin !== origin || !Array.isArray(value.local) || !Array.isArray(value.session)) continue;
-    const local = value.local.filter((entry) => Array.isArray(entry) && entry.length === 2 && entry.every((item) => typeof item === "string"));
-    const session = value.session.filter((entry) => Array.isArray(entry) && entry.length === 2 && entry.every((item) => typeof item === "string"));
-    await context.addInitScript(({ expectedOrigin, localEntries, sessionEntries }) => {
-      if (location.origin !== expectedOrigin) return;
-      for (const [key, item] of localEntries) {
-        if (localStorage.getItem(key) === null) localStorage.setItem(key, item);
-      }
-      for (const [key, item] of sessionEntries) {
-        if (sessionStorage.getItem(key) === null) sessionStorage.setItem(key, item);
-      }
-    }, { expectedOrigin: origin, localEntries: local, sessionEntries: session });
-  }
   return context;
-}
-
-export async function writeSiteStorageSnapshot(storagePath, value) {
-  await fs.mkdir(path.dirname(storagePath), { recursive: true });
-  const temporary = `${storagePath}.${process.pid}.tmp`;
-  try {
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    await fs.copyFile(storagePath, `${storagePath}.bak`).catch((error) => {
-      if (error?.code !== "ENOENT") throw error;
-    });
-    await fs.rename(temporary, storagePath);
-  } catch (error) {
-    await fs.rm(temporary, { force: true }).catch(() => {});
-    throw error;
-  }
-}
-
-async function persistSiteStorage(page, target, config, result) {
-  if (!shouldPersistSiteStorage(result)) return;
-  const relativeFile = config.siteStorageBootstrap?.[target.origin];
-  if (!relativeFile) return;
-  let activeOrigin;
-  try { activeOrigin = new URL(page.url()).origin; } catch { return; }
-  if (activeOrigin !== target.origin) return;
-  if (/\/(?:log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)/i.test(page.url())) return;
-  const visiblePassword = await page.locator('input[type="password"]:visible').count().catch(() => 0);
-  if (visiblePassword > 0) return;
-  const storagePath = path.resolve(rootDirectory, String(relativeFile));
-  const allowedRoot = path.resolve(rootDirectory, "data");
-  if (!storagePath.startsWith(`${allowedRoot}${path.sep}`)) return;
-  const storage = await page.evaluate(() => ({
-    local: Object.entries(localStorage),
-    session: Object.entries(sessionStorage),
-  }));
-  await writeSiteStorageSnapshot(storagePath, {
-    version: 1,
-    origin: target.origin,
-    capturedAt: new Date().toISOString(),
-    ...storage,
-  });
 }
 
 export async function processTarget(context, target, config, qaRules, logDirectory) {
   let lastResult = null;
   const candidateHistory = [];
+  const targetTimeoutMs = getTargetTimeoutMs(config);
+  const targetDeadline = Date.now() + targetTimeoutMs;
   for (let attempt = 0; attempt <= config.retryCount; attempt += 1) {
     const page = await context.newPage();
     let attemptResult = null;
@@ -889,11 +1877,26 @@ export async function processTarget(context, target, config, qaRules, logDirecto
       for (const candidateUrl of target.candidates) {
         let result;
         try {
+          const remainingMs = targetDeadline - Date.now();
+          if (remainingMs <= 0) throw new TargetTimeoutError(targetTimeoutMs);
           result = withRetrySchedule(
-            await processCandidate(page, target, candidateUrl, config, qaRules),
+            await runWithTargetTimeout(
+              () => processCandidate(page, target, candidateUrl, config, qaRules),
+              remainingMs,
+              () => closePageBounded(page, 1000),
+            ),
             config,
           );
         } catch (error) {
+          if (error instanceof TargetTimeoutError) {
+            result = {
+              status: "error",
+              reason: `单站处理超过 ${Math.ceil(targetTimeoutMs / 1000)} 秒，已终止并继续后续站点`,
+              url: safeLogUrl(page.url()),
+            };
+            candidateHistory.push(candidateHistoryEntry(candidateUrl, result, attempt + 1));
+            return { ...result, attempt: attempt + 1, candidateHistory };
+          }
           result = {
             status: "error",
             reason: safeErrorMessage(error),
@@ -934,8 +1937,7 @@ export async function processTarget(context, target, config, qaRules, logDirecto
         try { result.screenshot = await saveFailureScreenshot(page, logDirectory, target); } catch { /* 页面可能已经关闭 */ }
       }
     } finally {
-      await persistSiteStorage(page, target, config, attemptResult).catch(() => {});
-      await page.close().catch(() => {});
+      await closePageBounded(page);
     }
 
     if (attempt < config.retryCount) await sleep(config.retryDelayMs);

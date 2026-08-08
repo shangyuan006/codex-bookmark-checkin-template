@@ -3,16 +3,26 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { findBookmarkTarget } from "./bookmarks.mjs";
 import { launchAutomationContext } from "./browser.mjs";
-import { safeLogUrl } from "./security.mjs";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
 const config = JSON.parse(await fs.readFile(path.join(rootDirectory, "config", "config.json"), "utf8"));
 const requestedOrigin = process.argv[2];
 const provider = process.argv[3] || "LinuxDO";
+const loginUrlIndex = process.argv.indexOf("--login-url");
+const automationProfileIndex = process.argv.indexOf("--automation-user-data-dir");
+const accountIdIndex = process.argv.indexOf("--account-id");
 if (!requestedOrigin) throw new Error("用法: node src/oauth-login.mjs <origin> [provider]");
 const origin = new URL(requestedOrigin).origin;
 await findBookmarkTarget(config.bookmarksPath, origin, config);
+
+const accountId = accountIdIndex >= 0 ? String(process.argv[accountIdIndex + 1] ?? "").trim() : "default";
+if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(accountId)) throw new Error("Invalid account id");
+const accountProfile = automationProfileIndex >= 0
+  ? String(process.argv[automationProfileIndex + 1] ?? "").trim()
+  : config.automationUserDataDir;
+if (!accountProfile) throw new Error("Automation profile is not configured");
+const runtimeConfig = { ...config, automationUserDataDir: path.resolve(rootDirectory, accountProfile) };
 
 async function trySavedLinuxDoLogin(page) {
   const location = new URL(page.url());
@@ -72,18 +82,16 @@ async function trySavedLinuxDoLogin(page) {
   return finalLocation.hostname !== "linux.do" || !/^\/login(?:[/?#]|$)/i.test(finalLocation.pathname);
 }
 
-const context = await launchAutomationContext(config);
+const context = await launchAutomationContext(runtimeConfig);
 try {
   let page = await context.newPage();
-  const configuredLoginUrl = config.oauthLoginUrls?.[origin] ?? `${origin}/login`;
+  const configuredLoginUrl = loginUrlIndex >= 0
+    ? process.argv[loginUrlIndex + 1]
+    : (config.oauthLoginUrls?.[origin] ?? `${origin}/login`);
   const loginUrl = new URL(configuredLoginUrl);
   if (loginUrl.origin !== origin || loginUrl.protocol !== "https:") throw new Error("OAuth 登录入口不属于目标站点");
-  await page.goto(loginUrl.href, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
-  await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
-  const agreementCheckbox = page.locator('input[type="checkbox"]:visible');
-  if (await agreementCheckbox.count() === 1 && !await agreementCheckbox.isChecked()) {
-    await agreementCheckbox.check({ force: true, timeout: 5000 });
-  }
+  await page.goto(loginUrl.href, { waitUntil: "commit", timeout: config.navigationTimeoutMs });
+  await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
   const providerVariants = [...new Set([provider, provider.replace(/linuxdo/i, "Linux DO")])];
   const providerLabels = providerVariants.flatMap((name) => [
     `使用 ${name} 继续`, `使用 ${name} 登录`, `使用 ${name} 登入`,
@@ -92,21 +100,29 @@ try {
     ? ["LINUX DO", "Linux DO", "LinuxDO"]
     : [provider, `${provider}登录`, `${provider}登入`];
   let providerButton = null;
-  for (const label of providerLabels) {
-    const candidate = page.getByText(label, { exact: true });
-    if (await candidate.count() === 1 && await candidate.isVisible()) {
-      providerButton = candidate;
-      break;
+  const providerDeadline = Date.now() + 20000;
+  while (!providerButton && Date.now() < providerDeadline) {
+    const agreementCheckbox = page.locator('input[type="checkbox"]:visible');
+    if (await agreementCheckbox.count() === 1 && !await agreementCheckbox.isChecked()) {
+      await agreementCheckbox.check({ force: true, timeout: 5000 });
     }
-  }
-  if (!providerButton) {
-    for (const label of providerAltLabels) {
-      const candidate = page.locator(`img[alt="${label}"]`);
+    for (const label of providerLabels) {
+      const candidate = page.getByText(label, { exact: true });
       if (await candidate.count() === 1 && await candidate.isVisible()) {
         providerButton = candidate;
         break;
       }
     }
+    if (!providerButton) {
+      for (const label of providerAltLabels) {
+        const candidate = page.locator(`img[alt="${label}"]`);
+        if (await candidate.count() === 1 && await candidate.isVisible()) {
+          providerButton = candidate;
+          break;
+        }
+      }
+    }
+    if (!providerButton) await page.waitForTimeout(500);
   }
   if (!providerButton) throw new Error(`没有找到唯一的 ${provider} 登录按钮`);
   const popupPromise = page.waitForEvent("popup", { timeout: 5000 }).catch(() => null);
@@ -155,7 +171,6 @@ try {
 
   await page.waitForTimeout(1500);
   const finalUrl = page.url();
-  const bodyText = String(await page.locator("body").innerText()).replace(/\s+/g, " ").trim();
   const finalLocation = new URL(finalUrl);
   const visiblePassword = await page.locator('input[type="password"]:visible').count() > 0;
   let visibleProviderLogin = false;
@@ -179,16 +194,10 @@ try {
     && !/\/(?:log[-_]?in|sign[-_]?in)(?:[/?#]|$)/i.test(finalLocation.href)
     && !visiblePassword
     && !visibleProviderLogin;
-  const screenshotPath = path.join(rootDirectory, "tmp", `oauth-${new URL(origin).hostname.replace(/[^a-z0-9.-]/gi, "_")}.png`);
-  if (!loggedIn) await page.screenshot({ path: screenshotPath, fullPage: false });
   console.log(JSON.stringify({
-    origin,
-    provider,
     status: loggedIn ? "logged_in" : "needs_attention",
-    finalUrl: safeLogUrl(finalUrl),
-    title: await page.title(),
-    screenshotPath: loggedIn ? null : screenshotPath,
-    excerpt: bodyText.slice(0, 1600),
+    finalOriginMatchesTarget: finalLocation.origin === origin,
+    loginFormVisible: visiblePassword || visibleProviderLogin,
   }, null, 2));
   if (!loggedIn) process.exitCode = 2;
 } finally {

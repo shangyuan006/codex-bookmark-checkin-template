@@ -32,18 +32,22 @@ pwsh -NoProfile -File .\scripts\Test-Environment.ps1 `
 
 - 每次启动动态读取书签，因此后续新增书签会自动进入下一次任务。
 - 原生 WAF/托管验证预热只访问当前书签目标及站点规则显式声明的关联来源；公共配置中的预热地址只是可匹配规则库，未命中本次书签范围时全部跳过。
+- 可见手动登录使用独立用户目录的最小原生 Chrome/Edge，不经过 Playwright 或远程调试；手动目标只接受 origin 或待处理序号，实际网址始终从当前书签重新解析。运行 `scripts\Close-ManualLogin.ps1` 会正常关闭窗口并让 Cookie、CF 通行状态和站点存储落盘，同时生成本地待复核记录；下一次 `Run-Checkin.ps1` 会定向重跑这些站点，并以页面或接口证据更新结果，不会把人工点击本身当作成功。
+- 对自动化特征敏感的 CF 站点，可在被 Git 忽略的 `config/config.local.json` 预热项中设置 `"passiveOnly": true`。该模式只用无 CDP 的原生浏览器等待并保存会话，等待本身只算 `prepared`，不能作为签到成功证据。
+- 对点击后由原生浏览器自动完成 CF 验证并刷新结果的站点，可在本地 `nativeChallengePreflight` 项中配置 `action`：用精确按钮文本执行唯一同源签到动作，按有限次数关闭公告，并在 `waitSeconds` 内等待页面自动刷新。只有页面明确显示今日已签到才记为成功；按钮不唯一、跨来源导航、验证未完成或仅发生点击都会失败关闭并交回常规复核。
+- 对必须退出并重新通过 OAuth 登录才发放每日额度的站点，可在被 Git 忽略的 `config/config.local.json` 中配置 `reauthCheckinRules`。流程每天最多退出一次，中断后从本地阶段继续而不会重复退出；只有登录前后额度严格增加，或站点存储中的明确布尔到账信号符合规则时，才会判定 `signed`。本地状态只保存日期、阶段和更新时间，不保存额度、Cookie、Token、页面正文或 OAuth 截图。
 - 相同来源和相同逻辑签到入口会去重，仍为每个书签保留结果。
 - 内置适配器覆盖 NexusPHP、New API、Linux DO OAuth、图片验证码、站内问答、Cloudflare/Turnstile，以及将“申请额度”作为每日签到动作的公益站流程。
 - 未知站点先走通用入口发现；Codex 只把经过页面成功确认的规则写入本机 `config/config.local.json`。
 - 单站重试、异常复查和任务级断点续跑只重新访问未确认目标。
 - 限频站点会记录 `nextEligibleAt` 并按时间定向补跑；超时续跑只接受当天的新检查点，避免复用旧日报或重复整批执行。
 - Windows 计划任务从签到时间起按小时做无副作用探测，用户级调度器按分钟探测；两者都受每日次数上限和运行锁保护。
-- 主浏览器配置只作为只读来源；后台运行始终使用独立配置，并为原生登录窗口禁用同步。
+- 主浏览器配置只作为只读来源；后台运行和可见原生登录始终使用独立配置，不直接控制用户正在使用的主浏览器窗口。
 - 默认不配置外部通知。用户可选择安全的命令型通知器，敏感值应从环境变量或凭据管理器读取。
 - 主浏览器保存密码同步和外部问答搜索默认关闭；初始化问卷获得明确授权后才启用，未授权时不会读取密码库或访问搜索引擎。
 - 机器人浏览器默认关闭 Chromium 的本地大模型下载；限频重试采用有界指数退避，达到当日上限后转到次日计划时间，避免空转。
 
-浏览器保存密码和 OAuth 都无法恢复的站点，可选择使用 Windows DPAPI 凭据。运行 `scripts\Set-ProtectedSiteCredential.ps1 -Origin https://example.com` 交互录入，用户名和密码不会显示；密文只写入被 Git 忽略的 `data\credentials\`，且仅能由当前 Windows 用户解密。随后在本机 `config/config.json` 的 `protectedCredentialOrigins` 中加入站点，并按需配置 `protectedLoginVerificationPaths` 和 `siteStorageBootstrap`。登录器只通过子进程标准输入接收临时明文，不写命令行或日志。
+浏览器保存密码和 OAuth 都无法恢复的站点，可选择使用 Windows DPAPI 凭据。运行 `scripts\Set-ProtectedSiteCredential.ps1 -Origin https://example.com` 交互录入，用户名和密码不会显示；密文只写入被 Git 忽略的 `data\credentials\`，且仅能由当前 Windows 用户解密。随后在本机 `config/config.json` 的 `protectedCredentialOrigins` 中加入站点，并按需配置 `protectedLoginVerificationPaths`。登录器只通过子进程标准输入接收临时明文，不写命令行或日志；登录后的 Cookie 和站点会话由独立 Edge/Chrome 配置目录加密持久化，不另行导出 `localStorage` 或 `sessionStorage`。
 
 ## 目录边界
 
@@ -74,6 +78,8 @@ pwsh -NoProfile -File .\scripts\Clear-AutomationChromeCache.ps1 -Apply
 ```powershell
 pwsh -NoProfile -File .\scripts\Export-PublicBundle.ps1
 ```
+
+升级旧部署后，可运行 `node src\repair-local-results.mjs` 清理历史结果中的奖励额度数值，并将当天后续定向补跑的权威终态合并进完整日报。原始分次报告仍保留，合并不会用错误、延迟或未确认状态覆盖已确认结果。
 
 项目目前面向 Windows 10/11 与桌面版 Chrome 或 Edge。电脑休眠或关机错过计划时间后，用户级调度器会在当天恢复登录后补跑。
 

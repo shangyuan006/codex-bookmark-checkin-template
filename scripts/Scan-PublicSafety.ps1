@@ -9,7 +9,7 @@ if ($git -and (Test-Path -LiteralPath (Join-Path $root '.git'))) {
     $relativeFiles = @(
         & $git.Source -C $root ls-files
         & $git.Source -C $root ls-files --others --exclude-standard
-    ) | Select-Object -Unique
+    ) | Select-Object -Unique | Where-Object { $_ -ne 'logs/.gitkeep' }
 }
 else {
     $relativeFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object {
@@ -31,12 +31,20 @@ $patterns = [ordered]@{
 }
 
 $findings = @()
+$binaryExtensions = '^\.(png|jpg|jpeg|gif|webp|ico|bmp|tiff?|zip|gz|7z|rar|pdf|exe|dll|pdb|woff2?|ttf|otf)$'
 foreach ($relative in $relativeFiles) {
     $fullPath = Join-Path $root $relative
     if (-not (Test-Path -LiteralPath $fullPath)) { continue }
-    if ([System.IO.Path]::GetExtension($fullPath) -match '^\.(png|jpg|jpeg|gif|webp|ico|zip|gz|pdf|lock)$') { continue }
+    if ([System.IO.Path]::GetExtension($fullPath) -match $binaryExtensions) {
+        $findings += [pscustomobject]@{ file = $relative; line = 0; rule = 'Binary file in public scope' }
+        continue
+    }
     $lineNumber = 0
-    foreach ($line in Get-Content -LiteralPath $fullPath -ErrorAction SilentlyContinue) {
+    $lines = try { @(Get-Content -LiteralPath $fullPath -ErrorAction Stop) } catch {
+        $findings += [pscustomobject]@{ file = $relative; line = 0; rule = 'Unreadable public file' }
+        @()
+    }
+    foreach ($line in $lines) {
         $lineNumber += 1
         foreach ($entry in $patterns.GetEnumerator()) {
             if ($relative -eq 'scripts/Scan-PublicSafety.ps1' -and $entry.Key -eq 'Assigned secret') { continue }

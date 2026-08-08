@@ -13,7 +13,8 @@ if ($config.syncBookmarkSavedLogins -ne $false) {
     if (-not (Test-Path -LiteralPath $node)) { throw "未找到 Node.js 运行时：$node" }
     $discoveredText = & $node $originHelper
     if ($LASTEXITCODE -ne 0) { throw '读取书签登录同步范围失败。' }
-    $origins = @($discoveredText | ConvertFrom-Json)
+    $parsedOrigins = $discoveredText | ConvertFrom-Json
+    $origins = @($parsedOrigins)
 }
 if ($origins.Count -eq 0) { return }
 

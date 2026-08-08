@@ -21,15 +21,40 @@ $items = @($config.nativeWafPreflightUrls | ForEach-Object {
     $passiveOnly = $_ -isnot [string] -and [bool]$_.passiveOnly
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "原生 WAF 预热地址无效：$rawUrl" }
     if ($waitSeconds -lt 5 -or $waitSeconds -gt 120) { throw "原生 WAF 等待时间必须为 5 到 120 秒：$rawUrl" }
-    [pscustomobject]@{ url = $uri.AbsoluteUri; waitSeconds = $waitSeconds; trustAsSigned = $true; passiveOnly = $passiveOnly }
+    [pscustomobject]@{
+        url = $uri.AbsoluteUri
+        waitSeconds = $waitSeconds
+        trustAsSigned = $true
+        passiveOnly = $passiveOnly
+        action = $null
+    }
 })
 $items += @($config.nativeChallengePreflight | ForEach-Object {
     $uri = [uri][string]$_.url
     $waitSeconds = [int]$_.waitSeconds
     $passiveOnly = [bool]$_.passiveOnly
+    $action = if ($null -ne $_.action) { $_.action } else { $null }
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "原生验证预热地址无效：$($_.url)" }
     if ($waitSeconds -lt 5 -or $waitSeconds -gt 120) { throw "原生验证等待时间必须为 5 到 120 秒：$($_.url)" }
-    [pscustomobject]@{ url = $uri.AbsoluteUri; waitSeconds = $waitSeconds; trustAsSigned = $false; passiveOnly = $passiveOnly }
+    if ($passiveOnly -and $null -ne $action) { throw "被动原生验证不能同时配置签到动作：$($_.url)" }
+    if ($null -ne $action) {
+        $actionTexts = @($action.actionTexts | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+        $dismissTexts = @($action.dismissButtonTexts | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+        $dismissSelectors = @($action.dismissSelectors | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+        if ($actionTexts.Count -lt 1 -or $actionTexts.Count -gt 10) {
+            throw "原生签到动作必须提供 1 到 10 个按钮文本：$($_.url)"
+        }
+        if ($dismissTexts.Count -gt 10 -or $dismissSelectors.Count -gt 10) {
+            throw "原生签到公告关闭规则过多：$($_.url)"
+        }
+    }
+    [pscustomobject]@{
+        url = $uri.AbsoluteUri
+        waitSeconds = $waitSeconds
+        trustAsSigned = $false
+        passiveOnly = $passiveOnly
+        action = $action
+    }
 })
 
 $originSet = @{};
@@ -83,7 +108,7 @@ foreach ($item in $items) {
         try {
             # 被动模式只启动真实有头浏览器，不开放调试端口，也不连接 CDP。
             # 等待本身不是签到成功证据，因此这里只能报告 prepared/unconfirmed。
-            & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -Urls @($url)
+            & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -NativeMinimal -Urls @($url)
             Start-Sleep -Seconds 2
             if ((Get-AutomationBrowserProcesses).Count -gt 0) {
                 Start-Sleep -Seconds ([int]$item.waitSeconds)
@@ -115,19 +140,27 @@ foreach ($item in $items) {
     }
 
     $inspection = $null
-    $inspectionMode = if ([bool]$item.trustAsSigned) { 'allow-endpoint' } else { 'require-confirmed' }
+    $lastInspection = $null
+    $hasAction = $null -ne $item.action
+    $inspectionMode = if ($hasAction) { 'execute-checkin' } elseif ([bool]$item.trustAsSigned) { 'allow-endpoint' } else { 'require-confirmed' }
+    $actionConfigBase64 = if ($hasAction) {
+        $actionJson = $item.action | ConvertTo-Json -Depth 5 -Compress
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($actionJson))
+    }
+    else { '' }
     for ($inspectionAttempt = 1; $inspectionAttempt -le 2 -and $null -eq $inspection; $inspectionAttempt++) {
         $debugPort = Get-Random -Minimum 12000 -Maximum 32000
         & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -RemoteDebuggingPort $debugPort -Urls @($url)
         Start-Sleep -Seconds 2
         try {
-            $inspectionText = & $node $inspector $debugPort $origin ([int]$item.waitSeconds) $inspectionMode 2>$null
+            $inspectionText = & $node $inspector $debugPort $origin ([int]$item.waitSeconds) $inspectionMode $actionConfigBase64 2>$null
             if ($LASTEXITCODE -eq 0 -and $inspectionText) {
                 $inspection = $inspectionText | ConvertFrom-Json
+                $lastInspection = $inspection
                 $attemptExplicit = [string]$inspection.status -in @('signed', 'already_signed')
                 $attemptEndpoint = [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
                     -and [bool]$inspection.attendanceEndpoint -and [string]$inspection.status -eq 'ready'
-                $attemptPrepared = -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
+                $attemptPrepared = -not $hasAction -and -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
                     -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
                 if (-not $attemptExplicit -and -not $attemptEndpoint -and -not $attemptPrepared) { $inspection = $null }
             }
@@ -140,8 +173,9 @@ foreach ($item in $items) {
     $endpointConfirmed = [bool]$item.trustAsSigned -and $null -ne $inspection `
         -and [bool]$inspection.siteBodyLoaded -and [bool]$inspection.attendanceEndpoint `
         -and [string]$inspection.status -eq 'ready'
-    $prepared = $null -ne $inspection -and [bool]$inspection.siteBodyLoaded `
+    $prepared = -not $hasAction -and $null -ne $inspection -and [bool]$inspection.siteBodyLoaded `
         -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
+    $reportedInspection = if ($null -ne $inspection) { $inspection } else { $lastInspection }
     if (-not $explicitlyConfirmed -and -not $endpointConfirmed -and -not $prepared) {
         Write-Warning "原生验证未能确认站点正文：$hostName"
     }
@@ -149,16 +183,36 @@ foreach ($item in $items) {
         origin = $origin
         url = $url
         status = if ($explicitlyConfirmed -or $endpointConfirmed) { 'signed' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
-        reason = if ($explicitlyConfirmed) {
+        reason = if ($explicitlyConfirmed -and $hasAction -and [bool]$inspection.actionAttempted) {
+            "原生 $($browser.DisplayName) 已执行签到动作，并由页面明确确认今天已签到"
+        } elseif ($explicitlyConfirmed -and $hasAction) {
+            "原生 $($browser.DisplayName) 页面明确确认今天已签到"
+        } elseif ($explicitlyConfirmed) {
             "原生 $($browser.DisplayName) 已通过 WAF，并由页面明确确认今天已签到"
         } elseif ($endpointConfirmed) {
             "原生 $($browser.DisplayName) 已通过 WAF，并确认签到端点完整加载"
         } elseif ($prepared) {
             "原生 $($browser.DisplayName) 已完成验证预热，等待自动化复查"
+        } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'action_not_found') {
+            '原生签到未找到配置的唯一动作'
+        } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'action_not_unique') {
+            '原生签到发现多个配置动作，已拒绝点击'
+        } elseif ($hasAction -and [string]$reportedInspection.challengeOutcome -eq 'challenge_not_unique') {
+            '原生签到发现多个 Cloudflare 验证控件，已拒绝点击'
+        } elseif ($hasAction -and [string]$reportedInspection.challengeOutcome -eq 'challenge_click_failed') {
+            '原生签到未能点击唯一的 Cloudflare 验证控件'
+        } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'confirmation_timeout') {
+            '原生签到点击后在有限等待内未确认成功'
+        } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'not_attempted') {
+            '原生签到页面尚未达到可执行状态'
         } else {
             '原生验证页面未能确认签到结果'
         }
-        inspectionStatus = if ($null -ne $inspection) { [string]$inspection.status } else { 'unavailable' }
+        inspectionStatus = if ($null -ne $reportedInspection) { [string]$reportedInspection.status } else { 'unavailable' }
+        actionAttempted = $null -ne $reportedInspection -and [bool]$reportedInspection.actionAttempted
+        actionOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.actionOutcome } else { 'unavailable' }
+        challengeOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.challengeOutcome } else { 'unavailable' }
+        challengeDetails = if ($null -ne $reportedInspection) { $reportedInspection.challengeDetails } else { $null }
     }
 }
 

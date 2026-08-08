@@ -3,6 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $schedulerScript = Join-Path $PSScriptRoot 'Start-UserScheduler.ps1'
 $configPath = Join-Path $root 'config\config.json'
 $heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
@@ -30,8 +31,7 @@ try {
                 $maxMinutes = 5
                 if ([string]$heartbeat.phase -eq 'running_checkin') {
                     $config = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
-                    $taskTimeoutMinutes = if ($null -ne $config.taskTimeoutMinutes) { [int]$config.taskTimeoutMinutes } else { 25 }
-                    $maxMinutes = $taskTimeoutMinutes + 10
+                    $maxMinutes = Get-CheckinTaskRuntimeBudgetMinutes $config
                 }
                 $fresh = (Get-Date) - [datetime]$heartbeat.updatedAt -lt [timespan]::FromMinutes($maxMinutes)
             } catch { $fresh = $false }

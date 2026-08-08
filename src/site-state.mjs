@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { atomicWriteJson } from "./security.mjs";
+import { atomicWriteJson, redactPrivateResultText } from "./security.mjs";
 
 const CONFIRMED = new Set(["signed", "already_signed", "not_available"]);
 const SUCCESSFUL = new Set(["signed", "already_signed"]);
@@ -87,12 +87,12 @@ export function updateSiteState(previous, results, finishedAt = new Date()) {
     sites[result.origin] = {
       ...prior,
       lastStatus: result.status,
-      lastReason: String(result.reason ?? "").slice(0, 240),
+      lastReason: redactPrivateResultText(result.reason).slice(0, 240),
       lastRunAt: timestamp,
       lastConfirmedAt: confirmed ? timestamp : (prior.lastConfirmedAt ?? null),
       lastConfirmedStatus: confirmed ? result.status : (prior.lastConfirmedStatus ?? null),
       lastConfirmedReason: confirmed
-        ? String(result.reason ?? "").slice(0, 240)
+        ? redactPrivateResultText(result.reason).slice(0, 240)
         : (prior.lastConfirmedReason ?? null),
       lastSuccessAt: successful ? timestamp : (prior.lastSuccessAt ?? null),
       failureStreak: confirmed ? 0 : Number(prior.failureStreak ?? 0) + 1,

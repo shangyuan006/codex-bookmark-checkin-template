@@ -9,9 +9,14 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 . (Join-Path $PSScriptRoot 'RunLock.ps1')
+. (Join-Path $PSScriptRoot 'ManualVerification.ps1')
+. (Join-Path $PSScriptRoot 'NativeFallbackPolicy.ps1')
+. (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $reporterScript = Join-Path $PSScriptRoot 'Submit-UnifiedCheckinReport.ps1'
 $outboxScript = Join-Path $PSScriptRoot 'Invoke-CheckinNotificationOutbox.ps1'
+$timeoutFinalizerScript = Join-Path $root 'src\finalize-timeout-report.mjs'
 $runLockPath = Join-Path $root 'tmp\run.lock'
+$manualVerificationPath = Join-Path $root 'tmp\manual-verification.json'
 $startedAt = Get-Date
 $runnerStatus = 'failed'
 $runnerMessage = '签到任务尚未开始。'
@@ -20,6 +25,7 @@ $locationPushed = $false
 $resumeCandidate = $null
 $wrapperMutex = $null
 $wrapperMutexOwned = $false
+$manualVerification = $null
 
 function Get-FreshResumeReport([datetime]$NotBefore) {
     $logsRoot = Join-Path $root 'logs'
@@ -92,12 +98,17 @@ function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
     if (-not (Test-IsCompleteFinalReport $Report)) { return $true }
     $unresolved = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
     if ($unresolved.Count -eq 0) { return $false }
+    $immediateRetryStatuses = @('error', 'login_required', 'managed_challenge', 'managed_challenge_timeout', 'unconfirmed', 'clicked', 'visited')
     foreach ($result in $unresolved) {
-        if ([string]$result.status -ne 'deferred') { return $true }
-        try {
-            if (-not $result.nextEligibleAt -or [datetime]$result.nextEligibleAt -le $RetryAt) { return $true }
+        $status = [string]$result.status
+        if ($status -eq 'deferred') {
+            try {
+                if (-not $result.nextEligibleAt -or [datetime]$result.nextEligibleAt -le $RetryAt) { return $true }
+            }
+            catch { return $true }
+            continue
         }
-        catch { return $true }
+        if ($status -in $immediateRetryStatuses) { return $true }
     }
     return $false
 }
@@ -121,6 +132,7 @@ try {
     if (-not (Test-Path -LiteralPath $configPath)) { throw '尚未初始化，请先运行 scripts\Initialize-Checkin.ps1。' }
     $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
     $node = Resolve-CheckinNode $config
+    $nativeFallbackOnlyOrigins = @(Get-NativeFallbackOnlyOrigins $config)
 
     $wrapperMutexName = if ($config.runMutexName) { [string]$config.runMutexName } else { 'Local\CodexBookmarkCheckinRun' }
     $wrapperMutex = [System.Threading.Mutex]::new($false, $wrapperMutexName)
@@ -134,26 +146,38 @@ try {
         return
     }
 
-    $timeoutMinutes = if ($null -ne $config.taskTimeoutMinutes) { [int]$config.taskTimeoutMinutes } else { 25 }
-    if ($timeoutMinutes -lt 5 -or $timeoutMinutes -gt 55) { throw 'taskTimeoutMinutes 必须为 5 到 55 分钟。' }
-    $runAttempts = if ($Attempts -gt 0) { $Attempts } elseif ($null -ne $config.taskRunAttempts) { [int]$config.taskRunAttempts } else { 2 }
-    if ($runAttempts -lt 1 -or $runAttempts -gt 3) { throw '任务级重试次数必须为 1 到 3。' }
+    $timeoutMinutes = Get-CheckinTaskTimeoutMinutes $config
+    $runAttempts = Get-CheckinTaskRunAttempts $config $Attempts
     if ($DryRun) { $runAttempts = 1 }
-    $retryDelayMinutes = if ($null -ne $config.taskRetryDelayMinutes) { [int]$config.taskRetryDelayMinutes } else { 3 }
-    if ($retryDelayMinutes -lt 0 -or $retryDelayMinutes -gt 30) { throw '任务级重试间隔必须为 0 到 30 分钟。' }
+    $retryDelayMinutes = Get-CheckinTaskRetryDelayMinutes $config
 
     $indexScript = Join-Path $root 'src\index.mjs'
     $arguments = @($indexScript)
     if ($DryRun) { $arguments += '--dry-run' }
 
     if (-not $DryRun) { $resumeCandidate = Get-TodayResumeReport }
+    if (-not $DryRun) {
+        $pendingManualVerification = Get-PendingManualVerification -Path $manualVerificationPath
+        $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
+        if ($null -ne $pendingManualVerification `
+            -and $null -ne $resumeCandidate `
+            -and [string]$pendingManualVerification.Document.sourceRunId -like "$todayPrefix*") {
+            $manualVerification = $pendingManualVerification
+        }
+        elseif ($null -ne $pendingManualVerification) {
+            Write-Warning '手动复核记录不是今天的有效运行，未强制续跑；请重新打开待处理站点。'
+        }
+    }
 
     $preflightConfigured = @($config.nativeWafPreflightUrls).Count -gt 0 -or @($config.nativeChallengePreflight).Count -gt 0
     $currentPreflightTargets = @()
     if (-not $DryRun -and $preflightConfigured) {
         $targetOutput = @(& $node $indexScript '--list-preflight-targets')
         if ($LASTEXITCODE -ne 0) { throw '无法读取当前书签预热目标。' }
-        try { $currentPreflightTargets = @(($targetOutput -join [Environment]::NewLine) | ConvertFrom-Json) }
+        try {
+            $parsedPreflightTargets = ($targetOutput -join [Environment]::NewLine) | ConvertFrom-Json
+            $currentPreflightTargets = @($parsedPreflightTargets)
+        }
         catch { throw "当前书签预热目标格式无效：$($_.Exception.Message)" }
         if ($currentPreflightTargets.Count -eq 0) { throw '当前书签没有可用的预热目标。' }
     }
@@ -173,9 +197,22 @@ try {
     }
     else {
         for ($attempt = 1; $attempt -le $runAttempts; $attempt++) {
+            $manualAttemptUpdate = $null
+            $needsNativeFallbackRetry = $false
             $runArguments = @($arguments)
             if ($null -ne $resumeCandidate) {
                 $runArguments += @('--resume-report', [string]$resumeCandidate.Path)
+            }
+            if ($null -ne $manualVerification) {
+                $runArguments += @('--origins', (@($manualVerification.Origins) -join ','))
+            }
+            elseif ($attempt -gt 1 -and $null -ne $resumeCandidate) {
+                $fallbackRetryOrigins = @(Get-NativeFallbackRetryOrigins `
+                    -Report $resumeCandidate.Report `
+                    -Origins $nativeFallbackOnlyOrigins)
+                if ($fallbackRetryOrigins.Count -gt 0) {
+                    $runArguments += @('--origins', ($fallbackRetryOrigins -join ','))
+                }
             }
             if ($preflightConfigured) {
                 $preflightTargets = @($currentPreflightTargets)
@@ -192,6 +229,20 @@ try {
                     $preflightTargets = @($currentPreflightTargets | Where-Object {
                         $targetOrigin = [string]$_.origin
                         -not $previousOriginSet.ContainsKey($targetOrigin) -or $pendingOriginSet.ContainsKey($targetOrigin)
+                    })
+                }
+                if ($null -ne $manualVerification) {
+                    $manualOriginSet = @{}
+                    foreach ($origin in @($manualVerification.Origins)) {
+                        $manualOriginSet[[string]$origin] = $true
+                    }
+                    $preflightTargets = @($preflightTargets | Where-Object {
+                        $manualOriginSet.ContainsKey([string]$_.origin)
+                    })
+                }
+                if ($attempt -eq 1 -and $nativeFallbackOnlyOrigins.Count -gt 0) {
+                    $preflightTargets = @($preflightTargets | Where-Object {
+                        -not ($nativeFallbackOnlyOrigins -contains [string]$_.origin)
                     })
                 }
                 $preflightOrigins = @($preflightTargets | ForEach-Object {
@@ -223,6 +274,16 @@ try {
                     break
                 }
                 [void](Remove-RunLockOwnedByProcess -LockPath $runLockPath -ProcessId $process.Id -ProcessStartedAt $processStartedAt)
+                $timeoutProgress = Get-FreshResumeReport $attemptStartedAt
+                if ($null -ne $timeoutProgress -and [string]$timeoutProgress.Report.runState -eq 'in_progress') {
+                    try {
+                        & $node $timeoutFinalizerScript --progress-report ([string]$timeoutProgress.Path) | Out-Null
+                        if ($LASTEXITCODE -ne 0) { throw '超时进度报告补全失败。' }
+                    }
+                    catch {
+                        Write-Warning "超时进度报告未能补全：$($_.Exception.Message)"
+                    }
+                }
             }
             else {
                 $nodeExitCode = $process.ExitCode
@@ -231,17 +292,70 @@ try {
             }
             $freshCandidate = Get-FreshResumeReport $attemptStartedAt
             if ($null -ne $freshCandidate) { $resumeCandidate = $freshCandidate }
+            if ($attempt -eq 1 -and $attempt -lt $runAttempts -and $null -ne $freshCandidate) {
+                $needsNativeFallbackRetry = Test-NeedsNativeFallbackRetry `
+                    -Report $freshCandidate.Report `
+                    -Origins $nativeFallbackOnlyOrigins
+                if ($needsNativeFallbackRetry) {
+                    Write-Warning '首轮仍有原生 fallback 站点未确认；继续第二轮原生签到复核。'
+                }
+            }
+            if ($null -ne $manualVerification -and $null -ne $freshCandidate) {
+                $manualAttemptUpdate = Update-ManualVerificationState `
+                    -Pending $manualVerification `
+                    -Report $freshCandidate.Report `
+                    -Path $manualVerificationPath `
+                    -RetryAt ((Get-Date).AddMinutes($retryDelayMinutes))
+                if ($manualAttemptUpdate.Updated) {
+                    if ($manualAttemptUpdate.Complete) {
+                        Write-Output '手动操作后的定向权威复核已全部确认。'
+                    }
+                    else {
+                        Write-Output "手动操作后的定向权威复核仍有 $(@($manualAttemptUpdate.PendingOrigins).Count) 个待处理站点。"
+                    }
+                }
+            }
             if ($nodeExitCode -eq 0 -and ($null -eq $freshCandidate -or -not (Test-IsCompleteFinalReport $freshCandidate.Report))) {
                 $nodeExitCode = 2
                 $runnerMessage = "签到程序已结束，但第 $attempt 次尝试未生成完整的 final 报告。"
             }
-            if ($nodeExitCode -eq 0) { break }
+            if ($null -ne $manualVerification `
+                -and $null -ne $freshCandidate `
+                -and (Test-IsCompleteFinalReport $freshCandidate.Report) `
+                -and ($null -eq $manualAttemptUpdate -or -not $manualAttemptUpdate.Updated)) {
+                if ($nodeExitCode -eq 0) { $nodeExitCode = 2 }
+                $runnerStatus = 'failed'
+                $runnerMessage = '签到程序已结束，但人工复核记录未被当前书签结果更新；可能有复核目标已移出书签范围。'
+            }
+            if (-not $needsNativeFallbackRetry) {
+                if ($nodeExitCode -eq 0) { break }
+            }
             if ($attempt -lt $runAttempts) {
-                if ($null -ne $resumeCandidate -and -not (Test-HasImmediateRetry $resumeCandidate.Report ((Get-Date).AddMinutes($retryDelayMinutes)))) {
-                    Write-Warning '剩余站点尚未到可重试时间，本次不空转，交由调度器按 nextEligibleAt 定向补跑。'
-                    break
+                if ($null -ne $manualVerification) {
+                    if ($null -ne $manualAttemptUpdate -and $manualAttemptUpdate.Updated -and $manualAttemptUpdate.Complete) {
+                        Write-Warning '人工复核目标已全部确认；未选中的其他异常不会触发重复访问。'
+                        break
+                    }
+                    if ($null -eq $manualAttemptUpdate -or -not $manualAttemptUpdate.Updated) {
+                        Write-Warning '本轮没有生成可用于更新人工复核记录的完整报告，记录保持待处理。'
+                        break
+                    }
+                    if (@($manualAttemptUpdate.RetryOrigins).Count -eq 0) {
+                        Write-Warning '人工复核目标当前没有适合立即重试的站点，本次不重复访问；未确认记录留待后续任务消费。'
+                        break
+                    }
+                    $manualVerification.Origins = @($manualAttemptUpdate.RetryOrigins)
                 }
-                if ($retryDelayMinutes -gt 0) { Start-Sleep -Seconds ($retryDelayMinutes * 60) }
+                elseif ($null -ne $resumeCandidate) {
+                    if (-not $needsNativeFallbackRetry `
+                        -and -not (Test-HasImmediateRetry $resumeCandidate.Report ((Get-Date).AddMinutes($retryDelayMinutes)))) {
+                        Write-Warning '剩余站点当前不适合立即重试，本次不空转；仅在后续任务触发且达到 nextEligibleAt 后定向补跑。'
+                        break
+                    }
+                }
+                if ($retryDelayMinutes -gt 0 -and -not $needsNativeFallbackRetry) {
+                    Start-Sleep -Seconds ($retryDelayMinutes * 60)
+                }
             }
         }
     }

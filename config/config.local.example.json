@@ -8,7 +8,98 @@
   "visitCheckinRules": {
     "https://example.com": { "after": "08:00" }
   },
+  "agentrouterAccounts": [
+    {
+      "origin": "https://example.com",
+      "accountId": "github",
+      "provider": "GitHub",
+      "automationUserDataDir": "data/edge-agentrouter-github",
+      "statePath": "data/agentrouter-github-state.json"
+    },
+    {
+      "origin": "https://example.com",
+      "accountId": "linuxdo",
+      "provider": "LinuxDO",
+      "automationUserDataDir": "data/edge-agentrouter-linuxdo",
+      "statePath": "data/agentrouter-linuxdo-state.json"
+    }
+  ],
+  "reauthCheckinRules": {
+    "https://example.com": {
+      "pageUrl": "https://example.com/console",
+      "loginUrl": "https://example.com/login",
+      "after": "08:00",
+      "provider": "LinuxDO",
+      "accountMenuSelector": "button[aria-haspopup=\"true\"]",
+      "logoutTexts": ["退出登录", "退出"],
+      "quotaEndpoint": "https://example.com/api/user/self",
+      "quotaField": "data.quota",
+      "quotaDomEvidence": {
+        "labelText": "当前余额",
+        "valueSiblingIndex": 1
+      },
+      "loginSuccessStorageEvidence": {
+        "storage": "localStorage",
+        "key": "user",
+        "field": "checked_in",
+        "expected": true
+      }
+    }
+  },
+  "preCheckinDismissRules": {
+    "https://example.com": {
+      "buttonTexts": ["关闭公告"],
+      "selectors": ["button[aria-label=\"Close\"]"],
+      "waitMs": 3000,
+      "maxDismissals": 3
+    }
+  },
+  "challengeInteractionRules": {
+    "https://example.com": {
+      "type": "click",
+      "phase": "before",
+      "waitMs": 30000,
+      "settleMs": 3000,
+      "retryAction": false,
+      "retryActionWaitMs": 5000
+    }
+  },
+  "checkinCaptchaDialogRules": {
+    "https://example.com": {
+      "dialogSelector": ".checkin-modal",
+      "imageSelector": "img.captcha",
+      "inputSelector": "input[placeholder=\"请输入验证码\"]",
+      "confirmTexts": ["确认"],
+      "refreshTexts": ["刷新验证码"],
+      "minLength": 4,
+      "maxLength": 8,
+      "minImageWidth": 40,
+      "minImageHeight": 20,
+      "minConfidence": 30,
+      "waitMs": 5000,
+      "maxAttempts": 3
+    }
+  },
   "nativeWafPreflightUrls": [
-    { "url": "https://example.com/account/check-in", "waitSeconds": 20 }
-  ]
+    { "url": "https://example.com/account/check-in", "waitSeconds": 45, "passiveOnly": true }
+  ],
+  "nativeChallengePreflight": [
+    {
+      "url": "https://example.com/account/check-in",
+      "waitSeconds": 30,
+      "action": {
+        "actionTexts": ["Check in"],
+        "dismissButtonTexts": ["Close"],
+        "dismissSelectors": ["button[aria-label=\"Close\"]"],
+        "dismissWaitMs": 3000,
+        "maxDismissals": 3
+      }
+    }
+  ],
+  "calendarDayCheckinOrigins": [
+    "https://example.com"
+  ],
+  "calendarDayCheckinPaths": {
+    "https://example.com": ["/account/check-in"]
+  }
 }

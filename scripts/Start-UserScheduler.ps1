@@ -3,6 +3,7 @@ param([switch]$Once)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $configPath = Join-Path $root 'config\config.json'
 $initialConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $statePath = Join-Path $root 'data\scheduler-state.json'
@@ -80,7 +81,7 @@ function Test-SchedulerWaiting($state, [datetime]$now, $config) {
     $maxAttempts = [Math]::Max(1, [Math]::Min(6, $maxAttempts))
     if ([string]$state.lastAttemptDate -eq $today -and [int]$state.attemptsToday -ge $maxAttempts) { return $true }
     if ([string]$state.phase -eq 'running' -and $state.lastAttemptStartedAt) {
-        $claimMaxAge = (if ($null -ne $config.taskTimeoutMinutes) { [int]$config.taskTimeoutMinutes } else { 25 }) + 15
+        $claimMaxAge = Get-CheckinTaskRuntimeBudgetMinutes $config
         try {
             if ($now - [datetime]$state.lastAttemptStartedAt -lt [timespan]::FromMinutes($claimMaxAge)) { return $true }
         }

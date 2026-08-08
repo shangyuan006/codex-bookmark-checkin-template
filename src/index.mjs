@@ -5,8 +5,15 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { readBookmarkPlan, publicBookmarkReport } from "./bookmarks.mjs";
 import { launchAutomationContext, processTarget } from "./browser.mjs";
-import { cleanupOldLogs, createRunLog, writeRunResult } from "./logger.mjs";
-import { atomicWriteJson, ensurePrivateDirectory } from "./security.mjs";
+import { getConfiguredReauthAccounts, getConfiguredReauthRule, runConfiguredReauthCheckin } from "./reauth-checkin.mjs";
+import {
+  cleanupOldLogs,
+  createRunLog,
+  sanitizeForPersistence,
+  summarizeResults,
+  writeRunResult,
+} from "./logger.mjs";
+import { atomicWriteJson, ensurePrivateDirectory, safeErrorMessage } from "./security.mjs";
 import { acquireRunLock, releaseRunLock } from "./run-lock.mjs";
 import {
   applyPreferredCandidates,
@@ -22,6 +29,7 @@ import {
   deferUnresolvedLogin,
   isCurrentLocalRunId,
   isRetryEligible,
+  isResumeRetryEligible,
   nextDeferredRetryAt,
 } from "./retry-policy.mjs";
 
@@ -136,8 +144,13 @@ try {
       if (!selectedOrigins) {
         const currentOrigins = new Set(plan.targets.map((target) => target.origin));
         const previousOrigins = new Set(resumeBase.results.map((result) => result.origin));
+        const reauthOrigins = new Set(plan.targets
+          .filter((target) => getConfiguredReauthRule(target, config))
+          .map((target) => target.origin));
         selectedOrigins = new Set([
-          ...resumeBase.results.filter((result) => isRetryEligible(result)).map((result) => result.origin),
+          ...resumeBase.results
+            .filter((result) => isResumeRetryEligible(result, reauthOrigins))
+            .map((result) => result.origin),
           ...[...currentOrigins].filter((origin) => !previousOrigins.has(origin)),
         ]);
       }
@@ -161,8 +174,10 @@ try {
     const selectedTargets = limit
       ? originFilteredTargets.slice(offset, offset + limit)
       : originFilteredTargets.slice(offset);
+    const selectedOriginList = selectedTargets.map((target) => target.origin);
     const plannedTotal = preferredTargets.length;
     const logicalCompletions = new Map();
+    const reauthResults = new Map();
 
     const mergedProgressResults = () => {
       if (!resumeBase) return [...results];
@@ -175,7 +190,7 @@ try {
 
     const writeProgress = async (phase, details = {}) => {
       const progressResults = mergedProgressResults();
-      await atomicWriteJson(path.join(runLog.directory, "progress.json"), {
+      await atomicWriteJson(path.join(runLog.directory, "progress.json"), sanitizeForPersistence({
         runId: runLog.runId,
         runState: "in_progress",
         isComplete: false,
@@ -184,14 +199,30 @@ try {
         processedTotal: progressResults.length,
         completed: progressResults.length,
         total: plannedTotal,
+        selectedOrigins: selectedOriginList,
+        selectedTotal: selectedTargets.length,
+        selectedProcessedTotal: results.length,
+        selectedResults: [...results],
         updatedAt: new Date().toISOString(),
         ...details,
         results: progressResults,
-      });
+      }));
     };
 
     await writeProgress("initial");
-    const context = selectedTargets.length > 0 ? await launchAutomationContext(config) : null;
+    const configuredReauthTargets = selectedTargets.filter((target) => getConfiguredReauthRule(target, config));
+    for (let index = 0; index < configuredReauthTargets.length; index += 1) {
+      const target = configuredReauthTargets[index];
+      const accountCount = getConfiguredReauthAccounts(target, config).length;
+      console.log(`[reauth ${index + 1}/${configuredReauthTargets.length}] ${target.origin} (${accountCount} isolated accounts)`);
+      try {
+        reauthResults.set(target.origin, await runConfiguredReauthCheckin(target, config));
+      } catch (error) {
+        reauthResults.set(target.origin, { status: "needs_attention", reason: safeErrorMessage(error) });
+      }
+    }
+    const needsGenericBrowser = selectedTargets.some((target) => !reauthResults.has(target.origin));
+    const context = needsGenericBrowser ? await launchAutomationContext(config) : null;
 
     const rememberLogicalCompletion = (target, result) => {
       const group = config.logicalCheckinGroups?.[target.origin];
@@ -202,6 +233,8 @@ try {
 
     const runOneTarget = async (activeContext, target, allowReuse = true) => {
       const started = Date.now();
+      const reauthResult = reauthResults.get(target.origin);
+      if (reauthResult) return { ...reauthResult, attempt: 1, durationMs: Date.now() - started };
       const group = config.logicalCheckinGroups?.[target.origin];
       const reused = allowReuse && group ? logicalCompletions.get(group) : null;
       if (reused && reused.origin !== target.origin) {
@@ -266,10 +299,10 @@ try {
             args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-ProtectedLogin.ps1"), "-Origin", current.origin, "-LoginUrl", current.url ?? `${current.origin}/login`],
           });
         }
-        if (provider) methods.push({ method: "oauth", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, provider] });
+        if (provider) methods.push({ method: "oauth", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, provider, "--private-result"] });
         else if (config.autoDetectLinuxDoOAuth !== false
           && (config.autoDetectOAuthOrigins ?? []).includes(current.origin)) {
-          methods.push({ method: "oauth_autodetect", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, "LinuxDO"] });
+          methods.push({ method: "oauth_autodetect", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, "LinuxDO", "--private-result"] });
         }
         methods.push({
           method: "saved_password",
@@ -352,17 +385,24 @@ try {
       config,
       finishedAt,
     );
-    const summary = Object.fromEntries(
-      [...new Set(finalResults.map((result) => result.status))].map((status) => [status, finalResults.filter((result) => result.status === status).length])
-    );
+    const summary = summarizeResults(finalResults);
     const processedTotal = finalResults.length;
     const isComplete = processedTotal === plannedTotal;
+    const selectedTotal = selectedTargets.length;
+    const selectedProcessedTotal = results.length;
+    const selectedSummary = summarizeResults(finalResults.filter((result) => currentOrigins.has(result.origin)));
+    const scopeComplete = selectedTotal > 0 && selectedProcessedTotal === selectedTotal;
     const output = {
       runId: runLog.runId,
       runState: "final",
       plannedTotal,
       processedTotal,
       isComplete,
+      selectedTotal,
+      selectedProcessedTotal,
+      selectedOrigins: selectedOriginList,
+      selectedSummary,
+      scopeComplete,
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
       bookmarkSummary: report,
@@ -371,13 +411,15 @@ try {
       results: finalResults,
     };
     const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);
+    const updateLatest = isComplete && finalResults.length >= minimumTargets;
     const resultPath = await writeRunResult(logsRoot, runLog, output, {
-      updateLatest: isComplete && finalResults.length >= minimumTargets,
+      updateLatest,
+      reconcileLatest: !updateLatest && scopeComplete,
     });
     await writeSiteState(siteStatePath, updateSiteState(siteState, results, finishedAt));
     await writeQaCache(qaCachePath, updateQaCache(qaCache, results, finishedAt));
     await fs.rm(nativeWafPreflightPath, { force: true }).catch(() => {});
-    console.log(JSON.stringify({ resultPath, summary }, null, 2));
+    console.log(JSON.stringify({ resultPath, selectedSummary, summary }, null, 2));
     if (!isComplete || finalResults.some((result) => !TERMINAL_STATUSES.has(result.status))) {
       process.exitCode = 2;
     }

@@ -3,6 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $configPath = Join-Path $root 'config\config.json'
 if (-not (Test-Path -LiteralPath $configPath)) {
     [ordered]@{ healthy = $false; reason = 'not_initialized'; checks = @{ configPresent = $false } } | ConvertTo-Json -Depth 5
@@ -17,6 +18,7 @@ $notificationQuarantinedCount = @(Get-ChildItem -LiteralPath $notificationQuaran
 $taskName = if ($config.schedulerTaskName) { [string]$config.schedulerTaskName } else { 'CodexBookmarkDailyCheckin' }
 $runKeyName = if ($config.schedulerRunKeyName) { [string]$config.schedulerRunKeyName } else { 'CodexBookmarkDailyCheckin' }
 $scheduledTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+$scheduledTaskEnabled = $scheduledTask -and [string]$scheduledTask.State -ne 'Disabled'
 $runValue = try {
     $runProperties = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction Stop
     [string]$runProperties.$runKeyName
@@ -34,9 +36,18 @@ $schedulerStatePath = Join-Path $root 'data\scheduler-state.json'
 $schedulerState = if (Test-Path -LiteralPath $schedulerStatePath) { try { Get-Content -Raw -Encoding UTF8 -LiteralPath $schedulerStatePath | ConvertFrom-Json } catch { $null } } else { $null }
 $heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
 $heartbeat = if (Test-Path -LiteralPath $heartbeatPath) { Get-Content -Raw -Encoding UTF8 -LiteralPath $heartbeatPath | ConvertFrom-Json } else { $null }
-$heartbeatMaxAgeMinutes = if ($heartbeat -and [string]$heartbeat.phase -eq 'running_checkin') { ([int]$config.taskTimeoutMinutes) + 10 } else { 5 }
+$heartbeatMaxAgeMinutes = if ($heartbeat -and [string]$heartbeat.phase -eq 'running_checkin') { Get-CheckinTaskRuntimeBudgetMinutes $config } else { 5 }
 $heartbeatFresh = $heartbeat -and ((Get-Date) - [datetime]$heartbeat.updatedAt) -lt [timespan]::FromMinutes($heartbeatMaxAgeMinutes)
 $problemCount = if ($latest) { @($latest.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') }).Count } else { $null }
+$latestPlannedTotal = if ($latest -and $null -ne $latest.plannedTotal) { [int]$latest.plannedTotal } else { 0 }
+$latestProcessedTotal = if ($latest -and $null -ne $latest.processedTotal) { [int]$latest.processedTotal } elseif ($latest) { @($latest.results).Count } else { 0 }
+$latestResultComplete = $latest `
+    -and [string]$latest.runState -eq 'final' `
+    -and $latest.isComplete -eq $true `
+    -and $latestPlannedTotal -gt 0 `
+    -and $latestProcessedTotal -ge $latestPlannedTotal `
+    -and @($latest.results).Count -ge $latestPlannedTotal
+$userSchedulerReady = [bool]$runValue -and $schedulerCount -eq 1 -and $watchdogCount -eq 1 -and [bool]$heartbeatFresh
 $notificationReady = $config.notification.mode -in @($null, '', 'none') -or (
     $config.notification.mode -eq 'command' -and
     ((Test-Path -LiteralPath ([string]$config.notification.executable)) -or (Get-Command ([string]$config.notification.executable) -ErrorAction SilentlyContinue))
@@ -48,18 +59,20 @@ $checks = [ordered]@{
     automationProfilePresent = Test-Path -LiteralPath (Join-Path ([string]$config.automationUserDataDir) 'Local State')
     notificationReady = [bool]$notificationReady
     notificationOutboxClean = $notificationQuarantinedCount -eq 0
-    schedulerReady = [bool]$scheduledTask -or [bool]$runValue
-    schedulerUnique = if ($scheduledTask) { $true } else { $schedulerCount -eq 1 -and $watchdogCount -eq 1 }
+    schedulerReady = [bool]$scheduledTaskEnabled -or [bool]$userSchedulerReady
+    schedulerUnique = if ($scheduledTaskEnabled) { $true } elseif ($runValue) { $schedulerCount -eq 1 -and $watchdogCount -eq 1 } else { $false }
     schedulerHeartbeatFresh = [bool]$heartbeatFresh
     latestResultPresent = [bool]$latest
-    latestResultConfirmed = $null -ne $problemCount -and $problemCount -eq 0
-    latestResultComplete = $null -ne $problemCount -and $problemCount -eq 0
+    latestResultConfirmed = [bool]$latestResultComplete -and $null -ne $problemCount -and $problemCount -eq 0
+    latestResultComplete = [bool]$latestResultComplete
     siteStatePresent = Test-Path -LiteralPath $statePath
 }
 [ordered]@{
     healthy = -not ($checks.Values -contains $false)
     schedule = [string]$config.schedule
-    schedulerMode = if ($scheduledTask) { 'windows_task' } elseif ($runValue) { 'user_scheduler' } else { 'none' }
+    schedulerMode = if ($scheduledTaskEnabled) { 'windows_task' } elseif ($runValue) { 'user_scheduler' } elseif ($scheduledTask) { 'windows_task_disabled' } else { 'none' }
+    scheduledTaskEnabled = [bool]$scheduledTaskEnabled
+    schedulerStatus = if ($scheduledTaskEnabled -or $userSchedulerReady) { 'active' } elseif ($scheduledTask -or $runValue) { 'paused' } else { 'not_installed' }
     schedulerProcessCount = $schedulerCount
     watchdogProcessCount = $watchdogCount
     latestRunId = if ($latest) { [string]$latest.runId } else { $null }

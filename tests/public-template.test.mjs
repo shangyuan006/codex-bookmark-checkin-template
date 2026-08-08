@@ -10,17 +10,48 @@ test("公开默认配置不启用外部通知", async () => {
   assert.deepEqual(defaults.syncSavedLoginOrigins, []);
   assert.equal(defaults.qaWebSearchEnabled, false);
   assert.equal(defaults.disableOptimizationGuideOnDeviceModel, true);
+  assert.equal(defaults.failureScreenshots, false);
+  assert.equal(Object.hasOwn(defaults, "siteStorageBootstrap"), false);
+  assert.deepEqual(defaults.agentrouterAccounts, []);
+  assert.deepEqual(defaults.reauthCheckinRules, {});
+  assert.deepEqual(defaults.preCheckinDismissRules, {});
+  assert.deepEqual(defaults.challengeInteractionRules, {});
+  assert.deepEqual(defaults.checkinCaptchaDialogRules, {});
+  assert.deepEqual(defaults.calendarDayCheckinOrigins, []);
+  assert.deepEqual(defaults.calendarDayCheckinPaths, {});
+});
+
+test("OAuth 恢复始终不保存页面截图或正文摘录", async () => {
+  const oauth = await fs.readFile(new URL("../src/oauth-login.mjs", import.meta.url), "utf8");
+  const adapter = await fs.readFile(new URL("../src/reauth-checkin.mjs", import.meta.url), "utf8");
+  const runner = await fs.readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
+  assert.match(adapter, /"--private-result"/);
+  assert.match(runner, /oauth-login\.mjs"\), current\.origin, provider, "--private-result"/);
+  assert.doesNotMatch(oauth, /page\.screenshot|screenshotPath|excerpt|bodyText/);
+  assert.match(oauth, /waitUntil: "commit"/);
+});
+
+test("Agent Router account login helper does not request or persist secrets", async () => {
+  const helper = await fs.readFile(new URL("../scripts/Open-AgentRouterLogin.ps1", import.meta.url), "utf8");
+  assert.match(helper, /agentrouterAccounts/);
+  assert.match(helper, /user-data-dir=/);
+  assert.doesNotMatch(helper, /password|cookie|token|session/i);
 });
 
 test("保存密码同步必须经过显式总开关授权", async () => {
   const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
+  const syncer = await fs.readFile(new URL("../scripts/Sync-ChromeSavedLogins.ps1", import.meta.url), "utf8");
   assert.match(runner, /syncBookmarkSavedLogins -eq \$true/);
   assert.doesNotMatch(runner, /syncSavedLoginOrigins\)\.Count -gt 0 -or/);
+  assert.match(syncer, /\$parsedOrigins = \$discoveredText \| ConvertFrom-Json/);
+  assert.match(syncer, /\$origins = @\(\$parsedOrigins\)/);
+  assert.doesNotMatch(syncer, /\$origins = @\(\$discoveredText \| ConvertFrom-Json\)/);
 });
 
 test("原生预热只能访问当前书签目标或其显式关联 origin", async () => {
   const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
   const preheater = await fs.readFile(new URL("../scripts/Prepare-NativeWafSession.ps1", import.meta.url), "utf8");
+  const fallbackPolicy = await fs.readFile(new URL("../scripts/NativeFallbackPolicy.ps1", import.meta.url), "utf8");
   const indexSource = await fs.readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
   const preheatCalls = [...runner.matchAll(/Prepare-NativeWafSession\.ps1'\)([^\r\n]*)/g)];
 
@@ -30,6 +61,94 @@ test("原生预热只能访问当前书签目标或其显式关联 origin", asyn
   for (const [, argumentsText] of preheatCalls) assert.match(argumentsText, /-Origins\s+\$preflightOrigins/);
   assert.match(preheater, /\[Parameter\(Mandatory\)\][\s\S]*?\[string\[\]\]\$Origins/);
   assert.doesNotMatch(preheater, /if \(\$Origins\.Count -gt 0\)/);
+  assert.match(fallbackPolicy, /function Get-NativeFallbackOnlyOrigins\(\$Config\)/);
+  assert.match(runner, /NativeFallbackPolicy\.ps1/);
+  assert.match(runner, /if \(\$attempt -eq 1 -and \$nativeFallbackOnlyOrigins\.Count -gt 0\)/);
+  assert.match(runner, /-not \(\$nativeFallbackOnlyOrigins -contains \[string\]\$_.origin\)/);
+});
+
+test("人工定向复核时原生预热与指定 origin 取交集", async () => {
+  const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
+  const manualScope = runner.match(/if \(\$null -ne \$manualVerification\) \{\s*\$manualOriginSet = @\{\}([\s\S]*?)\n\s*\}/)?.[1] ?? "";
+
+  assert.match(runner, /\$parsedPreflightTargets = \(\$targetOutput -join \[Environment\]::NewLine\) \| ConvertFrom-Json/);
+  assert.match(runner, /\$currentPreflightTargets = @\(\$parsedPreflightTargets\)/);
+  assert.doesNotMatch(runner, /\$currentPreflightTargets = @\(\(\$targetOutput -join/);
+  assert.match(manualScope, /foreach \(\$origin in @\(\$manualVerification\.Origins\)\)/);
+  assert.match(manualScope, /\$manualOriginSet\[\[string\]\$origin\] = \$true/);
+  assert.match(runner, /\$preflightTargets = @\(\$preflightTargets \| Where-Object \{\s*\$manualOriginSet\.ContainsKey\(\[string\]\$_\.origin\)/);
+});
+
+test("手动登录使用无 Playwright 和无远程调试的最小原生浏览器", async () => {
+  const opener = await fs.readFile(new URL("../scripts/Open-ManualLogin.ps1", import.meta.url), "utf8");
+  const nativeLauncher = await fs.readFile(new URL("../scripts/Open-PlainLoginChrome.ps1", import.meta.url), "utf8");
+  const closer = await fs.readFile(new URL("../scripts/Close-ManualLogin.ps1", import.meta.url), "utf8");
+  const attentionUrls = await fs.readFile(new URL("../src/attention-urls.mjs", import.meta.url), "utf8");
+
+  assert.doesNotMatch(opener, /manual-session\.mjs|launchAutomationContext/);
+  assert.match(opener, /\[string\[\]\]\$Origins/);
+  assert.match(opener, /\[int\[\]\]\$Selection/);
+  assert.match(opener, /Open-PlainLoginChrome\.ps1'\) @launchOptions/);
+  assert.match(nativeLauncher, /\$TrackManualSession -and \(-not \$NativeMinimal -or \$Offscreen -or \$RemoteDebuggingPort -gt 0\)/);
+  assert.match(nativeLauncher, /\$TrackManualSession -and \$Urls\.Count -gt 0/);
+  assert.match(nativeLauncher, /--origin/);
+  assert.match(nativeLauncher, /--selection/);
+  assert.match(nativeLauncher, /mode = 'native'/);
+  assert.match(nativeLauncher, /processStartedAt = \$processStartedAt/);
+  assert.match(nativeLauncher, /prepare-native-browser-profile\.mjs/);
+  assert.match(nativeLauncher, /targets = @\(\$items/);
+  assert.match(closer, /Get-CheckinAutomationBrowserProcesses/);
+  assert.match(closer, /\[int\]::TryParse\(\[string\]\$state\.pid/);
+  assert.match(closer, /\$_.ProcessId -eq \$trackedPid/);
+  assert.match(closer, /\[string\]::Equals\(\$recordedProfile, \$configuredProfile/);
+  assert.match(closer, /\$trackedProcess\.StartTime\.ToUniversalTime\(\)/);
+  assert.match(closer, /未关闭当前占用独立配置的其他浏览器/);
+  assert.match(closer, /CloseMainWindow\(\)/);
+  assert.doesNotMatch(closer, /Stop-Process/);
+  assert.match(closer, /state = 'pending_verification'/);
+  assert.match(closer, /successInferredFromManualInteraction = \$false/);
+  assert.match(closer, /authoritativeEvidenceRequired = \$true/);
+  assert.doesNotMatch(closer, /verificationStatus = '(?:signed|already_signed|clicked)'/);
+  assert.match(attentionUrls, /export const ATTENTION_STATUSES = new Set/);
+  assert.match(attentionUrls, /readBookmarkPlan\(config\.bookmarksPath, config\)/);
+  assert.doesNotMatch(attentionUrls, /readBookmarkPlanWithBackup/);
+  assert.doesNotMatch(attentionUrls, /"no_action"/);
+});
+
+test("定向补跑同时报告本轮统计和今日累计统计", async () => {
+  const runner = await fs.readFile(new URL("../src/index.mjs", import.meta.url), "utf8");
+  assert.match(runner, /selectedSummary = summarizeResults/);
+  assert.match(runner, /JSON\.stringify\(\{ resultPath, selectedSummary, summary \}/);
+});
+
+test("targeted timeout and notification code retain selected-scope fields", async () => {
+  const finalizer = await fs.readFile(new URL("../src/finalize-timeout-report.mjs", import.meta.url), "utf8");
+  const reporter = await fs.readFile(new URL("../scripts/Submit-UnifiedCheckinReport.ps1", import.meta.url), "utf8");
+  assert.match(finalizer, /selectedOrigins/);
+  assert.match(finalizer, /selectedResults/);
+  assert.match(finalizer, /selectedSummary/);
+  assert.match(finalizer, /reconcileLatest: !updateLatest && report\.scopeComplete/);
+  assert.match(reporter, /\$selectedResults/);
+  assert.match(reporter, /selectedProblemCount/);
+  assert.match(reporter, /本轮/);
+  assert.match(reporter, /今日累计/);
+  assert.match(reporter, /selectedSummary/);
+});
+
+test("原生登录生命周期脚本保留 Windows PowerShell 5.1 可识别的 UTF-8 BOM", async () => {
+  for (const script of ["Open-ManualLogin.ps1", "Open-PlainLoginChrome.ps1", "Close-ManualLogin.ps1"]) {
+    const contents = await fs.readFile(new URL(`../scripts/${script}`, import.meta.url));
+    assert.deepEqual([...contents.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+  }
+});
+
+test("CF 被动预热使用最小原生浏览器且不开放调试端口", async () => {
+  const preheater = await fs.readFile(new URL("../scripts/Prepare-NativeWafSession.ps1", import.meta.url), "utf8");
+  const passiveBlock = preheater.match(/if \(\[bool\]\$item\.passiveOnly\) \{([\s\S]*?)\n\s*continue\r?\n\s*\}/)?.[1];
+
+  assert.ok(passiveBlock);
+  assert.match(passiveBlock, /Open-PlainLoginChrome\.ps1'\) -Offscreen -NativeMinimal/);
+  assert.doesNotMatch(passiveBlock, /RemoteDebuggingPort|native-browser-inspect/);
 });
 
 test("机器人浏览器缓存清理有目录边界和会话数据保护", async () => {
@@ -57,12 +176,82 @@ test("wrapper 覆盖前置步骤并且只在子进程退出后清理运行锁", 
   assert.match(runner, /Remove-RunLockOwnedByProcess/);
 });
 
+test("调度器执行上限使用完整任务预算而非固定一小时", async () => {
+  const installer = await fs.readFile(new URL("../scripts/Install-ScheduledTask.ps1", import.meta.url), "utf8");
+  const helper = await fs.readFile(new URL("../scripts/TaskRuntimeBudget.ps1", import.meta.url), "utf8");
+  const watchdog = await fs.readFile(new URL("../scripts/Ensure-UserScheduler.ps1", import.meta.url), "utf8");
+  const scheduler = await fs.readFile(new URL("../scripts/Start-UserScheduler.ps1", import.meta.url), "utf8");
+  const health = await fs.readFile(new URL("../scripts/Test-CheckinHealth.ps1", import.meta.url), "utf8");
+  assert.match(helper, /function Get-CheckinTaskRuntimeBudgetMinutes/);
+  for (const source of [installer, watchdog, scheduler, health]) {
+    assert.match(source, /TaskRuntimeBudget\.ps1/);
+    assert.match(source, /Get-CheckinTaskRuntimeBudgetMinutes/);
+  }
+  assert.match(installer, /-ExecutionTimeLimit \(New-TimeSpan -Minutes \$executionLimitMinutes\)/);
+  assert.doesNotMatch(installer, /-ExecutionTimeLimit \(New-TimeSpan -Hours 1\)/);
+});
+
 test("安装配置优先使用 PowerShell 7，5.1 仅作为可用回退", async () => {
   const setup = await fs.readFile(new URL("../src/setup-config.mjs", import.meta.url), "utf8");
   const preflight = await fs.readFile(new URL("../scripts/Test-Environment.ps1", import.meta.url), "utf8");
   assert.match(setup, /findOnPath\("pwsh\.exe"\)/);
   assert.match(setup, /answers\.powershellExecutable \|\| preferredPowerShell/);
   assert.match(preflight, /--scope-json-base64/);
+});
+
+test("已确认书签范围的预检不输出用户目录或范围外收藏夹候选", async () => {
+  const preflight = await fs.readFile(new URL("../src/preflight.mjs", import.meta.url), "utf8");
+  assert.match(preflight, /if \(plan\) \{[\s\S]*?scopeMatch:[\s\S]*?sources: plan\.sources\.map/);
+  assert.match(preflight, /else \{[\s\S]*?listBookmarkFolderCandidatesWithBackup\(bookmarksPath\)/);
+  assert.match(preflight, /scopeProvided \? browser : \{ \.\.\.browser, userDataDir \}/);
+  assert.match(preflight, /scopeProvided[\s\S]*?bookmark_scope_unreadable[\s\S]*?: \{ bookmarksPath/);
+});
+
+test("健康检查区分暂停调度并严格验证完整日报合同", async () => {
+  const health = await fs.readFile(new URL("../scripts/Test-CheckinHealth.ps1", import.meta.url), "utf8");
+  assert.match(health, /scheduledTaskEnabled/);
+  assert.match(health, /windows_task_disabled/);
+  assert.match(health, /schedulerStatus/);
+  for (const contract of [
+    /runState -eq 'final'/,
+    /isComplete -eq \$true/,
+    /latestProcessedTotal -ge \$latestPlannedTotal/,
+    /results\)\.Count -ge \$latestPlannedTotal/,
+  ]) assert.match(health, contract);
+  assert.match(health, /latestResultConfirmed = \[bool\]\$latestResultComplete/);
+});
+
+test("公开安全扫描不会静默跳过截图或其他二进制文件", async () => {
+  const scanner = await fs.readFile(new URL("../scripts/Scan-PublicSafety.ps1", import.meta.url), "utf8");
+  assert.match(scanner, /Binary file in public scope/);
+  assert.match(scanner, /png\|jpg\|jpeg\|gif\|webp/);
+  assert.doesNotMatch(scanner, /GetExtension\(\$fullPath\)[^\n]+\{\s*continue\s*\}/);
+});
+
+test("诊断工具只输出分类证据并服从当前书签同源边界", async () => {
+  const inspector = await fs.readFile(new URL("../src/inspect-target.mjs", import.meta.url), "utf8");
+  const api = await fs.readFile(new URL("../src/checkin-api.mjs", import.meta.url), "utf8");
+  const scriptSearch = await fs.readFile(new URL("../src/search-site-checkin.mjs", import.meta.url), "utf8");
+  for (const source of [inspector, api, scriptSearch]) {
+    assert.match(source, /findBookmarkTarget/);
+    assert.match(source, /assertBookmarkNavigation/);
+    assert.doesNotMatch(source, /page\.screenshot|screenshotPath|outerHTML|excerpt/);
+  }
+  assert.doesNotMatch(inspector, /pageFunctions|specialHtml|showupHtml|visibleSurfaces/);
+  assert.doesNotMatch(api, /return \{[^}]*\bbody\b/);
+  const searchOutput = scriptSearch.match(/console\.log\(JSON\.stringify\(\{([\s\S]*?)\}\)\);/)?.[1] ?? "";
+  assert.doesNotMatch(searchOutput, /\b(?:requestedUrl|scriptUrl|excerpt)\s*[,}]/);
+  await assert.rejects(fs.access(new URL("../src/open-captcha-session.mjs", import.meta.url)));
+  await assert.rejects(fs.access(new URL("../src/u2-captcha-session.mjs", import.meta.url)));
+});
+
+test("原生预热检查器不向父进程返回页面标题或正文片段", async () => {
+  const inspector = await fs.readFile(new URL("../src/native-browser-inspect.mjs", import.meta.url), "utf8");
+  const outputBlock = inspector.match(/output = \{([\s\S]*?)\n\s*\};/)?.[1] ?? "";
+  assert.match(outputBlock, /status: (?:state|current\.state)\.status/);
+  assert.match(outputBlock, /siteBodyLoaded/);
+  assert.match(outputBlock, /attendanceEndpoint/);
+  assert.doesNotMatch(outputBlock, /origin|url|title|reason|bodyText|leichiText/);
 });
 
 test("公开模板不预设任何用户的书签文件夹名称", async () => {
@@ -119,9 +308,49 @@ test("DPAPI 凭据恢复默认关闭且强制同源验证", async () => {
 
   assert.deepEqual(defaults.protectedCredentialOrigins, []);
   assert.deepEqual(defaults.protectedLoginVerificationPaths, {});
+  assert.doesNotMatch(loginSource, /siteStorageBootstrap|Object\.entries\(localStorage\)|Object\.entries\(sessionStorage\)/);
   assert.match(loginSource, /new URL\(loginUrl\)\.origin !== origin/);
   assert.match(loginSource, /verificationUrl\.origin !== origin/);
   assert.match(setter, /ConvertFrom-SecureString/);
   assert.match(recovery, /RedirectStandardInput = \$true/);
   assert.doesNotMatch(recovery, /ArgumentList\.Add\(\$passwordPlain\)/);
+});
+
+test("任务级重试不会为空动作或人工处理状态重复空转", async () => {
+  const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
+  const fallbackPolicy = await fs.readFile(new URL("../scripts/NativeFallbackPolicy.ps1", import.meta.url), "utf8");
+  const statuses = runner.match(/\$immediateRetryStatuses\s*=\s*@\(([^)]*)\)/)?.[1] ?? "";
+  assert.match(statuses, /'error'/);
+  assert.match(statuses, /'managed_challenge_timeout'/);
+  assert.doesNotMatch(statuses, /'no_action'|'interactive_challenge'|'needs_attention'/);
+  assert.match(runner, /NativeFallbackPolicy\.ps1/);
+  assert.match(fallbackPolicy, /function Get-NativeFallbackRetryOrigins/);
+  assert.match(fallbackPolicy, /function Test-NeedsNativeFallbackRetry/);
+  assert.match(runner, /--origins', \(\$fallbackRetryOrigins -join ','\)/);
+  assert.match(runner, /-not \$needsNativeFallbackRetry/);
+  assert.match(runner, /继续第二轮原生签到复核/);
+  assert.match(runner, /后续任务触发且达到 nextEligibleAt/);
+});
+
+test("任务级超时会将最新进度补全为可续跑的最终报告", async () => {
+  const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
+  const finalizer = await fs.readFile(new URL("../src/finalize-timeout-report.mjs", import.meta.url), "utf8");
+  assert.match(runner, /finalize-timeout-report\.mjs/);
+  assert.match(runner, /--progress-report/);
+  assert.match(runner, /timeoutProgress\.Report\.runState -eq 'in_progress'/);
+  assert.match(finalizer, /retryCause: "task_timeout"/);
+  assert.match(finalizer, /runState: "final"/);
+  assert.match(finalizer, /const isComplete =/);
+});
+
+test("手动操作后的续跑强制复核记录中的 origin 且不从点击推断成功", async () => {
+  const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
+  const stateMachine = await fs.readFile(new URL("../scripts/ManualVerification.ps1", import.meta.url), "utf8");
+  assert.match(runner, /tmp\\manual-verification\.json/);
+  assert.match(stateMachine, /state -ne 'pending_verification'/);
+  assert.match(stateMachine, /authoritativeEvidenceRequired -ne \$true/);
+  assert.match(runner, /@\('--origins', \(@\(\$manualVerification\.Origins\) -join ','\)\)/);
+  assert.match(stateMachine, /verificationStatus = \[string\]\$result\.status/);
+  assert.match(stateMachine, /if \(\$allConfirmed\) \{ 'verification_complete' \} else \{ 'pending_verification' \}/);
+  assert.doesNotMatch(`${runner}\n${stateMachine}`, /verificationStatus\s*=\s*'(?:signed|already_signed|clicked)'/);
 });

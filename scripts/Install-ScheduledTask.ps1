@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
 $taskName = if ($config.schedulerTaskName) { [string]$config.schedulerTaskName } else { 'CodexBookmarkDailyCheckin' }
 $schedule = if ($Time) { $Time } else { [string]$config.schedule }
@@ -22,6 +23,7 @@ $action = New-ScheduledTaskAction -Execute $shell -Argument $arguments -WorkingD
 $scheduleTime = [datetime]::ParseExact($schedule, 'HH:mm', $null)
 $probeInterval = if ($null -ne $config.schedulerProbeIntervalMinutes) { [int]$config.schedulerProbeIntervalMinutes } else { 60 }
 $probeInterval = [Math]::Max(30, [Math]::Min(180, $probeInterval))
+$executionLimitMinutes = Get-CheckinTaskRuntimeBudgetMinutes $config
 $startMinutes = $scheduleTime.Hour * 60 + $scheduleTime.Minute
 $trigger = @(
     for ($minute = $startMinutes; $minute -lt 24 * 60; $minute += $probeInterval) {
@@ -35,7 +37,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -RunOnlyIfNetworkAvailable `
     -WakeToRun `
     -Hidden `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes $executionLimitMinutes) `
     -MultipleInstances IgnoreNew
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -70,4 +72,4 @@ Get-CimInstance Win32_Process | Where-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-Write-Output "计划任务已安装：$taskName，从每天 $schedule 起每 $probeInterval 分钟探测一次，仅在需要时执行或补跑。"
+Write-Output "计划任务已安装：$taskName，从每天 $schedule 起每 $probeInterval 分钟探测一次，仅在需要时执行或补跑（最长 $executionLimitMinutes 分钟）。"

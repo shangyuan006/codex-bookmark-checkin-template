@@ -57,6 +57,26 @@ $statuses = @($results | ForEach-Object { [string]$_.status })
 $reportRunState = if ($null -ne $report) { [string]$report.runState } else { '' }
 $plannedTotal = if ($null -ne $report -and $null -ne $report.plannedTotal) { [int]$report.plannedTotal } else { $results.Count }
 $processedTotal = if ($null -ne $report -and $null -ne $report.processedTotal) { [int]$report.processedTotal } else { $results.Count }
+$selectedOriginList = @()
+if ($null -ne $report -and $null -ne $report.selectedOrigins) {
+    $selectedOriginList = @($report.selectedOrigins | ForEach-Object { [string]$_ } | Where-Object { $_ })
+}
+$hasSelectedScope = $selectedOriginList.Count -gt 0
+$selectedResults = if ($hasSelectedScope) {
+    @($results | Where-Object { $selectedOriginList -contains ([string]$_.origin) })
+}
+else { @($results) }
+$selectedTotal = if ($null -ne $report -and $null -ne $report.selectedTotal) { [int]$report.selectedTotal } elseif ($hasSelectedScope) { $selectedOriginList.Count } else { $results.Count }
+$selectedProcessedTotal = if ($null -ne $report -and $null -ne $report.selectedProcessedTotal) { [int]$report.selectedProcessedTotal } else { $selectedResults.Count }
+$selectedStatuses = @($selectedResults | ForEach-Object { [string]$_.status })
+$selectedSummary = [ordered]@{}
+foreach ($selectedStatus in @($selectedStatuses | Sort-Object -Unique)) {
+    $selectedSummary[$selectedStatus] = @($selectedStatuses | Where-Object { $_ -eq $selectedStatus }).Count
+}
+$selectedDone = @($selectedStatuses | Where-Object { $_ -in @('signed', 'already_signed') }).Count
+$selectedNotAvailable = @($selectedStatuses | Where-Object { $_ -eq 'not_available' }).Count
+$selectedProblems = @($selectedResults | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+$isTargetedReport = $hasSelectedScope -and $plannedTotal -gt 0 -and $selectedTotal -lt $plannedTotal
 $isCompleteFinalReport = $null -ne $report `
     -and $reportRunState -eq 'final' `
     -and $report.isComplete -eq $true `
@@ -87,8 +107,14 @@ elseif ($RunnerStatus -eq 'skipped') { $status = 'skipped' }
 else { $status = 'unconfirmed' }
 
 $summary = if ($results.Count -gt 0 -or ($null -ne $report -and $plannedTotal -gt 0)) {
-    $heading = if ($isCompleteFinalReport) { "共 $plannedTotal 站：" } else { "已处理 $processedTotal/$plannedTotal 站（任务未完成）：" }
-    "$heading`n$done 个签到正常`n$notAvailable 个未开放签到"
+    if ($isTargetedReport) {
+        $dailyHeading = if ($isCompleteFinalReport) { "今日累计：共 $plannedTotal 站" } else { "今日累计：已处理 $processedTotal/$plannedTotal 站（任务未完成）" }
+        "本轮 $selectedProcessedTotal/$selectedTotal 站：`n$selectedDone 个签到正常`n$selectedNotAvailable 个未开放签到`n$dailyHeading`n$done 个签到正常`n$notAvailable 个未开放签到"
+    }
+    else {
+        $heading = if ($isCompleteFinalReport) { "共 $plannedTotal 站：" } else { "已处理 $processedTotal/$plannedTotal 站（任务未完成）：" }
+        "$heading`n$done 个签到正常`n$notAvailable 个未开放签到"
+    }
 }
 else { Compress-Text $RunnerMessage 160 }
 if ($problems.Count -gt 0) {
@@ -130,7 +156,11 @@ $source = if ($notification.source) { [string]$notification.source } else { 'bro
 $stateParts = @($results | Sort-Object origin | ForEach-Object {
     "$([string]$_.origin)=$([string]$_.status):$([string]$_.retryCause)"
 })
-$stateMaterial = if ($stateParts.Count -gt 0) { "$status|$reportRunState|$($stateParts -join '|')" } else { "$status|$RunnerStatus" }
+$selectedStateParts = @($selectedResults | Sort-Object origin | ForEach-Object {
+    "$([string]$_.origin)=$([string]$_.status):$([string]$_.retryCause)"
+})
+$scopeMaterial = if ($hasSelectedScope) { "|selected=$selectedTotal/$selectedProcessedTotal|$($selectedOriginList -join ',')|$($selectedStateParts -join '|')" } else { '' }
+$stateMaterial = if ($stateParts.Count -gt 0) { "$status|$reportRunState|$($stateParts -join '|')$scopeMaterial" } else { "$status|$RunnerStatus$scopeMaterial" }
 $stateBytes = [System.Text.Encoding]::UTF8.GetBytes($stateMaterial)
 $stateHash = (Get-Sha256Hex $stateBytes).Substring(0, 16)
 $eventKey = "external:$source`:$taskId`:$((Get-Date).ToString('yyyy-MM-dd')):$stateHash"
@@ -139,6 +169,12 @@ $payload = [ordered]@{
     summary = $summary
     siteCount = $results.Count
     problemCount = $problems.Count
+    selectedSiteCount = $selectedResults.Count
+    selectedProblemCount = $selectedProblems.Count
+    selectedOrigins = $selectedOriginList
+    selectedTotal = $selectedTotal
+    selectedProcessedTotal = $selectedProcessedTotal
+    selectedSummary = $selectedSummary
     runState = $reportRunState
     plannedTotal = $plannedTotal
     processedTotal = $processedTotal
@@ -178,6 +214,12 @@ $item = [ordered]@{
     source = $source
     status = $status
     summary = $summary
+    selectedSiteCount = $selectedResults.Count
+    selectedProblemCount = $selectedProblems.Count
+    selectedOrigins = $selectedOriginList
+    selectedTotal = $selectedTotal
+    selectedProcessedTotal = $selectedProcessedTotal
+    selectedSummary = $selectedSummary
     createdAt = if ($existing.createdAt) { [string]$existing.createdAt } else { $now.ToString('o') }
     updatedAt = $now.ToString('o')
     nextAttemptAt = if ($existing.delivered -eq $true) { $null } elseif ($existing.nextAttemptAt) { [string]$existing.nextAttemptAt } else { $now.ToString('o') }

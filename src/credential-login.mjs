@@ -33,36 +33,9 @@ function isLoginUrl(value) {
   catch { return true; }
 }
 
-async function persistConfiguredStorage(activePage) {
-  const relativeFile = config.siteStorageBootstrap?.[origin];
-  if (!relativeFile || new URL(activePage.url()).origin !== origin) return false;
-  const storagePath = path.resolve(rootDirectory, String(relativeFile));
-  const allowedRoot = path.resolve(rootDirectory, "data");
-  if (!storagePath.startsWith(`${allowedRoot}${path.sep}`)) throw new Error("会话引导文件不在私有数据目录内");
-  const storage = await activePage.evaluate(() => ({
-    local: Object.entries(localStorage),
-    session: Object.entries(sessionStorage),
-  }));
-  await fs.mkdir(path.dirname(storagePath), { recursive: true });
-  const temporary = `${storagePath}.${process.pid}.tmp`;
-  const current = await fs.readFile(storagePath).catch(() => null);
-  if (current) await fs.writeFile(`${storagePath}.bak`, current, { mode: 0o600 });
-  await fs.writeFile(temporary, `${JSON.stringify({
-    version: 1,
-    origin,
-    capturedAt: new Date().toISOString(),
-    ...storage,
-  }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await fs.rename(temporary, storagePath);
-  return true;
-}
-
-const loginConfig = { ...config, siteStorageBootstrap: { ...(config.siteStorageBootstrap ?? {}) } };
-delete loginConfig.siteStorageBootstrap[origin];
-const context = await launchAutomationContext(loginConfig);
+const context = await launchAutomationContext(config);
 let status = "failed";
 let page;
-let storageSaved = false;
 let authCheckStatus = null;
 try {
   page = await context.newPage();
@@ -126,11 +99,10 @@ try {
         const response = await fetch(pathValue, { credentials: "include", headers }).catch(() => null);
         return response?.status ?? 0;
       }, verificationUrl.href) : 200;
-      if (authCheckStatus === 200) storageSaved = await persistConfiguredStorage(page);
-      else status = "failed";
+      if (authCheckStatus !== 200) status = "failed";
     }
   }
-  process.stdout.write(JSON.stringify({ status, origin, finalUrl: safeLogUrl(page.url()), storageSaved, authCheckStatus }));
+  process.stdout.write(JSON.stringify({ status, origin, finalUrl: safeLogUrl(page.url()), authCheckStatus }));
   if (status !== "logged_in") process.exitCode = 2;
 } catch (error) {
   status = /Timeout|timed out/i.test(String(error?.message ?? error)) ? "timeout" : "failed";

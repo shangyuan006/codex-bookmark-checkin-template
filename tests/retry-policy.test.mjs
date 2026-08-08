@@ -6,10 +6,18 @@ import {
   deferUnresolvedLogin,
   isCurrentLocalRunId,
   isRetryEligible,
+  isResumeRetryEligible,
   nextDeferredRetryAt,
   nextShanghaiTime,
   withRetrySchedule,
 } from "../src/retry-policy.mjs";
+
+test("续跑只为配置了重认证的 needs_attention 站点放行", () => {
+  const result = { origin: "https://reauth.test", status: "needs_attention" };
+  assert.equal(isRetryEligible(result), false);
+  assert.equal(isResumeRetryEligible(result, new Set(["https://reauth.test"])), true);
+  assert.equal(isResumeRetryEligible(result, new Set(["https://other.test"])), false);
+});
 
 test("频率限制会获得有界的下次执行时间", () => {
   const now = new Date("2026-07-23T05:00:00Z");
@@ -135,7 +143,7 @@ test("自动登录恢复仍失败时使用独立的六小时退避时间", () =>
   assert.equal(result.status, "deferred");
   assert.equal(result.retryCause, "login_required");
   assert.equal(result.nextEligibleAt, "2026-07-23T11:00:00.000Z");
-  assert.equal(result.reason, "自动登录恢复未成功，已安排低频重试");
+  assert.equal(result.reason, "自动登录恢复未成功，等待后续符合条件的运行重试");
 });
 
 test("非登录异常不会被登录退避策略改写", () => {

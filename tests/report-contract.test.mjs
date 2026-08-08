@@ -50,6 +50,38 @@ test("部分进度即使全部已签到也不会报告成功", async () => {
   assert.match(report.summary, /\n2 个签到正常/);
 });
 
+test("targeted report exposes selected scope without changing cumulative completion", async () => {
+  const report = await previewReport({
+    runId: "20260723-120004",
+    runState: "final",
+    plannedTotal: 3,
+    processedTotal: 3,
+    isComplete: true,
+    selectedOrigins: ["https://two.test", "https://three.test"],
+    selectedTotal: 2,
+    selectedProcessedTotal: 2,
+    selectedSummary: { signed: 1, deferred: 1 },
+    results: [
+      { origin: "https://one.test", status: "already_signed" },
+      { origin: "https://two.test", status: "signed" },
+      { origin: "https://three.test", status: "deferred", retryCause: "task_timeout" },
+    ],
+  }, "timeout");
+
+  assert.equal(report.status, "timeout");
+  assert.equal(report.isComplete, true);
+  assert.equal(report.siteCount, 3);
+  assert.equal(report.problemCount, 1);
+  assert.equal(report.selectedSiteCount, 2);
+  assert.equal(report.selectedProblemCount, 1);
+  assert.deepEqual(report.selectedOrigins, ["https://two.test", "https://three.test"]);
+  assert.equal(report.selectedTotal, 2);
+  assert.equal(report.selectedProcessedTotal, 2);
+  assert.deepEqual(report.selectedSummary, { deferred: 1, signed: 1 });
+  assert.match(report.summary, /^本轮 2\/2 站：/);
+  assert.match(report.summary, /今日累计：共 3 站/);
+});
+
 test("部分进度在运行器超时时保持超时状态", async () => {
   const report = await previewReport({
     runId: "20260723-120001",
