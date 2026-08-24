@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readBookmarkPlan, publicBookmarkReport } from "./bookmarks.mjs";
+import { publicBookmarkReport } from "./bookmarks.mjs";
+import { readEffectiveBookmarkPlan } from "./effective-bookmark-plan.mjs";
 import { summarizeResults, writeRunResult } from "./logger.mjs";
 import { isCurrentLocalRunId, nextDeferredRetryAt } from "./retry-policy.mjs";
 
@@ -91,7 +92,11 @@ async function main() {
     throw new Error("超时进度报告不是今天的有效运行");
   }
 
-  const plan = await readBookmarkPlan(config.bookmarksPath, config);
+  const plan = await readEffectiveBookmarkPlan(
+    config.bookmarksPath,
+    config,
+    path.join(rootDirectory, "data", "last-valid-bookmark-plan.json"),
+  );
   const report = buildTimeoutReport(plan, progress);
   const runLog = { runId: report.runId, directory: path.dirname(progressPath) };
   const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);

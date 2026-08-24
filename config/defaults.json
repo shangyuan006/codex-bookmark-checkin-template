@@ -1,6 +1,9 @@
 {
   "mobileFolderNames": [],
   "targetFolderNames": [],
+  "bookmarkSourceName": "",
+  "additionalBookmarkSources": [],
+  "configuredTargets": [],
   "minimumBookmarkTargetCount": 1,
   "quotaRequestRules": {
     "https://new.sharedchat.cc": {
@@ -10,6 +13,8 @@
   },
   "relatedCandidateUrls": {},
   "logicalCheckinGroups": {},
+  "newApiCaptchaRules": {},
+  "newApiSignInRules": {},
   "newApiCheckinOrigins": [],
   "extendedDiscoveryOrigins": [],
   "autoDetectOAuthOrigins": [],
@@ -24,17 +29,21 @@
   "preCheckinDismissRules": {},
   "challengeInteractionRules": {},
   "checkinCaptchaDialogRules": {},
+  "sequentialActionRules": {},
   "nativeWafPreflightUrls": [],
   "nativeChallengePreflight": [],
   "oauthRedirectOverrides": {},
   "oauthLoginUrls": {},
   "savedLoginUrls": {},
+  "savedLoginFormRules": {},
+  "savedLoginSessionRules": {},
   "automaticOAuthProviders": {},
   "protectedCredentialOrigins": [],
   "protectedLoginVerificationPaths": {},
   "attentionPreferredOrigins": [],
   "autoDetectLinuxDoOAuth": true,
   "autoAcceptUpdatedTermsOrigins": [],
+  "autoClickTurnstileOrigins": [],
   "manualChallengeOrigins": [],
   "calendarDayCheckinOrigins": [],
   "calendarDayCheckinPaths": {},
@@ -89,6 +98,7 @@
     "retryBaseMinutes": 2,
     "retryMaxMinutes": 360,
     "outboxMaxItems": 20,
+    "outboxRetentionDays": 30,
     "timeoutSeconds": 60
   }
 }

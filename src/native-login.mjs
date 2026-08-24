@@ -1,13 +1,24 @@
 import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { connectOverCdpWithRetry } from "./native-cdp.mjs";
+import { expandSavedPasswordLogin } from "./login-form.mjs";
 import { safeLogUrl } from "./security.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
+const rootDirectory = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const config = JSON.parse(fs.readFileSync(path.join(rootDirectory, "config", "config.json"), "utf8"));
 const port = Number.parseInt(process.argv[2], 10);
 const expectedOrigin = new URL(process.argv[3]).origin;
 if (!Number.isInteger(port) || port <= 0) throw new Error("用法: node src/native-login.mjs <port> <origin>");
 
-const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 10000 });
+const browser = await connectOverCdpWithRetry(chromium, port, {
+  timeoutMs: 15000,
+  attemptTimeoutMs: 2000,
+  retryDelayMs: 500,
+});
 let status = "needs_attention";
 let page = null;
 try {
@@ -17,6 +28,7 @@ try {
   if (!page) throw new Error("原生浏览器中没有找到目标登录页");
   await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+  await expandSavedPasswordLogin(page, expectedOrigin, config);
   const password = page.locator('input[type="password"]:visible');
   const username = page.locator('input[type="email"]:visible, input[name*="user" i]:visible, input[name*="login" i]:visible, input[name*="email" i]:visible, input[type="text"]:visible');
   if (await password.count() !== 1 || await username.count() !== 1) {

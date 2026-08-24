@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import test from "node:test";
 import { buildTimeoutReport, finalizeTimedOutResults } from "../src/finalize-timeout-report.mjs";
 
@@ -7,6 +8,13 @@ const targets = [
   { origin: "https://two.example", title: "Two", folderNames: ["targets"], candidates: ["https://two.example/"] },
 ];
 const now = new Date("2026-07-31T03:00:00.000Z");
+
+test("超时收尾与正常运行使用相同的多来源书签备份计划", async () => {
+  const source = await fs.readFile(new URL("../src/finalize-timeout-report.mjs", import.meta.url), "utf8");
+  assert.match(source, /readEffectiveBookmarkPlan\(/);
+  assert.match(source, /last-valid-bookmark-plan\.json/);
+  assert.doesNotMatch(source, /await readBookmarkPlan(?:WithBackup)?\(config\.bookmarksPath/);
+});
 
 test("任务级超时保留已有结果并把未处理站点转为可续跑状态", () => {
   const results = finalizeTimedOutResults(targets, [{

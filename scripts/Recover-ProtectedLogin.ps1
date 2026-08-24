@@ -6,6 +6,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $modernPowerShell = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($modernPowerShell) {
+        & $modernPowerShell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $PSCommandPath `
+            -Origin $Origin -LoginUrl $LoginUrl
+        exit $LASTEXITCODE
+    }
+}
+
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
 $node = Resolve-CheckinNode $config
@@ -43,9 +53,19 @@ try {
     $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    [void]$start.ArgumentList.Add((Join-Path $root 'src\credential-login.mjs'))
-    [void]$start.ArgumentList.Add($uri.GetLeftPart([System.UriPartial]::Authority))
-    [void]$start.ArgumentList.Add($loginUri.AbsoluteUri)
+    $argumentValues = @(
+        (Join-Path $root 'src\credential-login.mjs'),
+        $uri.GetLeftPart([System.UriPartial]::Authority),
+        $loginUri.AbsoluteUri
+    )
+    if ($null -ne $start.PSObject.Properties['ArgumentList']) {
+        foreach ($argument in $argumentValues) { [void]$start.ArgumentList.Add($argument) }
+    }
+    else {
+        # Windows PowerShell 5.1 lacks ProcessStartInfo.ArgumentList. These
+        # arguments contain no credentials; only the helper path and URLs need quoting.
+        $start.Arguments = ($argumentValues | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $start
     [void]$process.Start()

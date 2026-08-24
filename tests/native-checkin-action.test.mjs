@@ -81,7 +81,8 @@ test("原生签到从实际点击后重新计算完整确认等待窗口", async
   assert.match(source, /if \(actionAttempted\) confirmationDeadline = Date\.now\(\) \+ maxWaitSeconds \* 1000/);
   assert.match(source, /actionOutcome = "confirmation_timeout"/);
   assert.match(source, /clickVisibleNativeChallengeControl/);
-  assert.match(source, /challengeOutcome === "pending"/);
+  assert.match(source, /retryableChallengeOutcomes\.has\(challengeOutcome\)/);
+  assert.match(source, /\["pending", "challenge_not_found", "challenge_click_failed"\]/);
   assert.doesNotMatch(source, /Date\.now\(\) >= deadline/);
 });
 

@@ -37,8 +37,9 @@ $browserExecutable = [string]$browser.Executable
 if (-not (Test-Path -LiteralPath $browserExecutable)) { throw "未找到 $($browser.DisplayName)：$browserExecutable" }
 $process = Start-Process -FilePath $browserExecutable -ArgumentList @(
     "--user-data-dir=$targetRoot", '--profile-directory=Default', '--headless=new',
+    '--no-startup-window',
     '--no-first-run', '--no-default-browser-check',
-    '--disable-features=OptimizationGuideOnDeviceModel', 'about:blank'
+    '--disable-features=OptimizationGuideOnDeviceModel'
 ) -WindowStyle Hidden -PassThru
 try {
     $deadline = (Get-Date).AddSeconds(20)

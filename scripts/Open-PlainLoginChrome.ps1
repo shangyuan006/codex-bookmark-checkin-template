@@ -73,12 +73,44 @@ else {
     $handoff = ($rawHandoff -join [Environment]::NewLine) | ConvertFrom-Json
     @($handoff.targets)
 }
+$agentRouterOrigins = @($config.agentrouterAccounts | ForEach-Object {
+    try {
+        $uri = [uri]([string]$_.origin)
+        if ($uri.Scheme -eq 'https' -and $uri.Host) { $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/').ToLowerInvariant() }
+    }
+    catch { }
+} | Where-Object { $_ } | Select-Object -Unique)
+$selectedAgentRouterItems = @($items | ForEach-Object {
+    try {
+        $uri = [uri]([string]$_.url)
+        if ($uri.Scheme -in @('http', 'https') -and $uri.Host) {
+            $origin = $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/').ToLowerInvariant()
+            if ($agentRouterOrigins -contains $origin) { $origin }
+        }
+    }
+    catch { }
+} | Where-Object { $_ } | Select-Object -Unique)
+if ($selectedAgentRouterItems.Count -gt 0) {
+    $agentRouterGuidance = 'Agent Router 必须使用专用入口：先运行 Open-AgentRouterLogin.ps1 -AccountKey <github|linuxdo>，完成后运行 Complete-AgentRouterLogin.ps1 -AccountKey <同一 accountKey>。'
+    if ($Origins.Count -gt 0 -or $Selection.Count -gt 0 -or $Urls.Count -gt 0) {
+        throw $agentRouterGuidance
+    }
+    Write-Warning "$agentRouterGuidance 普通待处理窗口将跳过该站点。"
+    $items = @($items | Where-Object {
+        $itemUri = try { [uri]([string]$_.url) } catch { $null }
+        if (-not $itemUri -or $itemUri.Scheme -notin @('http', 'https') -or -not $itemUri.Host) { return $false }
+        $itemOrigin = $itemUri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/').ToLowerInvariant()
+        return $agentRouterOrigins -notcontains $itemOrigin
+    })
+}
 if (@($items).Count -eq 0) { throw '当前没有符合选择条件的待处理站点。' }
 $windowPosition = if ($Offscreen) { '-32000,-32000' } else { '60,60' }
+$launchMarker = [guid]::NewGuid().ToString('N')
 $arguments = @(
     "--user-data-dir=$($config.automationUserDataDir)",
     '--profile-directory=Default',
-    '--new-window'
+    '--new-window',
+    "--checkin-launch=$launchMarker"
 )
 if (-not $NativeMinimal) {
     $arguments += @(
@@ -115,6 +147,7 @@ if ($TrackManualSession) {
         mode = 'native'
         startedAt = (Get-Date).ToUniversalTime().ToString('o')
         processStartedAt = $processStartedAt
+        launchMarker = $launchMarker
         profile = [string]$config.automationUserDataDir
         selectionMode = [string]$handoff.selectionMode
         sourceRunId = $handoff.sourceRunId

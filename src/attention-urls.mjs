@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { readBookmarkPlan } from "./bookmarks.mjs";
 
 export const ATTENTION_STATUSES = new Set([
+  "error",
   "login_required",
   "interactive_challenge",
   "managed_challenge",
@@ -12,10 +13,74 @@ export const ATTENTION_STATUSES = new Set([
 ]);
 
 const MANUAL_DEFERRED_CAUSES = new Set(["login_required", "managed_challenge_timeout"]);
+const AUTHORITATIVE_STATUSES = new Set(["signed", "already_signed", "not_available"]);
 
 export function requiresManualAttention(result) {
   if (result?.status === "deferred") return MANUAL_DEFERRED_CAUSES.has(result.retryCause);
   return ATTENTION_STATUSES.has(result?.status);
+}
+
+export function canExplicitlyRequestManualAttention(result) {
+  if (!result) return true;
+  return requiresManualAttention(result) || result.status === "no_action";
+}
+
+function runDate(runId) {
+  return String(runId ?? "").match(/^(\d{8})-/)?.[1] ?? null;
+}
+
+export function mergeAttentionEvidence(latest, runReports = []) {
+  const baselineResults = Array.isArray(latest?.results) ? latest.results : [];
+  const baselineDate = runDate(latest?.runId);
+  if (!baselineDate) return latest;
+
+  const newestByOrigin = new Map();
+  for (const report of [...runReports]
+    .filter((candidate) => runDate(candidate?.runId) === baselineDate && Array.isArray(candidate?.results))
+    .sort((left, right) => String(left.runId).localeCompare(String(right.runId)))) {
+    const selectedOrigins = Array.isArray(report.selectedOrigins)
+      ? new Set(report.selectedOrigins.map((value) => String(value)))
+      : null;
+    for (const result of report.results) {
+      const origin = String(result?.origin ?? "");
+      if (!origin || (selectedOrigins && !selectedOrigins.has(origin))) continue;
+      newestByOrigin.set(origin, result);
+    }
+  }
+
+  const merged = new Map(baselineResults
+    .filter((result) => result?.origin)
+    .map((result) => [result.origin, result]));
+  for (const [origin, candidate] of newestByOrigin) {
+    const current = merged.get(origin);
+    if (AUTHORITATIVE_STATUSES.has(current?.status)) continue;
+    merged.set(origin, candidate);
+  }
+  return {
+    ...latest,
+    results: [...merged.values()],
+  };
+}
+
+async function loadCurrentDayRunReports(logsDirectory, latest) {
+  const expectedDate = runDate(latest?.runId);
+  if (!expectedDate) return [];
+  const resolvedLogs = path.resolve(logsDirectory);
+  const entries = await fs.readdir(resolvedLogs, { withFileTypes: true }).catch(() => []);
+  const reports = [];
+  for (const entry of entries
+    .filter((candidate) => candidate.isDirectory() && !candidate.isSymbolicLink())
+    .sort((left, right) => right.name.localeCompare(left.name))
+    .slice(0, 256)) {
+    const directory = path.resolve(resolvedLogs, entry.name);
+    if (!directory.startsWith(`${resolvedLogs}${path.sep}`)) continue;
+    const resultPath = path.join(directory, "result.json");
+    const stat = await fs.lstat(resultPath).catch(() => null);
+    if (!stat?.isFile() || stat.isSymbolicLink()) continue;
+    const report = await fs.readFile(resultPath, "utf8").then(JSON.parse).catch(() => null);
+    if (runDate(report?.runId) === expectedDate) reports.push(report);
+  }
+  return reports;
 }
 
 function normalizeRequestedOrigin(value) {
@@ -79,7 +144,7 @@ export function buildAttentionHandoff({
       const target = targetByOrigin.get(origin);
       const previous = resultByOrigin.get(origin);
       if (!target?.candidates?.length) return null;
-      if (previous && !requiresManualAttention(previous)) return null;
+      if (!canExplicitlyRequestManualAttention(previous)) return null;
       return {
         origin,
         url: target.candidates[0],
@@ -126,11 +191,13 @@ export function parseAttentionArguments(argv) {
 export async function loadAttentionHandoff(rootDirectory, argv = []) {
   const configPath = path.join(rootDirectory, "config", "config.json");
   const config = JSON.parse(await fs.readFile(configPath, "utf8"));
-  const bookmarkStat = await fs.stat(config.bookmarksPath);
   // Manual handoff must use the live bookmark file. A backup can contain a URL
   // that the user has already replaced, so failure here is intentionally fatal.
   const plan = await readBookmarkPlan(config.bookmarksPath, config);
-  const latest = await fs.readFile(path.join(rootDirectory, "logs", "latest.json"), "utf8")
+  const bookmarkStats = await Promise.all(plan.bookmarkFiles.map((source) => fs.stat(source.path)));
+  const bookmarkLastModifiedAt = new Date(Math.max(...bookmarkStats.map((stat) => stat.mtimeMs))).toISOString();
+  const logsDirectory = path.join(rootDirectory, "logs");
+  const latest = await fs.readFile(path.join(logsDirectory, "latest.json"), "utf8")
     .then(JSON.parse)
     .catch((error) => {
       if (error.code !== "ENOENT") throw error;
@@ -139,14 +206,18 @@ export async function loadAttentionHandoff(rootDirectory, argv = []) {
         results: plan.targets.map((target) => ({ origin: target.origin, status: "login_required" })),
       };
     });
+  const attentionLatest = mergeAttentionEvidence(
+    latest,
+    await loadCurrentDayRunReports(logsDirectory, latest),
+  );
   const { requestedOrigins, selection } = parseAttentionArguments(argv);
   return buildAttentionHandoff({
     plan,
-    latest,
+    latest: attentionLatest,
     preferredOrigins: config.attentionPreferredOrigins ?? [],
     requestedOrigins,
     selection,
-    bookmarkLastModifiedAt: bookmarkStat.mtime.toISOString(),
+    bookmarkLastModifiedAt,
   });
 }
 

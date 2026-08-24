@@ -19,6 +19,7 @@ test("native fallback selects only configured unresolved origins", async () => {
     nativeWafPreflightUrls: [],
     nativeChallengePreflight: [
       { url: "https://fallback.test/dashboard", fallbackOnly: true },
+      { url: "https://action.test/dashboard", fallbackOnly: true, action: { actionTexts: ["Check in"] } },
       { url: "https://normal.test/", fallbackOnly: false },
     ],
   };

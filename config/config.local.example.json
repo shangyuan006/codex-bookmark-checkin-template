@@ -5,20 +5,61 @@
   "logicalCheckinGroups": {
     "https://example.com": "example-service"
   },
+  "additionalBookmarkSources": [
+    {
+      "name": "Chrome",
+      "path": "C:\\Path\\To\\Chrome\\Profile\\Bookmarks",
+      "mobileFolderNames": ["Automation"],
+      "targetFolderNames": ["Daily"],
+      "optional": true
+    }
+  ],
+  "configuredTargets": [
+    {
+      "title": "Configured check-in example",
+      "url": "https://configured.example.com/account/check-in",
+      "folderName": "Daily"
+    }
+  ],
+  "newApiCaptchaRules": {
+    "https://captcha.example.com": {
+      "checkinPath": "/api/user/checkin",
+      "captchaPath": "/api/user/checkin/captcha",
+      "userStorageKeys": ["user"],
+      "maxAttempts": 3,
+      "minConfidence": 30,
+      "verificationAttempts": 3,
+      "verificationDelayMs": 750
+    }
+  },
+  "newApiSignInRules": {
+    "https://signin.example.com": {
+      "signInPath": "/api/user/sign_in",
+      "selfPath": "/api/user/self",
+      "statusPath": "/api/status",
+      "logPath": "/api/log/self",
+      "logSuccessText": "Daily reward",
+      "rewardAmount": 1,
+      "logType": 1,
+      "userStorageKeys": ["user"],
+      "verificationAttempts": 3,
+      "verificationDelayMs": 750
+    }
+  },
   "visitCheckinRules": {
     "https://example.com": { "after": "08:00" }
   },
   "agentrouterAccounts": [
     {
       "origin": "https://example.com",
-      "accountId": "github",
+      "accountKey": "github",
       "provider": "GitHub",
       "automationUserDataDir": "data/edge-agentrouter-github",
       "statePath": "data/agentrouter-github-state.json"
     },
     {
       "origin": "https://example.com",
-      "accountId": "linuxdo",
+      "accountKey": "linuxdo",
       "provider": "LinuxDO",
       "automationUserDataDir": "data/edge-agentrouter-linuxdo",
       "statePath": "data/agentrouter-linuxdo-state.json"
@@ -54,6 +95,25 @@
       "maxDismissals": 3
     }
   },
+  "autoAcceptUpdatedTermsOrigins": [
+    "https://example.com"
+  ],
+  "autoClickTurnstileOrigins": [
+    "https://example.com"
+  ],
+  "savedLoginFormRules": {
+    "https://example.com": {
+      "expanderTexts": ["Use email or username"],
+      "afterClickWaitMs": 500
+    }
+  },
+  "savedLoginSessionRules": {
+    "https://example.com": {
+      "type": "new_api",
+      "selfPath": "/api/user/self",
+      "userStorageKeys": ["user"]
+    }
+  },
   "challengeInteractionRules": {
     "https://example.com": {
       "type": "click",
@@ -78,6 +138,40 @@
       "minConfidence": 30,
       "waitMs": 5000,
       "maxAttempts": 3
+    }
+  },
+  "sequentialActionRules": {
+    "https://example.com": {
+      "steps": [
+        {
+          "url": "https://example.com/account/check-in",
+          "actionTexts": ["Check in"],
+          "completedTexts": ["Checked in today"],
+          "successTexts": ["Check-in successful"],
+          "disabledActionIsComplete": true,
+          "reloadOnUnconfirmed": true,
+          "waitMs": 10000
+        },
+        {
+          "url": "https://example.com/account/reward-draw",
+          "actionTexts": ["Draw x10"],
+          "completedTexts": ["Today's draw is complete"],
+          "successTexts": ["Draw successful"],
+          "successIncludes": ["Draw result"],
+          "acceptGenericCheckinState": false,
+          "responseEvidence": [
+            {
+              "urlIncludes": "/draw",
+              "methods": ["POST"],
+              "successAny": [
+                { "path": "success", "equals": true },
+                { "path": "code", "equals": 0 }
+              ]
+            }
+          ],
+          "waitMs": 10000
+        }
+      ]
     }
   },
   "nativeWafPreflightUrls": [

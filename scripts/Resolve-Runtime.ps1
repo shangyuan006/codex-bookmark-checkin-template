@@ -63,12 +63,67 @@ function Resolve-CheckinBrowser {
     }
 }
 
+function Get-CheckinProfileBrowserProcesses {
+    param(
+        $Config,
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilePath
+    )
+
+    $browser = Resolve-CheckinBrowser $Config -OptionalExecutable
+    $resolvedProfilePath = [System.IO.Path]::GetFullPath($ProfilePath)
+    return @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$resolvedProfilePath*"
+    })
+}
+
 function Get-CheckinAutomationBrowserProcesses {
     param($Config)
 
-    $browser = Resolve-CheckinBrowser $Config -OptionalExecutable
     $profilePath = [System.IO.Path]::GetFullPath([string]$Config.automationUserDataDir)
-    return @(Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profilePath*"
+    return @(Get-CheckinProfileBrowserProcesses -Config $Config -ProfilePath $profilePath)
+}
+
+function Get-CheckinManualSessionBrowserProcesses {
+    param(
+        $Config,
+        $State,
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilePath
+    )
+
+    $profileProcesses = @(Get-CheckinProfileBrowserProcesses -Config $Config -ProfilePath $ProfilePath)
+    if ($profileProcesses.Count -eq 0) { return @() }
+
+    $launchMarker = [string]$State.launchMarker
+    if ($launchMarker -and $launchMarker -match '^[a-f0-9]{32}$') {
+        $marked = @($profileProcesses | Where-Object {
+            $_.CommandLine -like "*--checkin-launch=$launchMarker*"
+        })
+        if ($marked.Count -gt 0) { return $marked }
+    }
+
+    $recordedStart = [datetime]::MinValue
+    $recordedStartText = if ($State.processStartedAt) {
+        [string]$State.processStartedAt
+    }
+    else {
+        [string]$State.startedAt
+    }
+    if (-not $recordedStartText -or -not [datetime]::TryParse($recordedStartText, [ref]$recordedStart)) {
+        return @()
+    }
+    $toleranceSeconds = if ($State.processStartedAt) { 5 } else { 30 }
+    return @($profileProcesses | Where-Object {
+        $candidate = Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue
+        if (-not $candidate) {
+            $false
+        }
+        else {
+            try {
+                $candidate.StartTime.ToUniversalTime() -ge $recordedStart.ToUniversalTime().AddSeconds(-$toleranceSeconds)
+            }
+            catch { $false }
+        }
     })
 }

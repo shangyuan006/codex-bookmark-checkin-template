@@ -8,6 +8,9 @@ import {
   classifyCalendarDayCheckinEvidence,
   getConfiguredChallengeInteractionRule,
   getConfiguredCheckinCaptchaDialogRule,
+  getConfiguredSequentialActionRule,
+  configuredSequentialResponseProvesSuccess,
+  selectConfiguredSequentialActionCandidate,
   getConfiguredPreCheckinDismissRule,
   getVisitCheckinWaitMs,
   getTargetTimeoutMs,
@@ -19,17 +22,222 @@ import {
   isConfiguredGrowthCheckinPage,
   isSafeDiscoveredHref,
   matchesConfiguredGrowthCompletedControlText,
+  reliableNewApiCaptchaCandidates,
   preferCandidateResult,
   reconcileConfiguredGrowthCheckinState,
+  selectConfiguredCapChallengeCandidate,
   selectSliderDragGeometry,
   runWithTargetTimeout,
   shouldBlockManualChallengeAction,
   TargetTimeoutError,
   targetNeedsManualChallenge,
   targetUsesCalendarDayCheckin,
+  tryConfiguredNewApiCheckin,
+  tryNewApiCheckin,
   waitForConfirmedCheckinState,
+  waitForManagedChallenge,
   waitForPendingCheckinState,
 } from "../src/browser.mjs";
+
+test("顺序动作规则限制同源网址、精确按钮和权威响应证据", () => {
+  const target = {
+    origin: "https://me.example",
+    allowedOrigins: ["https://me.example"],
+  };
+  const rule = getConfiguredSequentialActionRule(target, {
+    sequentialActionRules: {
+      "https://me.example": {
+        steps: [
+          {
+            url: "https://me.example/home",
+            actionTexts: ["签到"],
+            actionTags: ["button"],
+            preferInteractive: true,
+            completedTexts: ["已签到"],
+            disabledActionIsComplete: true,
+          },
+          {
+            url: "https://me.example/draw",
+            actionTexts: ["连抽x10"],
+            successTexts: ["抽奖成功"],
+            successIncludes: ["抽奖结果"],
+            acceptGenericCheckinState: false,
+            responseEvidence: [{
+              urlIncludes: "/draw",
+              methods: ["POST"],
+              successAny: [{ path: "success", equals: true }],
+            }],
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(rule.steps.length, 2);
+  assert.deepEqual(rule.steps[0].actionTags, ["BUTTON"]);
+  assert.equal(rule.steps[0].preferInteractive, true);
+  assert.equal(rule.steps[1].acceptGenericCheckinState, false);
+  assert.deepEqual(rule.steps[1].successIncludes, ["抽奖结果"]);
+  assert.equal(configuredSequentialResponseProvesSuccess({
+    url: "https://me.example/api/draw",
+    method: "POST",
+    status: 200,
+    json: { success: true },
+  }, rule.steps[1].responseEvidence[0], "https://me.example"), true);
+  assert.equal(configuredSequentialResponseProvesSuccess({
+    url: "https://evil.example/api/draw",
+    method: "POST",
+    status: 200,
+    json: { success: true },
+  }, rule.steps[1].responseEvidence[0], "https://me.example"), false);
+  const selected = selectConfiguredSequentialActionCandidate([
+    { index: 1, text: "连抽x10", visible: true, disabled: false, href: "https://me.example/draw" },
+    { index: 2, text: "开始抽奖", visible: true, disabled: false, href: "https://me.example/draw" },
+  ], rule.steps[1], target.allowedOrigins);
+  assert.equal(selected.outcome, "ready");
+  assert.equal(selected.candidate.index, 1);
+  assert.equal(selectConfiguredSequentialActionCandidate([
+    { index: 1, tagName: "BUTTON", text: "连抽x10", visible: true, disabled: false, href: "https://me.example/draw" },
+    { index: 2, tagName: "BUTTON", text: "连抽x10", visible: true, disabled: false, href: "https://me.example/draw" },
+  ], rule.steps[1], target.allowedOrigins).outcome, "action_not_unique");
+  assert.equal(selectConfiguredSequentialActionCandidate([
+    { index: 1, tagName: "BUTTON", text: "签到", visible: true, disabled: false, hasHandler: false },
+    { index: 2, tagName: "BUTTON", text: "签到", visible: true, disabled: false, hasHandler: true },
+  ], rule.steps[0], target.allowedOrigins).candidate.index, 2);
+});
+
+test("顺序动作规则拒绝跨来源步骤和缺少成功证据的响应规则", () => {
+  const target = { origin: "https://me.example", allowedOrigins: ["https://me.example"] };
+  assert.throws(() => getConfiguredSequentialActionRule(target, {
+    sequentialActionRules: {
+      "https://me.example": { steps: [{ url: "https://other.example/draw", actionTexts: ["抽取"] }] },
+    },
+  }), /拒绝跨站导航/);
+  assert.throws(() => getConfiguredSequentialActionRule(target, {
+    sequentialActionRules: {
+      "https://me.example": { steps: [{
+        url: "https://me.example/draw",
+        actionTexts: ["抽取"],
+        responseEvidence: [{ urlIncludes: "/draw", successAny: [] }],
+      }] },
+    },
+  }), /必须配置有限的成功字段条件/);
+});
+
+test("New API captcha OCR only forwards reliable fixed-length candidates", () => {
+  assert.deepEqual(reliableNewApiCaptchaCandidates({ code: "ab12c", confidence: 30 }, 30), ["AB12C"]);
+  assert.deepEqual(reliableNewApiCaptchaCandidates({ code: "AB12C", confidence: 29 }, 30), []);
+  assert.deepEqual(reliableNewApiCaptchaCandidates({ code: "ABC123", confidence: 99 }, 30), []);
+  assert.throws(() => reliableNewApiCaptchaCandidates({ code: "AB12C", confidence: 99 }, 101), /minConfidence/);
+});
+
+test("configured New API adapters reject conflicts and skip unconfigured origins", async () => {
+  let evaluations = 0;
+  const page = {
+    evaluate: async () => {
+      evaluations += 1;
+      return { state: "already_signed" };
+    },
+  };
+  const bothConfigured = {
+    newApiCaptchaRules: {
+      "https://api.example.test": { verificationDelayMs: 0 },
+    },
+    newApiSignInRules: {
+      "https://api.example.test": {
+        rewardAmount: 1,
+        logType: 1,
+        logSuccessText: "Daily reward",
+        verificationDelayMs: 0,
+      },
+    },
+  };
+  await assert.rejects(tryConfiguredNewApiCheckin(
+    page,
+    "https://api.example.test",
+    bothConfigured,
+  ), /conflicting captcha and sign-in rules/);
+  assert.equal(evaluations, 0);
+
+  const untouched = await tryConfiguredNewApiCheckin(page, "https://other.example.test", bothConfigured);
+  assert.equal(untouched, null);
+  assert.equal(evaluations, 0);
+
+  const captchaOnly = {
+    newApiCaptchaRules: bothConfigured.newApiCaptchaRules,
+  };
+  assert.equal((await tryConfiguredNewApiCheckin(
+    page,
+    "https://api.example.test",
+    captchaOnly,
+  )).status, "already_signed");
+  assert.equal(evaluations, 1);
+
+  const signInOnly = {
+    newApiSignInRules: bothConfigured.newApiSignInRules,
+  };
+  page.evaluate = async () => {
+    evaluations += 1;
+    return { state: "already_confirmed" };
+  };
+  assert.equal((await tryConfiguredNewApiCheckin(
+    page,
+    "https://api.example.test",
+    signInOnly,
+  )).status, "already_signed");
+  assert.equal(evaluations, 2);
+});
+
+async function runLegacyNewApiCheckin(statuses) {
+  const names = ["localStorage", "sessionStorage", "document", "fetch", "setTimeout"];
+  const originals = new Map(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const statusQueue = [...statuses];
+  const requests = [];
+  const storage = {
+    length: 1,
+    key: () => "user",
+    getItem: () => JSON.stringify({ id: 42 }),
+  };
+  try {
+    Object.defineProperties(globalThis, {
+      localStorage: { configurable: true, value: storage },
+      sessionStorage: { configurable: true, value: { length: 0, key: () => null, getItem: () => null } },
+      document: { configurable: true, value: { body: { innerText: "" } } },
+      setTimeout: { configurable: true, value: (callback) => { callback(); return 0; } },
+      fetch: {
+        configurable: true,
+        value: async (url, options = {}) => {
+          requests.push({ url: String(url), method: options.method ?? "GET" });
+          if (options.method === "POST") {
+            return { status: 200, json: async () => ({ success: true }) };
+          }
+          const checked = statusQueue.shift() ?? false;
+          return {
+            status: 200,
+            json: async () => ({ success: true, data: { stats: { checked_in_today: checked } } }),
+          };
+        },
+      },
+    });
+    const result = await tryNewApiCheckin({ evaluate: async (callback) => callback() });
+    return { result, requests };
+  } finally {
+    for (const name of names) {
+      const descriptor = originals.get(name);
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  }
+}
+
+test("legacy New API POST success requires a confirming status read", async () => {
+  const unconfirmed = await runLegacyNewApiCheckin([false, false, false, false, false]);
+  assert.equal(unconfirmed.result, null);
+  assert.equal(unconfirmed.requests.filter((request) => request.method === "POST").length, 1);
+
+  const confirmed = await runLegacyNewApiCheckin([false, true]);
+  assert.equal(confirmed.result.status, "signed");
+  assert.equal(confirmed.requests.filter((request) => request.method === "GET").length, 2);
+});
 
 test("签到入口发现拒绝被浏览器解析成同源路径的畸形 href", () => {
   assert.equal(isSafeDiscoveredHref("/profile"), true);
@@ -168,8 +376,27 @@ test("候选历史会脱敏网址和错误原因", () => {
 
 test("通用安全验证选择器覆盖 Cap.js", () => {
   assert.match(CHALLENGE_SELECTOR, /cap-widget/);
+  assert.match(CHALLENGE_SELECTOR, /\.cap-verify/);
   assert.match(CHALLENGE_SELECTOR, /data-cap-api-endpoint/);
   assert.match(CHALLENGE_SELECTOR, /altcha-widget/);
+});
+
+test("Cap.js 容器只接受唯一、可见且尺寸合理的候选", () => {
+  assert.deepEqual(selectConfiguredCapChallengeCandidate([
+    { index: 0, visible: true, disabled: false, width: 390, height: 60 },
+  ]), {
+    candidate: { index: 0, visible: true, disabled: false, width: 390, height: 60 },
+    outcome: "ready",
+  });
+  assert.equal(selectConfiguredCapChallengeCandidate([
+    { index: 0, visible: true, disabled: false, width: 390, height: 60 },
+    { index: 1, visible: true, disabled: false, width: 390, height: 60 },
+  ]).outcome, "challenge_not_unique");
+  assert.equal(selectConfiguredCapChallengeCandidate([
+    { index: 0, visible: false, disabled: false, width: 390, height: 60 },
+    { index: 1, visible: true, disabled: true, width: 390, height: 60 },
+    { index: 2, visible: true, disabled: false, width: 80, height: 20 },
+  ]).outcome, "challenge_not_found");
 });
 
 test("验证控件保留在页面时只把未解决证据视为挑战", () => {
@@ -191,6 +418,7 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
   assert.deepEqual(getConfiguredChallengeInteractionRule(target, "https://bookmark.test", config, "before"), {
     type: "click",
     phase: "before",
+    optional: false,
     waitMs: 60_000,
     settleMs: 3000,
     retryAction: false,
@@ -201,6 +429,7 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
       "https://bookmark.test": {
         type: "wait",
         phase: "after",
+        optional: true,
         retryAction: true,
         retryActionWaitMs: 90_000,
       },
@@ -208,6 +437,7 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
   }, "after"), {
     type: "wait",
     phase: "after",
+    optional: true,
     waitMs: 30_000,
     settleMs: 3000,
     retryAction: true,
@@ -322,6 +552,51 @@ test("异步签到状态超过有限等待时保持未确认", async () => {
     "每日签到 正在加载签到状态... 加载中...",
   ]), { checkinStateWaitMs: 10, checkinStatePollMs: 5 });
   assert.deepEqual(state, { status: "unconfirmed", reason: "签到状态在有限等待内未加载完成" });
+});
+
+test("托管验证超时前刷新一次并接受迟到的权威成功状态", async () => {
+  let reloaded = false;
+  const page = {
+    url: () => "https://checkin.test/dashboard",
+    title: async () => "Check-in",
+    evaluate: async () => ({
+      bodyText: reloaded ? "Already checked in" : "Just a moment",
+      passwordInputs: false,
+      challengeEvidence: [],
+      confirmedCheckinControl: false,
+    }),
+    reload: async () => { reloaded = true; },
+  };
+  const state = await waitForManagedChallenge(page, {
+    cloudflareWaitMs: 0,
+    navigationTimeoutMs: 100,
+    checkinStateWaitMs: 20,
+    checkinStatePollMs: 5,
+  });
+  assert.equal(reloaded, true);
+  assert.equal(state.status, "already_signed");
+});
+
+test("托管验证最终刷新拒绝跨来源跳转", async () => {
+  let currentUrl = "https://checkin.test/dashboard";
+  const page = {
+    url: () => currentUrl,
+    title: async () => "Check-in",
+    evaluate: async () => ({
+      bodyText: "Just a moment",
+      passwordInputs: false,
+      challengeEvidence: [],
+      confirmedCheckinControl: false,
+    }),
+    reload: async () => { currentUrl = "https://outside.test/login"; },
+  };
+  const state = await waitForManagedChallenge(page, {
+    cloudflareWaitMs: 0,
+    navigationTimeoutMs: 100,
+    checkinStateWaitMs: 20,
+    checkinStatePollMs: 5,
+  });
+  assert.equal(state.status, "needs_attention");
 });
 
 test("验证码弹窗提交后等待完成控件异步更新", async () => {

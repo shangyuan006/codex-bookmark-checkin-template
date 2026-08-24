@@ -4,11 +4,16 @@ param([switch]$Once)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
+. (Join-Path $PSScriptRoot 'ManualVerification.ps1')
 $configPath = Join-Path $root 'config\config.json'
 $initialConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $statePath = Join-Path $root 'data\scheduler-state.json'
 $heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
 $schedulerLogPath = Join-Path $root 'logs\scheduler.log'
+$manualSessionPath = Join-Path $root 'tmp\manual-session.json'
+$manualVerificationPath = Join-Path $root 'tmp\manual-verification.json'
+$manualHandoffPath = Join-Path $root 'tmp\manual-handoff.json'
+$manualAbandonPath = Join-Path $root 'tmp\manual-abandon.json'
 $outboxScript = Join-Path $PSScriptRoot 'Invoke-CheckinNotificationOutbox.ps1'
 $mutexCreated = $false
 $mutexName = if ($initialConfig.schedulerMutexName) { [string]$initialConfig.schedulerMutexName } else { 'Local\CodexBookmarkDailyCheckinScheduler' }
@@ -30,6 +35,23 @@ function Read-SchedulerState {
     if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{} }
     try { return Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json }
     catch { return [pscustomobject]@{} }
+}
+
+function Get-TodayAbandonedOrigins([datetime]$Now) {
+    $origins = @{}
+    if (-not (Test-Path -LiteralPath $manualAbandonPath)) { return $origins }
+    try {
+        $document = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualAbandonPath | ConvertFrom-Json
+        if ([string]$document.date -ne $Now.ToString('yyyyMMdd')) { return $origins }
+        foreach ($rawOrigin in @($document.origins)) {
+            $uri = try { [uri]([string]$rawOrigin) } catch { $null }
+            if ($uri -and $uri.Scheme -eq 'https' -and $uri.Host -and -not $uri.UserInfo) {
+                $origins[$uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/')] = $true
+            }
+        }
+    }
+    catch { }
+    return $origins
 }
 
 function Get-LatestReportState([datetime]$now, $config, [Nullable[datetime]]$notBefore = $null) {
@@ -55,7 +77,11 @@ function Get-LatestReportState([datetime]$now, $config, [Nullable[datetime]]$not
         $contractComplete = $latest.isComplete -eq $true `
             -and $processedTotal -ge $plannedTotal `
             -and $results.Count -ge $plannedTotal
-        $problems = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+        $abandonedOrigins = Get-TodayAbandonedOrigins $now
+        $problems = @($results | Where-Object {
+            $_.status -notin @('signed', 'already_signed', 'not_available') `
+                -and -not $abandonedOrigins.ContainsKey([string]$_.origin)
+        })
         $missingCount = [Math]::Max(0, $plannedTotal - $processedTotal)
         $retryTimes = @($problems | Where-Object { $_.status -eq 'deferred' -and $_.nextEligibleAt } | ForEach-Object {
             try { [datetime]$_.nextEligibleAt } catch { }
@@ -74,7 +100,68 @@ function Get-LatestReportState([datetime]$now, $config, [Nullable[datetime]]$not
     catch { return $empty }
 }
 
-function Test-SchedulerWaiting($state, [datetime]$now, $config) {
+function Get-ManualHandoffState([datetime]$Now) {
+    $empty = [pscustomobject]@{
+        Mode = 'none'
+        SourceRunId = $null
+        ChangedAt = $null
+    }
+    if (Test-Path -LiteralPath $manualSessionPath) {
+        return [pscustomobject]@{
+            Mode = 'manual_session'
+            SourceRunId = $null
+            ChangedAt = (Get-Item -LiteralPath $manualSessionPath).LastWriteTimeUtc.ToString('o')
+        }
+    }
+    $todayPrefix = $Now.ToString('yyyyMMdd') + '-'
+    if (Test-Path -LiteralPath $manualVerificationPath) {
+        try {
+            $verification = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualVerificationPath | ConvertFrom-Json
+            $pendingCount = @($verification.targets | Where-Object {
+                -not (Test-ManualVerificationTerminalStatus $_.verificationStatus)
+            }).Count
+            if ([string]$verification.state -eq 'pending_verification' `
+                -and $verification.authoritativeEvidenceRequired -eq $true `
+                -and [string]$verification.sourceRunId -like "$todayPrefix*" `
+                -and $pendingCount -gt 0) {
+                return [pscustomobject]@{
+                    Mode = 'verification_ready'
+                    SourceRunId = [string]$verification.sourceRunId
+                    ChangedAt = (Get-Item -LiteralPath $manualVerificationPath).LastWriteTimeUtc.ToString('o')
+                }
+            }
+        }
+        catch { }
+    }
+    if (Test-Path -LiteralPath $manualHandoffPath) {
+        try {
+            $handoff = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualHandoffPath | ConvertFrom-Json
+            $targetCount = @($handoff.targets).Count
+            if ([string]$handoff.state -eq 'awaiting_manual_handoff' `
+                -and [string]$handoff.sourceRunId -like "$todayPrefix*" `
+                -and $handoff.authoritativeEvidenceRequired -eq $true `
+                -and $targetCount -gt 0) {
+                return [pscustomobject]@{
+                    Mode = 'awaiting_manual_handoff'
+                    SourceRunId = [string]$handoff.sourceRunId
+                    ChangedAt = (Get-Item -LiteralPath $manualHandoffPath).LastWriteTimeUtc.ToString('o')
+                }
+            }
+        }
+        catch { }
+    }
+    return $empty
+}
+
+function Test-SchedulerWaiting($state, [datetime]$now, $config, $manualHandoff) {
+    if ([string]$manualHandoff.Mode -in @('manual_session', 'awaiting_manual_handoff')) {
+        return $true
+    }
+    if ([string]$manualHandoff.Mode -eq 'verification_ready' `
+        -and ([string]$state.lastManualVerificationSourceRunId -ne [string]$manualHandoff.SourceRunId `
+            -or [string]$state.lastManualVerificationChangedAt -ne [string]$manualHandoff.ChangedAt)) {
+        return $false
+    }
     $today = $now.ToString('yyyy-MM-dd')
     if ([string]$state.lastRunDate -eq $today -and $state.reportComplete -eq $true) { return $true }
     $maxAttempts = if ($null -ne $config.schedulerMaxDailyAttempts) { [int]$config.schedulerMaxDailyAttempts } else { 3 }
@@ -115,7 +202,7 @@ function Write-SchedulerClaim([datetime]$startedAt) {
     Move-Item -LiteralPath $temporary -Destination $statePath -Force
 }
 
-function Write-SchedulerState([datetime]$finishedAt, [int]$exitCode, $reportState, $config) {
+function Write-SchedulerState([datetime]$finishedAt, [int]$exitCode, $reportState, $config, $manualHandoff) {
     $state = Read-SchedulerState
     $failureDelay = if ($null -ne $config.schedulerFailureRetryMinutes) { [int]$config.schedulerFailureRetryMinutes } else { 60 }
     $failureDelay = [Math]::Max(5, [Math]::Min(360, $failureDelay))
@@ -126,6 +213,16 @@ function Write-SchedulerState([datetime]$finishedAt, [int]$exitCode, $reportStat
         } else {
             $finishedAt.AddMinutes($failureDelay).ToString('o')
         }
+    }
+    $lastManualVerificationSourceRunId = [string]$state.lastManualVerificationSourceRunId
+    $lastManualVerificationChangedAt = [string]$state.lastManualVerificationChangedAt
+    if ([string]$manualHandoff.Mode -eq 'verification_ready') {
+        $lastManualVerificationSourceRunId = [string]$manualHandoff.SourceRunId
+        $lastManualVerificationChangedAt = [string]$manualHandoff.ChangedAt
+    }
+    elseif ([string]$manualHandoff.Mode -eq 'none') {
+        $lastManualVerificationSourceRunId = $null
+        $lastManualVerificationChangedAt = $null
     }
     $value = [ordered]@{
         phase = 'finished'
@@ -143,6 +240,11 @@ function Write-SchedulerState([datetime]$finishedAt, [int]$exitCode, $reportStat
         plannedTotal = $reportState.PlannedTotal
         processedTotal = $reportState.ProcessedTotal
         nextEligibleAt = $nextEligibleAt
+        manualHandoffMode = [string]$manualHandoff.Mode
+        manualHandoffSourceRunId = [string]$manualHandoff.SourceRunId
+        manualHandoffChangedAt = [string]$manualHandoff.ChangedAt
+        lastManualVerificationSourceRunId = $lastManualVerificationSourceRunId
+        lastManualVerificationChangedAt = $lastManualVerificationChangedAt
     }
     $temporary = "$statePath.$PID.tmp"
     [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
@@ -172,7 +274,8 @@ try {
             $now = Get-Date
             $scheduledToday = [datetime]::ParseExact("$($now.ToString('yyyy-MM-dd')) $schedule", 'yyyy-MM-dd HH:mm', $null)
             $state = Read-SchedulerState
-            if ($now -ge $scheduledToday -and -not (Test-SchedulerWaiting $state $now $config)) {
+            $manualHandoff = Get-ManualHandoffState $now
+            if ($now -ge $scheduledToday -and -not (Test-SchedulerWaiting $state $now $config $manualHandoff)) {
                 Write-SchedulerHeartbeat 'running_checkin'
                 Write-SchedulerLog "开始第 $([int]$state.attemptsToday + 1) 次签到尝试。"
                 $runScript = Join-Path $PSScriptRoot 'Run-Checkin.ps1'
@@ -191,8 +294,12 @@ try {
                 }
                 $finishedAt = Get-Date
                 $reportState = Get-LatestReportState $finishedAt $config $runStartedAt
-                Write-SchedulerState $finishedAt $process.ExitCode $reportState $config
+                $manualHandoffAfter = Get-ManualHandoffState $finishedAt
+                Write-SchedulerState $finishedAt $process.ExitCode $reportState $config $manualHandoffAfter
                 Write-SchedulerLog "签到结束：退出码=$($process.ExitCode)，报告有效=$($reportState.Valid)，完整=$($reportState.Complete)，进度=$($reportState.ProcessedTotal)/$($reportState.PlannedTotal)，异常=$($reportState.ProblemCount)。"
+                if ([string]$manualHandoffAfter.Mode -ne 'none') {
+                    Write-SchedulerLog "人工交接状态：$($manualHandoffAfter.Mode)，来源运行=$($manualHandoffAfter.SourceRunId)。"
+                }
             }
         }
         catch {

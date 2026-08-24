@@ -2,7 +2,7 @@ function Get-NativeFallbackOnlyOrigins($Config) {
     $origins = @()
     $entries = @($Config.nativeWafPreflightUrls) + @($Config.nativeChallengePreflight)
     foreach ($entry in $entries) {
-        if ($entry -is [string] -or $entry.fallbackOnly -ne $true) { continue }
+        if ($entry -is [string] -or $entry.fallbackOnly -ne $true -or $null -ne $entry.action) { continue }
         try {
             $uri = [uri][string]$entry.url
             if ($uri.Scheme -in @('http', 'https') -and $uri.Host) {

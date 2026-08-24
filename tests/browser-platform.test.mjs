@@ -69,6 +69,10 @@ test("browser lifecycle scripts use configured process discovery", async () => {
     assert.doesNotMatch(source, /Name='chrome\.exe'|Name -eq 'chrome\.exe'/);
   }
 
+  const initializer = await fs.readFile(new URL("../scripts/Initialize-BrowserProfile.ps1", import.meta.url), "utf8");
+  assert.match(initializer, /--no-startup-window/);
+  assert.doesNotMatch(initializer, /['\"]about:blank['\"]/);
+
   const runtime = await fs.readFile(new URL("../scripts/Resolve-Runtime.ps1", import.meta.url), "utf8");
   assert.match(runtime, /browserExecutable/);
   assert.match(runtime, /chromeExecutable/);

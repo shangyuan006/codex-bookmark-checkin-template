@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 
 test("公开默认配置不启用外部通知", async () => {
   const defaults = JSON.parse(await fs.readFile(new URL("../config/defaults.json", import.meta.url), "utf8"));
+  const localExample = JSON.parse(await fs.readFile(new URL("../config/config.local.example.json", import.meta.url), "utf8"));
   assert.equal(defaults.notification.mode, "none");
   assert.equal(defaults.notification.executable, "");
   assert.equal(defaults.syncBookmarkSavedLogins, false);
@@ -17,8 +18,14 @@ test("公开默认配置不启用外部通知", async () => {
   assert.deepEqual(defaults.preCheckinDismissRules, {});
   assert.deepEqual(defaults.challengeInteractionRules, {});
   assert.deepEqual(defaults.checkinCaptchaDialogRules, {});
+  assert.deepEqual(defaults.newApiCaptchaRules, {});
+  assert.deepEqual(defaults.newApiSignInRules, {});
+  assert.deepEqual(defaults.savedLoginSessionRules, {});
   assert.deepEqual(defaults.calendarDayCheckinOrigins, []);
   assert.deepEqual(defaults.calendarDayCheckinPaths, {});
+  assert.deepEqual(Object.keys(localExample.newApiCaptchaRules), ["https://captcha.example.com"]);
+  assert.deepEqual(Object.keys(localExample.newApiSignInRules), ["https://signin.example.com"]);
+  assert.deepEqual(Object.keys(localExample.savedLoginSessionRules), ["https://example.com"]);
 });
 
 test("OAuth 恢复始终不保存页面截图或正文摘录", async () => {
@@ -32,10 +39,17 @@ test("OAuth 恢复始终不保存页面截图或正文摘录", async () => {
 });
 
 test("Agent Router account login helper does not request or persist secrets", async () => {
-  const helper = await fs.readFile(new URL("../scripts/Open-AgentRouterLogin.ps1", import.meta.url), "utf8");
-  assert.match(helper, /agentrouterAccounts/);
-  assert.match(helper, /user-data-dir=/);
-  assert.doesNotMatch(helper, /password|cookie|token|session/i);
+  const [opener, accountHelper] = await Promise.all([
+    fs.readFile(new URL("../scripts/Open-AgentRouterLogin.ps1", import.meta.url), "utf8"),
+    fs.readFile(new URL("../scripts/AgentRouterAccount.ps1", import.meta.url), "utf8"),
+  ]);
+  assert.match(opener, /agentrouterAccounts/);
+  assert.match(opener, /\[Alias\('AccountId'\)\]/);
+  assert.match(accountHelper, /\.accountKey/);
+  assert.match(accountHelper, /\.accountId/);
+  assert.match(opener, /user-data-dir=/);
+  assert.match(opener, /oauth-provider-session\.mjs/);
+  assert.doesNotMatch(`${opener}\n${accountHelper}`, /password|cookie|token|current_user|username|email/i);
 });
 
 test("保存密码同步必须经过显式总开关授权", async () => {
@@ -45,6 +59,8 @@ test("保存密码同步必须经过显式总开关授权", async () => {
   assert.doesNotMatch(runner, /syncSavedLoginOrigins\)\.Count -gt 0 -or/);
   assert.match(syncer, /\$parsedOrigins = \$discoveredText \| ConvertFrom-Json/);
   assert.match(syncer, /\$origins = @\(\$parsedOrigins\)/);
+  assert.match(syncer, /populated_origins/);
+  assert.match(syncer, /没有保存记录/);
   assert.doesNotMatch(syncer, /\$origins = @\(\$discoveredText \| ConvertFrom-Json\)/);
 });
 
@@ -83,6 +99,7 @@ test("手动登录使用无 Playwright 和无远程调试的最小原生浏览�
   const opener = await fs.readFile(new URL("../scripts/Open-ManualLogin.ps1", import.meta.url), "utf8");
   const nativeLauncher = await fs.readFile(new URL("../scripts/Open-PlainLoginChrome.ps1", import.meta.url), "utf8");
   const closer = await fs.readFile(new URL("../scripts/Close-ManualLogin.ps1", import.meta.url), "utf8");
+  const runtimeResolver = await fs.readFile(new URL("../scripts/Resolve-Runtime.ps1", import.meta.url), "utf8");
   const attentionUrls = await fs.readFile(new URL("../src/attention-urls.mjs", import.meta.url), "utf8");
 
   assert.doesNotMatch(opener, /manual-session\.mjs|launchAutomationContext/);
@@ -95,14 +112,17 @@ test("手动登录使用无 Playwright 和无远程调试的最小原生浏览�
   assert.match(nativeLauncher, /--selection/);
   assert.match(nativeLauncher, /mode = 'native'/);
   assert.match(nativeLauncher, /processStartedAt = \$processStartedAt/);
+  assert.match(nativeLauncher, /launchMarker = \$launchMarker/);
+  assert.match(nativeLauncher, /--checkin-launch=/);
   assert.match(nativeLauncher, /prepare-native-browser-profile\.mjs/);
   assert.match(nativeLauncher, /targets = @\(\$items/);
-  assert.match(closer, /Get-CheckinAutomationBrowserProcesses/);
+  assert.match(closer, /Get-CheckinManualSessionBrowserProcesses/);
+  assert.doesNotMatch(runtimeResolver, /Where-Object\s*\{[\s\S]*?if \(-not \$candidate\) \{ return \$false \}/);
   assert.match(closer, /\[int\]::TryParse\(\[string\]\$state\.pid/);
   assert.match(closer, /\$_.ProcessId -eq \$trackedPid/);
   assert.match(closer, /\[string\]::Equals\(\$recordedProfile, \$configuredProfile/);
   assert.match(closer, /\$trackedProcess\.StartTime\.ToUniversalTime\(\)/);
-  assert.match(closer, /未关闭当前占用独立配置的其他浏览器/);
+  assert.match(closer, /保留状态记录/);
   assert.match(closer, /CloseMainWindow\(\)/);
   assert.doesNotMatch(closer, /Stop-Process/);
   assert.match(closer, /state = 'pending_verification'/);
@@ -112,7 +132,10 @@ test("手动登录使用无 Playwright 和无远程调试的最小原生浏览�
   assert.match(attentionUrls, /export const ATTENTION_STATUSES = new Set/);
   assert.match(attentionUrls, /readBookmarkPlan\(config\.bookmarksPath, config\)/);
   assert.doesNotMatch(attentionUrls, /readBookmarkPlanWithBackup/);
-  assert.doesNotMatch(attentionUrls, /"no_action"/);
+  const automaticAttentionStatuses = attentionUrls.match(
+    /export const ATTENTION_STATUSES = new Set\(\[[\s\S]*?\]\);/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(automaticAttentionStatuses, /"no_action"/);
 });
 
 test("定向补跑同时报告本轮统计和今日累计统计", async () => {
@@ -194,17 +217,23 @@ test("调度器执行上限使用完整任务预算而非固定一小时", async
 test("安装配置优先使用 PowerShell 7，5.1 仅作为可用回退", async () => {
   const setup = await fs.readFile(new URL("../src/setup-config.mjs", import.meta.url), "utf8");
   const preflight = await fs.readFile(new URL("../scripts/Test-Environment.ps1", import.meta.url), "utf8");
+  const watchdog = await fs.readFile(new URL("../scripts/Ensure-UserScheduler.ps1", import.meta.url), "utf8");
   assert.match(setup, /findOnPath\("pwsh\.exe"\)/);
   assert.match(setup, /answers\.powershellExecutable \|\| preferredPowerShell/);
   assert.match(preflight, /--scope-json-base64/);
+  assert.match(watchdog, /config\.powershellExecutable/);
+  assert.match(watchdog, /Get-Command pwsh,powershell/);
+  assert.match(watchdog, /Start-Process -FilePath \$shell/);
+  assert.doesNotMatch(watchdog, /Start-Process -FilePath 'pwsh\.exe'/);
 });
 
 test("已确认书签范围的预检不输出用户目录或范围外收藏夹候选", async () => {
   const preflight = await fs.readFile(new URL("../src/preflight.mjs", import.meta.url), "utf8");
   assert.match(preflight, /if \(plan\) \{[\s\S]*?scopeMatch:[\s\S]*?sources: plan\.sources\.map/);
   assert.match(preflight, /else \{[\s\S]*?listBookmarkFolderCandidatesWithBackup\(bookmarksPath\)/);
-  assert.match(preflight, /scopeProvided \? browser : \{ \.\.\.browser, userDataDir \}/);
-  assert.match(preflight, /scopeProvided[\s\S]*?bookmark_scope_unreadable[\s\S]*?: \{ bookmarksPath/);
+  assert.match(preflight, /return requestedScopeProvided \? \{ \.\.\.browser, executable \} : \{ \.\.\.browser, executable, userDataDir \}/);
+  assert.match(preflight, /requestedScopeProvided[\s\S]*?bookmark_scope_unreadable[\s\S]*?: \{ bookmarksPath/);
+  assert.match(preflight, /if \(configuredMultiSource\) return \{ \.\.\.browser, installed: Boolean\(executable\) \}/);
 });
 
 test("健康检查区分暂停调度并严格验证完整日报合同", async () => {
@@ -215,8 +244,8 @@ test("健康检查区分暂停调度并严格验证完整日报合同", async ()
   for (const contract of [
     /runState -eq 'final'/,
     /isComplete -eq \$true/,
-    /latestProcessedTotal -ge \$latestPlannedTotal/,
-    /results\)\.Count -ge \$latestPlannedTotal/,
+    /latestProcessedTotal -eq \$latestPlannedTotal/,
+    /results\)\.Count -eq \$latestPlannedTotal/,
   ]) assert.match(health, contract);
   assert.match(health, /latestResultConfirmed = \[bool\]\$latestResultComplete/);
 });
@@ -293,6 +322,25 @@ test("公开站点规则只包含无凭据 HTTPS URL", async () => {
   }
 });
 
+test("显式目标公开示例只扩展已确认目录内的无凭据 HTTPS 站点", async () => {
+  const example = JSON.parse(await fs.readFile(new URL("../config/config.local.example.json", import.meta.url), "utf8"));
+  const readme = await fs.readFile(new URL("../README.md", import.meta.url), "utf8");
+  const confirmedFolderNames = new Set((example.additionalBookmarkSources ?? [])
+    .flatMap((source) => source.targetFolderNames ?? []));
+
+  assert.ok(example.configuredTargets.length > 0);
+  for (const target of example.configuredTargets) {
+    const url = new URL(target.url);
+    assert.equal(url.protocol, "https:");
+    assert.equal(url.username, "");
+    assert.equal(url.password, "");
+    assert.ok(confirmedFolderNames.has(target.folderName));
+  }
+  assert.match(readme, /configuredTargets/);
+  assert.match(readme, /folderName.*targetFolderNames/);
+  assert.match(readme, /扩展浏览器实际导航和网络访问范围/);
+});
+
 test("本机配置、结果和凭据目录被 Git 忽略", async () => {
   const ignore = await fs.readFile(new URL("../.gitignore", import.meta.url), "utf8");
   for (const pattern of ["config/config.json", "config/config.local.json", "setup/answers.json", "data/", "logs/*", "tmp/*"]) {
@@ -311,6 +359,9 @@ test("DPAPI 凭据恢复默认关闭且强制同源验证", async () => {
   assert.doesNotMatch(loginSource, /siteStorageBootstrap|Object\.entries\(localStorage\)|Object\.entries\(sessionStorage\)/);
   assert.match(loginSource, /new URL\(loginUrl\)\.origin !== origin/);
   assert.match(loginSource, /verificationUrl\.origin !== origin/);
+  assert.match(recovery, /\$PSVersionTable\.PSVersion\.Major -lt 7/);
+  assert.match(recovery, /Get-Command pwsh\.exe/);
+  assert.match(recovery, /-Origin \$Origin -LoginUrl \$LoginUrl/);
   assert.match(setter, /ConvertFrom-SecureString/);
   assert.match(recovery, /RedirectStandardInput = \$true/);
   assert.doesNotMatch(recovery, /ArgumentList\.Add\(\$passwordPlain\)/);
@@ -349,7 +400,8 @@ test("手动操作后的续跑强制复核记录中的 origin 且不从点击推
   assert.match(runner, /tmp\\manual-verification\.json/);
   assert.match(stateMachine, /state -ne 'pending_verification'/);
   assert.match(stateMachine, /authoritativeEvidenceRequired -ne \$true/);
-  assert.match(runner, /@\('--origins', \(@\(\$manualVerification\.Origins\) -join ','\)\)/);
+  assert.match(runner, /'--origins', \(@\(\$manualVerification\.Origins\) -join ','\),[\s\S]*?'--consume-manual-verification'/);
+  assert.match(runner, /--consume-manual-verification/);
   assert.match(stateMachine, /verificationStatus = \[string\]\$result\.status/);
   assert.match(stateMachine, /if \(\$allConfirmed\) \{ 'verification_complete' \} else \{ 'pending_verification' \}/);
   assert.doesNotMatch(`${runner}\n${stateMachine}`, /verificationStatus\s*=\s*'(?:signed|already_signed|clicked)'/);

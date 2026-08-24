@@ -15,8 +15,13 @@ def host_matches(value: str, allowed_hosts: set[str]) -> bool:
 if len(sys.argv) != 4:
     raise SystemExit("usage: Sync-ChromeSavedLogins.py <source> <target> <allowed-hosts-json>")
 
-source_path, target_path, allowed_json = sys.argv[1:]
-allowed_hosts = {str(value).lower() for value in json.loads(allowed_json) if value}
+source_path, target_path, allowed_value = sys.argv[1:]
+try:
+    allowed_values = json.loads(allowed_value)
+except json.JSONDecodeError:
+    # Windows PowerShell removes quotes from JSON passed to native programs.
+    allowed_values = [item.strip() for item in allowed_value.split(",") if item.strip()]
+allowed_hosts = {str(value).lower() for value in allowed_values if value}
 if not allowed_hosts:
     print(json.dumps({"copied": 0, "origins": 0}))
     raise SystemExit(0)

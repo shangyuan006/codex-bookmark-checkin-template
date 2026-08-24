@@ -58,7 +58,7 @@ try {
             'textarea[name*="response" i], input[name*="response" i], textarea[name*="captcha" i], input[name*="captcha" i], input[name="altcha" i], [data-response]',
           )]);
           const explicitWidget = element.matches(
-            'iframe, .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, altcha-widget, [data-altcha], [data-cap-api-endpoint]',
+            'iframe, .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, .cap-verify, altcha-widget, [data-altcha], [data-cap-api-endpoint]',
           );
           return {
             visible: visible(element),

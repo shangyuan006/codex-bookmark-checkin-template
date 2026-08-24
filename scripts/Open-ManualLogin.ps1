@@ -10,6 +10,24 @@ $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
 $statePath = Join-Path $root 'tmp\manual-session.json'
 
+$agentRouterOrigins = @($config.agentrouterAccounts | ForEach-Object {
+    try {
+        $uri = [uri]([string]$_.origin)
+        if ($uri.Scheme -eq 'https' -and $uri.Host) { $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/').ToLowerInvariant() }
+    }
+    catch { }
+} | Where-Object { $_ } | Select-Object -Unique)
+$requestedAgentRouterOrigins = @($Origins | ForEach-Object {
+    try {
+        $uri = [uri]([string]$_)
+        if ($uri.Scheme -in @('http', 'https') -and $uri.Host) { $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/').ToLowerInvariant() }
+    }
+    catch { }
+} | Where-Object { $agentRouterOrigins -contains $_ })
+if ($requestedAgentRouterOrigins.Count -gt 0) {
+    throw 'Agent Router 必须使用专用入口：先运行 Open-AgentRouterLogin.ps1 -AccountKey <github|linuxdo>，完成后运行 Complete-AgentRouterLogin.ps1 -AccountKey <同一 accountKey>。'
+}
+
 if ($Origins.Count -gt 0 -and $Selection.Count -gt 0) {
     throw 'Origins 和 Selection 不能同时使用。'
 }

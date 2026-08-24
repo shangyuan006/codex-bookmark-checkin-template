@@ -3,26 +3,73 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { launchAutomationContext } from "./browser.mjs";
+import { dismissConfiguredPreCheckinOverlay, launchAutomationContext } from "./browser.mjs";
+import { loginHelperOutcomeFromStreams } from "./login-recovery.mjs";
 import { localRunDate, nextShanghaiTime } from "./retry-policy.mjs";
+import { normalizeAgentRouterAccountKey, normalizeReauthProvider } from "./result-identity.mjs";
 import { atomicWriteJson, safeErrorMessage } from "./security.mjs";
 
 const execFileAsync = promisify(execFile);
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
+const dataDirectory = path.resolve(rootDirectory, "data");
 const defaultStatePath = path.join(rootDirectory, "data", "reauth-checkin-state.json");
 
-function normalizeAccountId(value) {
-  const normalized = String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(normalized)) {
-    throw new Error("reauth accountId must contain 1-64 ASCII letters, digits, underscores, or hyphens");
+function normalizeAuthoritativeAccountId(entry) {
+  const siteAccountId = entry?.siteAccountId;
+  const authoritativeAccountId = entry?.authoritativeAccountId;
+  if (siteAccountId != null && authoritativeAccountId != null && siteAccountId !== authoritativeAccountId) {
+    throw new Error("siteAccountId conflicts with authoritativeAccountId");
   }
-  return normalized;
+  const value = authoritativeAccountId ?? siteAccountId;
+  if (value == null) return null;
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()
+    || value.length > 128 || /[\s\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error("authoritative reauth accountId must be a trimmed non-whitespace string of at most 128 characters");
+  }
+  return value;
 }
 
-function resolveAccountPath(value, fallback) {
+function configuredAccountOrigin(value, label) {
+  const raw = String(value ?? "");
+  if (!raw || raw !== raw.trim()) throw new Error(`${label} must be a canonical HTTPS origin`);
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`${label} must be a canonical HTTPS origin`);
+  }
+  if (url.protocol !== "https:"
+    || url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash) {
+    throw new Error(`${label} must be a canonical HTTPS origin`);
+  }
+  return url.origin;
+}
+
+function resolveAccountPath(value, fallback, label) {
   const raw = String(value ?? "").trim();
-  return path.resolve(rootDirectory, raw || fallback);
+  const resolved = path.resolve(rootDirectory, raw || fallback);
+  const relative = path.relative(dataDirectory, resolved);
+  if (!relative
+    || relative === ".."
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)) {
+    throw new Error(`${label} must stay inside the project data directory`);
+  }
+  return resolved;
+}
+
+function optionalBoundedInteger(value, minimum, maximum, label) {
+  if (value == null || String(value).trim() === "") return null;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < minimum || number > maximum) {
+    throw new Error(`${label} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return number;
 }
 
 function assertSameOriginHttps(rawUrl, origin, label) {
@@ -50,8 +97,13 @@ export function getConfiguredReauthRule(target, config) {
   const raw = config?.reauthCheckinRules?.[target?.origin];
   if (!raw || raw.enabled === false) return null;
   const origin = new URL(target.origin).origin;
-  const provider = String(raw.provider ?? "").trim();
-  if (!provider) throw new Error("重认证规则缺少登录提供方");
+  let provider;
+  try {
+    provider = normalizeReauthProvider(raw.provider, "重认证规则登录提供方");
+  } catch (error) {
+    if (!String(raw.provider ?? "").trim()) throw new Error("重认证规则缺少登录提供方");
+    throw error;
+  }
   const afterMatch = raw.after == null ? null : String(raw.after).match(/^([01]\d|2[0-3]):([0-5]\d)$/);
   if (raw.after != null && !afterMatch) throw new Error("重认证签到时间必须使用 HH:mm");
   const quotaField = String(raw.quotaField || "data.quota");
@@ -115,47 +167,152 @@ export function getConfiguredReauthAccounts(target, config) {
   if (configured != null && !Array.isArray(configured)) {
     throw new Error("agentrouterAccounts must be an array");
   }
-  const matching = (configured ?? []).filter((entry) => {
-    try {
-      return new URL(String(entry?.origin ?? "")).origin === baseRule.origin;
-    } catch {
-      return false;
+  const validatedAccounts = (configured ?? []).map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`agentrouterAccounts[${index}] must be an object`);
     }
+    return {
+      entry,
+      origin: configuredAccountOrigin(entry.origin, `agentrouterAccounts[${index}].origin`),
+    };
   });
+  const matching = validatedAccounts
+    .filter((candidate) => candidate.origin === baseRule.origin)
+    .map((candidate) => candidate.entry);
   if (matching.length === 0) {
     return [{
       ...baseRule,
-      accountId: "default",
-      automationUserDataDir: resolveAccountPath(config.automationUserDataDir, "data/edge-user-data"),
+      accountKey: "default",
+      supplementalAccount: false,
+      automationUserDataDir: resolveAccountPath(
+        config.automationUserDataDir,
+        "data/edge-user-data",
+        "automationUserDataDir",
+      ),
       statePath: defaultStatePath,
     }];
   }
-  const seen = new Set();
+  const seenAccountKeys = new Set();
+  const seenAccountIds = new Set();
   return matching.map((entry, index) => {
-    const accountId = normalizeAccountId(entry.accountId ?? entry.id);
-    if (seen.has(accountId)) throw new Error(`Duplicate reauth accountId for ${baseRule.origin}: ${accountId}`);
-    seen.add(accountId);
-    const provider = String(entry.provider ?? baseRule.provider).trim();
-    if (!provider) throw new Error(`Reauth account ${accountId} is missing a login provider`);
+    const accountKey = normalizeAgentRouterAccountKey(entry.accountKey ?? entry.accountId ?? entry.id, "reauth accountKey");
+    if (entry.accountKey != null && (entry.accountId != null || entry.id != null)) {
+      const legacyAccountKey = normalizeAgentRouterAccountKey(entry.accountId ?? entry.id, "legacy reauth account key");
+      if (legacyAccountKey !== accountKey) {
+        throw new Error("legacy agentrouter accountId/id must match accountKey; use authoritativeAccountId for a site account id");
+      }
+    }
+    if (seenAccountKeys.has(accountKey)) {
+      throw new Error(`Duplicate reauth accountKey for ${baseRule.origin}: ${accountKey}`);
+    }
+    seenAccountKeys.add(accountKey);
+    const provider = normalizeReauthProvider(entry.provider ?? baseRule.provider, "agentrouter provider");
+    const oauthAttempts = optionalBoundedInteger(
+      entry.oauthAttempts,
+      1,
+      3,
+      `agentrouterAccounts[${index}].oauthAttempts`,
+    );
+    const oauthRetryDelayMs = optionalBoundedInteger(
+      entry.oauthRetryDelayMs,
+      500,
+      20_000,
+      `agentrouterAccounts[${index}].oauthRetryDelayMs`,
+    );
+    const oauthWaitMs = optionalBoundedInteger(
+      entry.oauthWaitMs,
+      30_000,
+      120_000,
+      `agentrouterAccounts[${index}].oauthWaitMs`,
+    );
+    const accountId = normalizeAuthoritativeAccountId(entry);
+    if (accountId && seenAccountIds.has(accountId)) {
+      throw new Error(`Duplicate authoritative reauth accountId for ${baseRule.origin}`);
+    }
+    if (accountId) seenAccountIds.add(accountId);
     return {
       ...baseRule,
-      accountId,
+      accountKey,
+      ...(accountId ? { accountId } : {}),
       provider,
+      ...(oauthAttempts == null ? {} : { oauthAttempts }),
+      ...(oauthRetryDelayMs == null ? {} : { oauthRetryDelayMs }),
+      ...(oauthWaitMs == null ? {} : { oauthWaitMs }),
+      supplementalAccount: index > 0,
       automationUserDataDir: resolveAccountPath(
         entry.automationUserDataDir,
-        path.join("data", `edge-agentrouter-${accountId}`),
+        path.join("data", `edge-agentrouter-${accountKey}`),
+        `agentrouterAccounts[${index}].automationUserDataDir`,
       ),
       statePath: resolveAccountPath(
         entry.statePath,
-        path.join("data", `agentrouter-${accountId}-state.json`),
+        path.join("data", `agentrouter-${accountKey}-state.json`),
+        `agentrouterAccounts[${index}].statePath`,
       ),
       accountIndex: index,
     };
   });
 }
 
+function sanitizeReauthAccountResult(result) {
+  const {
+    accountId: _accountId,
+    accountLabel: _accountLabel,
+    authoritativeAccountId: _authoritativeAccountId,
+    siteAccountId: _siteAccountId,
+    provider,
+    ...safeResult
+  } = result ?? {};
+  return {
+    ...safeResult,
+    ...(provider == null ? {} : { provider: normalizeReauthProvider(provider, "account result provider") }),
+  };
+}
+
+export function withReauthAccountMetadata(result, account) {
+  return {
+    ...sanitizeReauthAccountResult(result),
+    origin: account.origin,
+    accountKey: account.accountKey,
+    provider: account.provider,
+    supplementalAccount: account.supplementalAccount === true,
+  };
+}
+
+function matchesLegacyAccountIdOption(account, value) {
+  const requestedAccountId = String(value ?? "").trim();
+  let legacyAccountKey = null;
+  try {
+    legacyAccountKey = normalizeAgentRouterAccountKey(requestedAccountId, "legacy reauth account selector");
+  } catch {
+    // Authoritative site account ids are not required to be path-safe keys.
+  }
+  return account.accountKey === legacyAccountKey || account.accountId === requestedAccountId;
+}
+
+export function selectConfiguredReauthAccount(accounts, options = {}, origin = "configured origin") {
+  if (!Array.isArray(accounts)) throw new TypeError("reauth accounts must be an array");
+  if (!options.accountKey && !options.accountId) return null;
+
+  let matches = accounts;
+  if (options.accountKey) {
+    const requestedAccountKey = normalizeAgentRouterAccountKey(options.accountKey, "reauth accountKey selector");
+    matches = matches.filter((candidate) => candidate.accountKey === requestedAccountKey);
+  }
+  if (options.accountId) {
+    matches = matches.filter((candidate) => matchesLegacyAccountIdOption(candidate, options.accountId));
+  }
+  if (matches.length !== 1) {
+    const selector = options.accountKey ? "accountKey" : "accountId";
+    throw new Error(`Unknown or ambiguous reauth ${selector} for ${origin}`);
+  }
+  return matches[0];
+}
+
 export function aggregateReauthResults(accountResults) {
-  const results = Array.isArray(accountResults) ? accountResults : [];
+  const results = Array.isArray(accountResults)
+    ? accountResults.map(sanitizeReauthAccountResult)
+    : [];
   if (results.length === 0) {
     return { status: "needs_attention", reason: "No reauth accounts are configured", accountResults: [] };
   }
@@ -191,9 +348,47 @@ export function aggregateReauthResults(accountResults) {
   };
 }
 
-export function reauthLoginFailureReason(provider) {
+export function mergeSelectedReauthAccountResult(accounts, previousParent, selectedAccountResult) {
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    throw new TypeError("configured reauth accounts must be a non-empty array");
+  }
+  const selectedKey = normalizeAgentRouterAccountKey(
+    selectedAccountResult?.accountKey,
+    "selected reauth account result.accountKey",
+  );
+  if (!accounts.some((account) => account.accountKey === selectedKey)) {
+    throw new Error("selected reauth account result is not part of the configured account set");
+  }
+  const previousByKey = new Map((previousParent?.accountResults ?? [])
+    .filter((entry) => entry?.accountKey)
+    .map((entry) => [entry.accountKey, sanitizeReauthAccountResult(entry)]));
+  return aggregateReauthResults(accounts.map((account) => {
+    if (account.accountKey === selectedKey) return selectedAccountResult;
+    return previousByKey.get(account.accountKey) ?? {
+      accountKey: account.accountKey,
+      provider: account.provider,
+      status: "needs_attention",
+      reason: "The current daily report has no authoritative result for this account",
+    };
+  }));
+}
+
+export function reauthLoginFailureReason(provider, oauthStage = null) {
   const normalized = String(provider ?? "").trim() || "配置的登录提供方";
-  return `${normalized} 重新登录未完成，需要人工处理`;
+  const stageReasons = {
+    target_login: "目标站登录页未就绪",
+    provider_button: "未找到登录提供方按钮",
+    provider_transition: "登录提供方跳转未完成",
+    linuxdo_session: "LinuxDO 会话恢复未完成",
+    provider_authorization: "LinuxDO 授权未完成",
+    target_callback: "登录回调未返回目标站",
+    timeout: "登录流程超时",
+    helper_failed: "登录助手执行失败",
+  };
+  const detail = stageReasons[oauthStage];
+  return detail
+    ? `${normalized} 重新登录未完成（${detail}），需要人工处理`
+    : `${normalized} 重新登录未完成，需要人工处理`;
 }
 
 function normalizeProviderLabel(value) {
@@ -471,9 +666,9 @@ async function waitForUniqueVisibleLocator(locator, waitMs) {
   return null;
 }
 
-async function runPrivateOAuth(rule, config, account) {
+async function runOAuthHelper(rule, config, account, phaseArgs = []) {
   try {
-    await execFileAsync(process.execPath, [
+    const result = await execFileAsync(process.execPath, [
       path.join(sourceDirectory, "oauth-login.mjs"),
       rule.origin,
       rule.provider,
@@ -482,7 +677,9 @@ async function runPrivateOAuth(rule, config, account) {
       "--automation-user-data-dir",
       account.automationUserDataDir,
       "--account-id",
-      account.accountId,
+      account.accountKey,
+      ...(Number.isInteger(account.oauthWaitMs) ? ["--wait-ms", String(account.oauthWaitMs)] : []),
+      ...phaseArgs,
       "--private-result",
     ], {
       cwd: rootDirectory,
@@ -491,20 +688,135 @@ async function runPrivateOAuth(rule, config, account) {
       maxBuffer: 1024 * 1024,
       env: process.env,
     });
-    return true;
+    const outcome = loginHelperOutcomeFromStreams(result.stdout, result.stderr);
+    return { succeeded: outcome.succeeded, oauthStage: outcome.oauthStage ?? null };
+  } catch (error) {
+    const fallback = error?.code === "ETIMEDOUT" ? "timeout" : "failed";
+    const outcome = loginHelperOutcomeFromStreams(error?.stdout, error?.stderr, fallback);
+    return {
+      succeeded: false,
+      oauthStage: outcome.oauthStage ?? (fallback === "timeout" ? "timeout" : "helper_failed"),
+    };
+  }
+}
+
+async function runPrivateOAuth(rule, config, account) {
+  if (normalizeReauthProvider(rule.provider, "agentrouter provider") !== "LinuxDO") {
+    return runOAuthHelper(rule, config, account);
+  }
+
+  // LinuxDO recovery is deliberately split into two isolated contexts. The
+  // provider session is established and closed first; only then is the
+  // Agent Router OAuth page opened with the same encrypted browser profile.
+  const providerResult = await runOAuthHelper(rule, config, account, ["--provider-only"]);
+  if (!providerResult.succeeded) return providerResult;
+  return runOAuthHelper(rule, config, account, ["--agent-router-only"]);
+}
+
+async function retryOAuthOperation(rule, config, account, operation) {
+  const attempts = Math.max(1, Math.min(3, Number(account.oauthAttempts) || Number(config.reauthLoginAttempts) || 2));
+  const retryDelayMs = Math.max(
+    500,
+    Math.min(20_000, Number(account.oauthRetryDelayMs) || Number(config.reauthLoginRetryDelayMs) || 3000),
+  );
+  let latest = { succeeded: false, oauthStage: "helper_failed" };
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const current = await operation();
+    if (current.succeeded) return current;
+    latest = {
+      succeeded: false,
+      oauthStage: preferOAuthFailureStage(latest.oauthStage, current.oauthStage),
+    };
+    if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+  }
+  return latest;
+}
+
+async function runProviderOnlyWithRetry(rule, config, account) {
+  const providerResult = await retryOAuthOperation(
+    rule,
+    config,
+    account,
+    () => runOAuthHelper(rule, config, account, ["--provider-only"]),
+  );
+  if (providerResult.succeeded) return providerResult;
+  if (!await runNativeProviderSessionRefresh(config, account)) return providerResult;
+  const refreshedResult = await runOAuthHelper(rule, config, account, ["--provider-only"]);
+  return refreshedResult.succeeded ? refreshedResult : {
+    succeeded: false,
+    oauthStage: preferOAuthFailureStage(providerResult.oauthStage, refreshedResult.oauthStage),
+  };
+}
+
+async function runNativeProviderSessionRefresh(config, account) {
+  const configuredPowerShell = String(config.powershellExecutable ?? "").trim();
+  const systemRoot = String(process.env.SystemRoot ?? "C:\\Windows");
+  const executable = configuredPowerShell || path.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  if (!path.isAbsolute(executable) || !["powershell.exe", "pwsh.exe"].includes(path.basename(executable).toLowerCase())) {
+    return false;
+  }
+  try {
+    const result = await execFileAsync(executable, [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      path.join(rootDirectory, "scripts", "Refresh-AgentRouterProviderSession.ps1"),
+      "-AccountKey",
+      account.accountKey,
+    ], {
+      cwd: rootDirectory,
+      windowsHide: true,
+      timeout: 70_000,
+      maxBuffer: 1024 * 1024,
+      env: process.env,
+    });
+    const lines = String(result.stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    return lines.some((line) => {
+      try { return JSON.parse(line)?.status === "prepared"; } catch { return false; }
+    });
   } catch {
     return false;
   }
 }
 
-async function runPrivateOAuthWithRetry(rule, config, account) {
-  const attempts = Math.max(1, Math.min(3, Number(config.reauthLoginAttempts) || 2));
-  const retryDelayMs = Math.max(500, Math.min(20_000, Number(config.reauthLoginRetryDelayMs) || 3000));
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (await runPrivateOAuth(rule, config, account)) return true;
-    if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+async function runAgentRouterOnlyWithRetry(rule, config, account) {
+  return retryOAuthOperation(
+    rule,
+    config,
+    account,
+    () => runOAuthHelper(rule, config, account, ["--agent-router-only"]),
+  );
+}
+
+export function parseProviderSessionProbe(text) {
+  const lines = String(text ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const line of [...lines].reverse()) {
+    try {
+      const value = JSON.parse(line);
+      if (["valid", "invalid", "unknown", "not_supported"].includes(value?.status)) {
+        return { status: value.status };
+      }
+    } catch { /* ignore browser startup diagnostics */ }
   }
-  return false;
+  return { status: "unknown" };
+}
+
+export function preferOAuthFailureStage(previous, current) {
+  const generic = new Set([null, undefined, "helper_failed"]);
+  if (generic.has(current) && !generic.has(previous)) return previous;
+  return current ?? previous ?? "helper_failed";
+}
+
+async function runPrivateOAuthWithRetry(rule, config, account) {
+  return retryOAuthOperation(rule, config, account, () => runPrivateOAuth(rule, config, account));
 }
 
 async function inspectCurrentLogin(config, rule) {
@@ -541,7 +853,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   }
 
   const statePath = options.statePath ?? rule.statePath ?? defaultStatePath;
-  const stateKey = `${rule.origin}::${rule.accountId}`;
+  const stateKey = `${rule.origin}::${rule.accountKey}`;
   const accountConfig = { ...config, automationUserDataDir: rule.automationUserDataDir };
   const state = await readState(statePath);
   const previous = state.entries?.[stateKey] ?? state.entries?.[rule.origin];
@@ -550,7 +862,11 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   }
   if (previous?.date === date && previous.status === "logged_out") {
     let currentLogin = await inspectCurrentLogin(accountConfig, rule);
-    if (!currentLogin.valid && await runPrivateOAuthWithRetry(rule, accountConfig, rule)) {
+    if (!currentLogin.valid) {
+      const oauthResult = await runPrivateOAuthWithRetry(rule, accountConfig, rule);
+      if (!oauthResult.succeeded) {
+        return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider, oauthResult.oauthStage) };
+      }
       currentLogin = await inspectCurrentLogin(accountConfig, rule);
     }
     if (previous.status === "logged_out" && currentLogin.valid && currentLogin.explicitLoginSuccess) {
@@ -568,7 +884,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     if (currentLogin.valid && currentLogin.explicitLoginSuccess) {
       const refreshed = await readState(statePath);
       await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));
-      return { status: "signed", reason: "閲嶆柊鐧诲綍鍚庣珯鐐圭‘璁ら搴﹀凡鍒拌处" };
+      return { status: "signed", reason: "重新登录后站点确认额度已到账" };
     }
     // A started run may have been interrupted before OAuth login. Continue
     // with a fresh before/after cycle instead of leaving the account stuck.
@@ -577,11 +893,27 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   let beforeSession;
   let before;
   try {
+    const isLinuxDoProvider = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO";
+    if (isLinuxDoProvider) {
+      // The provider-only helper is the single authoritative LinuxDO stage.
+      // It opens one provider context, confirms the session endpoint, and
+      // closes that context before this function can open Agent Router.
+      const providerRecovery = await runProviderOnlyWithRetry(rule, accountConfig, rule);
+      if (!providerRecovery.succeeded) {
+        throw new Error(`${rule.provider} 会话恢复未完成，未退出 Agent Router；请先完成提供方登录`);
+      }
+    }
     beforeSession = await openRulePage(accountConfig, rule);
     before = await readQuota(beforeSession, rule);
     if (await verifyConfiguredProviderBeforeLogout(beforeSession, rule, accountConfig)) {
       throw new Error(`${rule.provider} 登录入口未出现在当前站点登录页，已取消退出`);
     }
+    await dismissConfiguredPreCheckinOverlay(
+      beforeSession.page,
+      target,
+      new URL(beforeSession.page.url()).origin,
+      accountConfig,
+    );
     const accountMenu = await waitForUniqueVisibleLocator(
       beforeSession.page.locator(rule.accountMenuSelector),
       rule.evidenceWaitMs,
@@ -609,8 +941,11 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     await beforeSession?.context.close().catch(() => {});
   }
 
-  if (!await runPrivateOAuthWithRetry(rule, accountConfig, rule)) {
-    return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider) };
+  const oauthResult = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO"
+    ? await runAgentRouterOnlyWithRetry(rule, accountConfig, rule)
+    : await runPrivateOAuthWithRetry(rule, accountConfig, rule);
+  if (!oauthResult.succeeded) {
+    return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider, oauthResult.oauthStage) };
   }
 
   let afterSession;
@@ -638,24 +973,42 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
 export async function runConfiguredReauthCheckin(target, config, options = {}) {
   const accounts = getConfiguredReauthAccounts(target, config);
   if (accounts.length === 0) return null;
-  if (options.accountId) {
-    const account = accounts.find((candidate) => candidate.accountId === options.accountId);
-    if (!account) throw new Error(`Unknown reauth accountId for ${target.origin}: ${options.accountId}`);
+  if (options.onAccountResult != null && typeof options.onAccountResult !== "function") {
+    throw new TypeError("onAccountResult must be a function");
+  }
+  const callbackAccounts = accounts.map((account) => withReauthAccountMetadata({}, account));
+  if (options.accountKey || options.accountId) {
+    const account = selectConfiguredReauthAccount(accounts, options, target.origin);
     const result = await runConfiguredReauthCheckinForAccount(target, config, account, options);
-    return { ...result, accountId: account.accountId, provider: account.provider };
+    const accountResult = withReauthAccountMetadata(result, account);
+    if (options.onAccountResult) {
+      await options.onAccountResult(
+        { ...accountResult },
+        [{ ...accountResult }],
+        callbackAccounts.map((candidate) => ({ ...candidate })),
+      );
+    }
+    return accountResult;
   }
   const accountResults = [];
   for (const account of accounts) {
+    let accountResult;
     try {
       const result = await runConfiguredReauthCheckinForAccount(target, config, account, options);
-      accountResults.push({ ...result, accountId: account.accountId, provider: account.provider });
+      accountResult = withReauthAccountMetadata(result, account);
     } catch (error) {
-      accountResults.push({
+      accountResult = withReauthAccountMetadata({
         status: "needs_attention",
         reason: safeErrorMessage(error),
-        accountId: account.accountId,
-        provider: account.provider,
-      });
+      }, account);
+    }
+    accountResults.push(accountResult);
+    if (options.onAccountResult) {
+      await options.onAccountResult(
+        { ...accountResult },
+        accountResults.map((completed) => ({ ...completed })),
+        callbackAccounts.map((candidate) => ({ ...candidate })),
+      );
     }
   }
   return aggregateReauthResults(accountResults);

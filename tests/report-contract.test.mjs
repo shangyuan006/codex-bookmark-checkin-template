@@ -9,25 +9,34 @@ import { powershellExecutable } from "./helpers/powershell.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const logsRoot = path.join(root, "logs");
+const tmpRoot = path.join(root, "tmp");
 const reporter = path.join(root, "scripts", "Submit-UnifiedCheckinReport.ps1");
 
 async function previewReport(report, runnerStatus = "completed") {
-  await fs.mkdir(logsRoot, { recursive: true });
-  const directory = await fs.mkdtemp(path.join(logsRoot, "report-contract-test-"));
-  const reportPath = path.join(directory, "report.json");
+  await fs.mkdir(tmpRoot, { recursive: true });
+  const fixtureRoot = await fs.mkdtemp(path.join(tmpRoot, "report-contract-test-"));
+  const scriptsDirectory = path.join(fixtureRoot, "scripts");
+  const configDirectory = path.join(fixtureRoot, "config");
+  const reportDirectory = path.join(fixtureRoot, "logs", "run");
+  const fixtureReporter = path.join(scriptsDirectory, "Submit-UnifiedCheckinReport.ps1");
+  const reportPath = path.join(reportDirectory, "report.json");
   try {
+    await fs.mkdir(scriptsDirectory, { recursive: true });
+    await fs.mkdir(configDirectory, { recursive: true });
+    await fs.mkdir(reportDirectory, { recursive: true });
+    await fs.copyFile(reporter, fixtureReporter);
+    await fs.writeFile(path.join(configDirectory, "defaults.json"), JSON.stringify({ notification: { mode: "none" } }), "utf8");
     await fs.writeFile(reportPath, JSON.stringify(report), "utf8");
     const { stdout } = await execFileAsync(powershellExecutable, [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-      "-File", reporter,
+      "-File", fixtureReporter,
       "-RunnerStatus", runnerStatus,
       "-ReportPath", reportPath,
       "-Preview",
     ], { cwd: root, encoding: "utf8" });
     return JSON.parse(stdout.trim());
   } finally {
-    await fs.rm(directory, { recursive: true, force: true });
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
   }
 }
 
@@ -165,4 +174,165 @@ test("延迟重试按原因区分登录恢复和安全验证", async () => {
   assert.equal(report.status, "skipped");
   assert.match(report.summary, /login\.example\.test：登录恢复未成功，计划/);
   assert.match(report.summary, /challenge\.example\.test：验证未自动通过，计划/);
+});
+
+test("嵌套账号逐项进入摘要但不暴露权威账号和私密结果字段", async () => {
+  const report = await previewReport({
+    runId: "20260723-120005",
+    runState: "final",
+    plannedTotal: 1,
+    processedTotal: 1,
+    isComplete: true,
+    results: [{
+      origin: "https://router.example.test/checkin/private?token=NeverShow",
+      status: "signed",
+      accountResults: [
+        {
+          accountLabel: "GitHub 主账号", provider: "GitHub", accountKey: "github",
+          accountId: "authoritative-github-id", status: "signed",
+          reason: "signed at https://router.example.test/private/path with balance=98765 token=SecretValue",
+          balance: 98765,
+        },
+        {
+          provider: "LinuxDO", accountKey: "linuxdo", accountId: "authoritative-linuxdo-id",
+          status: "login_required", reason: "account authoritative-linuxdo-id needs login",
+        },
+        {
+          accountKey: "backup", status: "deferred", retryCause: "managed_challenge_timeout",
+          reason: "https://router.example.test/hidden/challenge timed out",
+        },
+      ],
+    }],
+  });
+
+  assert.equal(report.status, "needs_attention");
+  assert.equal(report.siteCount, 1);
+  assert.equal(report.problemCount, 1);
+  assert.equal(report.plannedTotal, 1);
+  assert.match(report.summary, /需关注 1 个站点的账号明细：2 个账号未确认/);
+  assert.match(report.summary, /账号明细：/);
+  assert.match(report.summary, /router\.example\.test \/ GitHub：signed（签到成功）/);
+  assert.match(report.summary, /router\.example\.test \/ LinuxDO：login_required（需要重新登录）/);
+  assert.match(report.summary, /router\.example\.test \/ 账号 3：deferred（验证未自动通过，等待重试）/);
+  assert.doesNotMatch(report.summary, /GitHub 主账号|backup/);
+  assert.doesNotMatch(report.summary, /authoritative-|98765|NeverShow|SecretValue|\/private|\/hidden|balance/i);
+});
+
+test("嵌套账号状态改变会更新事件键且账号顺序不影响哈希", async () => {
+  const base = {
+    runId: "20260723-120006",
+    runState: "final",
+    plannedTotal: 1,
+    processedTotal: 1,
+    isComplete: true,
+  };
+  const github = { accountLabel: "GitHub", provider: "GitHub", accountKey: "github", status: "signed" };
+  const linuxdo = { accountLabel: "LinuxDO", provider: "LinuxDO", accountKey: "linuxdo", status: "already_signed" };
+  const initial = await previewReport({
+    ...base,
+    results: [{ origin: "https://router.example.test", status: "signed", accountResults: [github, linuxdo] }],
+  });
+  const reordered = await previewReport({
+    ...base,
+    results: [{ origin: "https://router.example.test", status: "signed", accountResults: [linuxdo, github] }],
+  });
+  const changed = await previewReport({
+    ...base,
+    results: [{
+      origin: "https://router.example.test",
+      status: "signed",
+      accountResults: [github, { ...linuxdo, status: "login_required", reason: "private detail" }],
+    }],
+  });
+  const reasonChanged = await previewReport({
+    ...base,
+    results: [{
+      origin: "https://router.example.test",
+      status: "signed",
+      accountResults: [github, { ...linuxdo, reason: "a different safe operational reason" }],
+    }],
+  });
+  const anonymousOrderA = await previewReport({
+    ...base,
+    results: [{
+      origin: "https://router.example.test", status: "signed",
+      accountResults: [{ status: "signed" }, { status: "already_signed" }],
+    }],
+  });
+  const anonymousOrderB = await previewReport({
+    ...base,
+    results: [{
+      origin: "https://router.example.test", status: "signed",
+      accountResults: [{ status: "already_signed" }, { status: "signed" }],
+    }],
+  });
+
+  assert.equal(initial.eventKey, reordered.eventKey);
+  assert.equal(anonymousOrderA.eventKey, anonymousOrderB.eventKey);
+  assert.notEqual(initial.eventKey, changed.eventKey);
+  assert.notEqual(initial.eventKey, reasonChanged.eventKey);
+  assert.equal(changed.status, "needs_attention");
+  assert.equal(changed.siteCount, 1);
+});
+
+test("父级已签到但账号超时会 fail closed 且不展平站点计数", async () => {
+  const report = await previewReport({
+    runId: "20260723-120007",
+    runState: "final",
+    plannedTotal: 1,
+    processedTotal: 1,
+    isComplete: true,
+    selectedOrigins: ["https://router.example.test"],
+    selectedTotal: 1,
+    selectedProcessedTotal: 1,
+    results: [{
+      origin: "https://router.example.test",
+      status: "already_signed",
+      accountResults: [
+        { accountLabel: "private primary", provider: "GitHub", status: "already_signed" },
+        { accountLabel: "private secondary", provider: "LinuxDO", status: "managed_challenge_timeout", reason: "private timeout detail" },
+      ],
+    }],
+  });
+
+  assert.equal(report.status, "needs_attention");
+  assert.equal(report.siteCount, 1);
+  assert.equal(report.problemCount, 1);
+  assert.equal(report.selectedSiteCount, 1);
+  assert.equal(report.selectedProblemCount, 1);
+  assert.deepEqual(report.selectedSummary, { needs_attention: 1 });
+  assert.match(report.summary, /0 个签到正常/);
+  assert.match(report.summary, /LinuxDO：managed_challenge_timeout（验证超时）/);
+  assert.doesNotMatch(report.summary, /private primary|private secondary/);
+});
+
+test("损坏的嵌套账号条目同样 fail closed", async () => {
+  const report = await previewReport({
+    runId: "20260723-120008",
+    runState: "final",
+    plannedTotal: 1,
+    processedTotal: 1,
+    isComplete: true,
+    results: [{ origin: "https://router.example.test", status: "signed", accountResults: [null] }],
+  });
+
+  assert.equal(report.status, "needs_attention");
+  assert.equal(report.problemCount, 1);
+  assert.match(report.summary, /需关注 1 个站点的账号明细：1 个账号未确认/);
+  assert.match(report.summary, /账号 1：unknown（结果未确认）/);
+});
+
+test("空的嵌套账号数组同样 fail closed", async () => {
+  const report = await previewReport({
+    runId: "20260723-120009",
+    runState: "final",
+    plannedTotal: 1,
+    processedTotal: 1,
+    isComplete: true,
+    results: [{ origin: "https://router.example.test", status: "signed", accountResults: [] }],
+  });
+
+  assert.equal(report.status, "needs_attention");
+  assert.equal(report.problemCount, 1);
+  assert.match(report.summary, /需关注 1 个站点的账号明细：1 个账号未确认/);
 });

@@ -44,6 +44,129 @@ function Compress-Text([object]$Value, [int]$MaximumLength = 120) {
     return $text
 }
 
+function Protect-AccountIdentityText([object]$Value, [int]$MaximumLength = 48) {
+    $text = (Remove-SensitiveText $Value).Trim()
+    if (-not $text) { return '' }
+    $text = [regex]::Replace($text, '(?i)\bhttps?://[^\s,;，；]+', {
+        param($match)
+        try { return ([uri]$match.Value).GetLeftPart([System.UriPartial]::Authority) }
+        catch { return '[REDACTED]' }
+    })
+    $text = $text -replace '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '[REDACTED]'
+    $text = ($text -replace '[\r\n\t]+', ' ' -replace '\s{2,}', ' ').Trim()
+    if (-not $text -or $text.Contains('[REDACTED]')) { return '' }
+    if ($text.Length -gt $MaximumLength) { return $text.Substring(0, $MaximumLength) + '…' }
+    return $text
+}
+
+function Get-AccountStatus([object]$AccountResult) {
+    $status = [string]$AccountResult.status
+    if ($status -in @(
+        'signed', 'already_signed', 'deferred', 'login_required', 'interactive_challenge',
+        'managed_challenge_timeout', 'needs_attention', 'not_available', 'no_action',
+        'visited', 'clicked', 'error', 'failed'
+    )) { return $status }
+    return 'unknown'
+}
+
+function Get-AccountReasonLabel([object]$AccountResult) {
+    $status = Get-AccountStatus $AccountResult
+    switch ($status) {
+        'signed' { return '签到成功' }
+        'already_signed' { return '今日已签到' }
+        'deferred' {
+            switch ([string]$AccountResult.retryCause) {
+                'login_required' { return '登录恢复未成功，等待重试' }
+                'managed_challenge_timeout' { return '验证未自动通过，等待重试' }
+                default { return '等待计划重试' }
+            }
+        }
+        'login_required' { return '需要重新登录' }
+        'interactive_challenge' { return '需要人工验证' }
+        'managed_challenge_timeout' { return '验证超时' }
+        'needs_attention' { return '需要人工处理' }
+        'not_available' { return '未开放签到' }
+        'no_action' { return '未找到签到入口' }
+        'visited' { return '结果未确认' }
+        'clicked' { return '结果未确认' }
+        'error' { return '执行失败' }
+        'failed' { return '执行失败' }
+        default { return '结果未确认' }
+    }
+}
+
+function Get-AccountReasonFingerprint([object]$AccountResult) {
+    $text = Remove-SensitiveText $AccountResult.reason
+    $text = [regex]::Replace($text, '(?i)\bhttps?://[^\s,;，；]+', {
+        param($match)
+        try { return ([uri]$match.Value).GetLeftPart([System.UriPartial]::Authority) }
+        catch { return '[REDACTED]' }
+    })
+    $text = $text -replace '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '[REDACTED]'
+    $text = $text -replace '(?i)\b(balance|quota|credit|amount)\b[^,;，；。.!?]{0,80}', '$1=[REDACTED]'
+    $text = $text -replace '(余额|额度|积分)[^,;，；。.!?]{0,80}', '$1=[REDACTED]'
+    foreach ($propertyName in @('accountId', 'authoritativeAccountId', 'siteAccountId')) {
+        $accountId = [string]$AccountResult.$propertyName
+        if ($accountId) { $text = [regex]::Replace($text, [regex]::Escape($accountId), '[REDACTED]', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) }
+    }
+    $text = ($text -replace '[\r\n\t]+', ' ' -replace '\s{2,}', ' ').Trim()
+    return (Get-Sha256Hex ([System.Text.Encoding]::UTF8.GetBytes($text))).Substring(0, 16)
+}
+
+function Get-AccountDisplayLabel([object]$AccountResult, [int]$Index) {
+    $provider = (Protect-AccountIdentityText $AccountResult.provider).ToLowerInvariant() -replace '[\s._-]+', ''
+    switch -Regex ($provider) {
+        '^github$' { return 'GitHub' }
+        '^linuxdo$' { return 'LinuxDO' }
+        '^gitlab$' { return 'GitLab' }
+        '^gitee$' { return 'Gitee' }
+        '^google$' { return 'Google' }
+        '^discord$' { return 'Discord' }
+    }
+    return "账号 $Index"
+}
+
+function Get-AccountStateParts([object]$Result) {
+    $parts = @()
+    $accountResultsProperty = $Result.PSObject.Properties['accountResults']
+    if ($null -eq $accountResultsProperty) { return @() }
+    if ($null -eq $accountResultsProperty.Value) { return @('||=unknown:结果未确认:malformed') }
+    $index = 0
+    foreach ($accountResult in @($accountResultsProperty.Value)) {
+        $index++
+        if ($null -eq $accountResult) {
+            $parts += '||=unknown:结果未确认:malformed'
+            continue
+        }
+        $label = Protect-AccountIdentityText $accountResult.accountLabel
+        $provider = Protect-AccountIdentityText $accountResult.provider
+        $accountKey = Protect-AccountIdentityText $accountResult.accountKey
+        $status = Get-AccountStatus $accountResult
+        $reason = Get-AccountReasonLabel $accountResult
+        $reasonFingerprint = Get-AccountReasonFingerprint $accountResult
+        $parts += "$label|$provider|$accountKey=$status`:$reason`:$reasonFingerprint"
+    }
+    return @($parts | Sort-Object)
+}
+
+function Get-NestedAccountConflictCount([object]$Result) {
+    $accountResultsProperty = $Result.PSObject.Properties['accountResults']
+    if ($null -eq $accountResultsProperty) { return 0 }
+    if ($null -eq $accountResultsProperty.Value) { return 1 }
+    $accountResults = @($accountResultsProperty.Value)
+    if ($accountResults.Count -eq 0) { return 1 }
+    $count = 0
+    foreach ($accountResult in $accountResults) {
+        if ($null -eq $accountResult -or (Get-AccountStatus $accountResult) -notin @('signed', 'already_signed')) { $count++ }
+    }
+    return $count
+}
+
+function Test-ResultHasNestedAccountConflict([object]$Result) {
+    if ([string]$Result.status -notin @('signed', 'already_signed')) { return $false }
+    return (Get-NestedAccountConflictCount $Result) -gt 0
+}
+
 if ($ReportPath) {
     $resolvedReport = (Resolve-Path -LiteralPath $ReportPath).Path
     $logsRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'logs'))
@@ -62,20 +185,24 @@ if ($null -ne $report -and $null -ne $report.selectedOrigins) {
     $selectedOriginList = @($report.selectedOrigins | ForEach-Object { [string]$_ } | Where-Object { $_ })
 }
 $hasSelectedScope = $selectedOriginList.Count -gt 0
-$selectedResults = if ($hasSelectedScope) {
+$selectedResults = @(if ($hasSelectedScope) {
     @($results | Where-Object { $selectedOriginList -contains ([string]$_.origin) })
 }
-else { @($results) }
+else { @($results) })
 $selectedTotal = if ($null -ne $report -and $null -ne $report.selectedTotal) { [int]$report.selectedTotal } elseif ($hasSelectedScope) { $selectedOriginList.Count } else { $results.Count }
 $selectedProcessedTotal = if ($null -ne $report -and $null -ne $report.selectedProcessedTotal) { [int]$report.selectedProcessedTotal } else { $selectedResults.Count }
-$selectedStatuses = @($selectedResults | ForEach-Object { [string]$_.status })
+$selectedStatuses = @($selectedResults | ForEach-Object {
+    if (Test-ResultHasNestedAccountConflict $_) { 'needs_attention' } else { [string]$_.status }
+})
 $selectedSummary = [ordered]@{}
 foreach ($selectedStatus in @($selectedStatuses | Sort-Object -Unique)) {
     $selectedSummary[$selectedStatus] = @($selectedStatuses | Where-Object { $_ -eq $selectedStatus }).Count
 }
 $selectedDone = @($selectedStatuses | Where-Object { $_ -in @('signed', 'already_signed') }).Count
 $selectedNotAvailable = @($selectedStatuses | Where-Object { $_ -eq 'not_available' }).Count
-$selectedProblems = @($selectedResults | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+$selectedProblems = @($selectedResults | Where-Object {
+    $_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_)
+})
 $isTargetedReport = $hasSelectedScope -and $plannedTotal -gt 0 -and $selectedTotal -lt $plannedTotal
 $isCompleteFinalReport = $null -ne $report `
     -and $reportRunState -eq 'final' `
@@ -84,12 +211,18 @@ $isCompleteFinalReport = $null -ne $report `
     -and $processedTotal -ge $plannedTotal `
     -and $results.Count -ge $plannedTotal
 $isPartialReport = $null -ne $report -and -not $isCompleteFinalReport
-$done = @($statuses | Where-Object { $_ -in @('signed', 'already_signed') }).Count
+$nestedConflictResults = @($results | Where-Object { Test-ResultHasNestedAccountConflict $_ })
+$done = @($results | Where-Object {
+    $_.status -in @('signed', 'already_signed') -and -not (Test-ResultHasNestedAccountConflict $_)
+}).Count
 $notAvailable = @($statuses | Where-Object { $_ -eq 'not_available' }).Count
-$problems = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
-$attentionCount = @($problems | Where-Object { $_.status -in @('interactive_challenge', 'login_required', 'needs_attention') }).Count
-$timeoutCount = @($problems | Where-Object { $_.status -eq 'managed_challenge_timeout' }).Count
-$hardFailureCount = @($problems | Where-Object { $_.status -in @('error', 'failed') }).Count
+$parentProblems = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+$problems = @($results | Where-Object {
+    $_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_)
+})
+$attentionCount = @($parentProblems | Where-Object { $_.status -in @('interactive_challenge', 'login_required', 'needs_attention') }).Count + $nestedConflictResults.Count
+$timeoutCount = @($parentProblems | Where-Object { $_.status -eq 'managed_challenge_timeout' }).Count
+$hardFailureCount = @($parentProblems | Where-Object { $_.status -in @('error', 'failed') }).Count
 
 if ($RunnerStatus -eq 'timeout') { $status = 'timeout' }
 elseif ($isPartialReport) { $status = 'unconfirmed' }
@@ -117,9 +250,9 @@ $summary = if ($results.Count -gt 0 -or ($null -ne $report -and $plannedTotal -g
     }
 }
 else { Compress-Text $RunnerMessage 160 }
-if ($problems.Count -gt 0) {
-    $summary += "`n需关注 $($problems.Count) 个："
-    $brief = @($problems | ForEach-Object {
+if ($parentProblems.Count -gt 0) {
+    $summary += "`n需关注 $($parentProblems.Count) 个："
+    $brief = @($parentProblems | ForEach-Object {
         $problem = $_
         $hostName = try { ([uri]$problem.origin).DnsSafeHost } catch { Compress-Text $problem.origin 30 }
         $reason = switch ([string]$problem.status) {
@@ -144,6 +277,40 @@ if ($problems.Count -gt 0) {
     }) -join "`n"
     $summary += "`n$brief"
 }
+if ($nestedConflictResults.Count -gt 0) {
+    $nestedConflictAccountCount = 0
+    foreach ($nestedConflictResult in $nestedConflictResults) {
+        $nestedConflictAccountCount += Get-NestedAccountConflictCount $nestedConflictResult
+    }
+    $summary += "`n需关注 $($nestedConflictResults.Count) 个站点的账号明细：$nestedConflictAccountCount 个账号未确认"
+}
+$accountDetailLines = @($results | Sort-Object origin | ForEach-Object {
+    $result = $_
+    $hostName = try { ([uri]$result.origin).DnsSafeHost } catch { '站点' }
+    $accountResultsProperty = $result.PSObject.Properties['accountResults']
+    if ($null -ne $accountResultsProperty) {
+        if ($null -eq $accountResultsProperty.Value) {
+            "- $hostName / 账号 1：unknown（结果未确认）"
+        }
+        else {
+            $accountIndex = 0
+            foreach ($accountResult in @($accountResultsProperty.Value)) {
+                $accountIndex++
+                if ($null -eq $accountResult) {
+                    "- $hostName / 账号 $accountIndex：unknown（结果未确认）"
+                    continue
+                }
+                $accountLabel = Get-AccountDisplayLabel $accountResult $accountIndex
+                $accountStatus = Get-AccountStatus $accountResult
+                $accountReason = Get-AccountReasonLabel $accountResult
+                "- $hostName / $accountLabel：$accountStatus（$accountReason）"
+            }
+        }
+    }
+})
+if ($accountDetailLines.Count -gt 0) {
+    $summary += "`n账号明细：`n$($accountDetailLines -join "`n")"
+}
 if ($summary.Length -gt 950) { $summary = $summary.Substring(0, 947) + "…`n（其余站点请查看本地日志）" }
 $summary = Remove-SensitiveText $summary
 
@@ -154,10 +321,14 @@ $name = if ($notification.name) { [string]$notification.name } else { '浏览器
 $source = if ($notification.source) { [string]$notification.source } else { 'browser-codex' }
 
 $stateParts = @($results | Sort-Object origin | ForEach-Object {
-    "$([string]$_.origin)=$([string]$_.status):$([string]$_.retryCause)"
+    $result = $_
+    "$([string]$result.origin)=$([string]$result.status):$([string]$result.retryCause)"
+    Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
 })
 $selectedStateParts = @($selectedResults | Sort-Object origin | ForEach-Object {
-    "$([string]$_.origin)=$([string]$_.status):$([string]$_.retryCause)"
+    $result = $_
+    "$([string]$result.origin)=$([string]$result.status):$([string]$result.retryCause)"
+    Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
 })
 $scopeMaterial = if ($hasSelectedScope) { "|selected=$selectedTotal/$selectedProcessedTotal|$($selectedOriginList -join ',')|$($selectedStateParts -join '|')" } else { '' }
 $stateMaterial = if ($stateParts.Count -gt 0) { "$status|$reportRunState|$($stateParts -join '|')$scopeMaterial" } else { "$status|$RunnerStatus$scopeMaterial" }

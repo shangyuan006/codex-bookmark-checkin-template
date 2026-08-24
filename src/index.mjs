@@ -3,9 +3,17 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { readBookmarkPlan, publicBookmarkReport } from "./bookmarks.mjs";
+import { publicBookmarkReport } from "./bookmarks.mjs";
 import { launchAutomationContext, processTarget } from "./browser.mjs";
-import { getConfiguredReauthAccounts, getConfiguredReauthRule, runConfiguredReauthCheckin } from "./reauth-checkin.mjs";
+import { readEffectiveBookmarkPlan } from "./effective-bookmark-plan.mjs";
+import {
+  aggregateReauthResults,
+  getConfiguredReauthAccounts,
+  getConfiguredReauthRule,
+  mergeSelectedReauthAccountResult,
+  runConfiguredReauthCheckin,
+} from "./reauth-checkin.mjs";
+import { buildCompletedReauthProgressResult, buildReauthProgressResult } from "./reauth-progress.mjs";
 import {
   cleanupOldLogs,
   createRunLog,
@@ -13,6 +21,8 @@ import {
   summarizeResults,
   writeRunResult,
 } from "./logger.mjs";
+import { loginHelperOutcome, loginHelperOutcomeFromStreams, resolveLoginRecoveryUrl } from "./login-recovery.mjs";
+import { assertManualVerificationExecution } from "./manual-verification-guard.mjs";
 import { atomicWriteJson, ensurePrivateDirectory, safeErrorMessage } from "./security.mjs";
 import { acquireRunLock, releaseRunLock } from "./run-lock.mjs";
 import {
@@ -28,6 +38,7 @@ import {
   advanceAttemptedDeferredRetries,
   deferUnresolvedLogin,
   isCurrentLocalRunId,
+  localRunDate,
   isRetryEligible,
   isResumeRetryEligible,
   nextDeferredRetryAt,
@@ -51,6 +62,11 @@ const limitIndex = process.argv.indexOf("--limit");
 const offsetIndex = process.argv.indexOf("--offset");
 const originsIndex = process.argv.indexOf("--origins");
 const resumeIndex = process.argv.indexOf("--resume-report");
+const consumeManualVerification = process.argv.includes("--consume-manual-verification");
+const reauthAccountKeyIndex = process.argv.indexOf("--reauth-account-key");
+const reauthAccountKey = reauthAccountKeyIndex >= 0
+  ? String(process.argv[reauthAccountKeyIndex + 1] ?? "").trim() || null
+  : null;
 const limit = limitIndex >= 0 ? Math.max(1, Number.parseInt(process.argv[limitIndex + 1], 10) || 1) : null;
 const offset = offsetIndex >= 0 ? Math.max(0, Number.parseInt(process.argv[offsetIndex + 1], 10) || 0) : 0;
 let selectedOrigins = originsIndex >= 0
@@ -58,38 +74,32 @@ let selectedOrigins = originsIndex >= 0
   : null;
 const requestedResumePath = resumeIndex >= 0 ? String(process.argv[resumeIndex + 1] ?? "").trim() : null;
 const lockPath = path.join(rootDirectory, "tmp", "run.lock");
+const manualVerificationPath = path.join(rootDirectory, "tmp", "manual-verification.json");
 const nativeWafPreflightPath = path.join(rootDirectory, "tmp", "native-waf-preflight.json");
 const lastValidBookmarkPlanPath = path.join(rootDirectory, "data", "last-valid-bookmark-plan.json");
 function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
-async function validateBookmarkPlan(plan) {
-  const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);
-  let lastValid = null;
-  try { lastValid = JSON.parse(await fs.readFile(lastValidBookmarkPlanPath, "utf8")); } catch { /* first run */ }
-  const previousCount = Number(lastValid?.targetCount) || 0;
-  const suddenDrop = previousCount >= minimumTargets && plan.targetCount < Math.ceil(previousCount * 0.5);
-  if (plan.targetCount < minimumTargets || suddenDrop) {
-    throw new Error(`书签目标异常：当前 ${plan.targetCount} 个，上次 ${previousCount || "无记录"} 个；拒绝生成空签到结果`);
-  }
-  await atomicWriteJson(lastValidBookmarkPlanPath, publicBookmarkReport(plan));
+if (!dryRun && !listPreflightTargets && !reauthAccountKey) {
+  const manualVerification = await fs.readFile(manualVerificationPath, "utf8")
+    .then(JSON.parse)
+    .catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+  assertManualVerificationExecution(manualVerification, {
+    consume: consumeManualVerification,
+    resumeRequested: Boolean(requestedResumePath),
+    selectedOrigins,
+    runDate: localRunDate(),
+  });
 }
 
 async function readValidatedBookmarkPlan() {
-  const candidates = [config.bookmarksPath, `${config.bookmarksPath}.bak`];
-  const failures = [];
-  for (let index = 0; index < candidates.length; index += 1) {
-    const candidatePath = candidates[index];
-    try {
-      const plan = await readBookmarkPlan(candidatePath, config);
-      await validateBookmarkPlan(plan);
-      return { ...plan, recoveredFromBackup: index > 0 };
-    } catch (error) {
-      failures.push(`${path.basename(candidatePath)}：${error.message}`);
-    }
-  }
-  throw new Error(`无法读取有效签到书签：${failures.join("；")}`);
+  const plan = await readEffectiveBookmarkPlan(config.bookmarksPath, config, lastValidBookmarkPlanPath);
+  await atomicWriteJson(lastValidBookmarkPlanPath, publicBookmarkReport(plan));
+  return plan;
 }
 
 async function readFreshNativeWafPreflight() {
@@ -178,31 +188,53 @@ try {
     const plannedTotal = preferredTargets.length;
     const logicalCompletions = new Map();
     const reauthResults = new Map();
+    const reauthProgressResults = new Map();
+    const completedReauthProgressResults = new Map();
 
-    const mergedProgressResults = () => {
-      if (!resumeBase) return [...results];
+    const mergedProgressResults = (includeReauthProgress = true) => {
       const currentByOrigin = new Map(results.map((result) => [result.origin, result]));
-      const previousByOrigin = new Map(resumeBase.results.map((result) => [result.origin, result]));
+      const previousByOrigin = new Map((resumeBase?.results ?? []).map((result) => [result.origin, result]));
       return preferredTargets
-        .map((target) => currentByOrigin.get(target.origin) ?? previousByOrigin.get(target.origin))
+        .map((target) => currentByOrigin.get(target.origin)
+          ?? completedReauthProgressResults.get(target.origin)
+          ?? (includeReauthProgress ? reauthProgressResults.get(target.origin) : null)
+          ?? previousByOrigin.get(target.origin))
+        .filter(Boolean);
+    };
+
+    const selectedProgressResults = () => {
+      const currentByOrigin = new Map(results.map((result) => [result.origin, result]));
+      return selectedTargets
+        .map((target) => currentByOrigin.get(target.origin)
+          ?? completedReauthProgressResults.get(target.origin)
+          ?? reauthProgressResults.get(target.origin))
+        .filter(Boolean);
+    };
+
+    const selectedCompletedProgressResults = () => {
+      const currentByOrigin = new Map(results.map((result) => [result.origin, result]));
+      return selectedTargets
+        .map((target) => currentByOrigin.get(target.origin) ?? completedReauthProgressResults.get(target.origin))
         .filter(Boolean);
     };
 
     const writeProgress = async (phase, details = {}) => {
       const progressResults = mergedProgressResults();
+      const completedProgressResults = mergedProgressResults(false);
+      const completedSelectedResults = selectedCompletedProgressResults();
       await atomicWriteJson(path.join(runLog.directory, "progress.json"), sanitizeForPersistence({
         runId: runLog.runId,
         runState: "in_progress",
         isComplete: false,
         phase,
         plannedTotal,
-        processedTotal: progressResults.length,
-        completed: progressResults.length,
+        processedTotal: completedProgressResults.length,
+        completed: completedProgressResults.length,
         total: plannedTotal,
         selectedOrigins: selectedOriginList,
         selectedTotal: selectedTargets.length,
-        selectedProcessedTotal: results.length,
-        selectedResults: [...results],
+        selectedProcessedTotal: completedSelectedResults.length,
+        selectedResults: selectedProgressResults(),
         updatedAt: new Date().toISOString(),
         ...details,
         results: progressResults,
@@ -216,7 +248,49 @@ try {
       const accountCount = getConfiguredReauthAccounts(target, config).length;
       console.log(`[reauth ${index + 1}/${configuredReauthTargets.length}] ${target.origin} (${accountCount} isolated accounts)`);
       try {
-        reauthResults.set(target.origin, await runConfiguredReauthCheckin(target, config));
+        const startedAt = Date.now();
+        const runOptions = reauthAccountKey
+          ? { accountKey: reauthAccountKey }
+          : { onAccountResult: async (_accountResult, completedResults, accounts) => {
+            if (completedResults.length === accounts.length) {
+              const aggregate = aggregateReauthResults(completedResults);
+              completedReauthProgressResults.set(target.origin, buildCompletedReauthProgressResult(
+                target,
+                aggregate,
+                accounts.length,
+                Date.now() - startedAt,
+              ));
+              reauthProgressResults.delete(target.origin);
+            } else {
+              reauthProgressResults.set(target.origin, buildReauthProgressResult(
+                target,
+                completedResults,
+                accounts.length,
+              ));
+            }
+            await writeProgress("reauth_account", {
+              activeOrigin: target.origin,
+              activeAccountCount: accounts.length,
+              activeCompletedAccountCount: completedResults.length,
+            });
+          } };
+        const selectedAccountResult = await runConfiguredReauthCheckin(target, config, runOptions);
+        const result = reauthAccountKey
+          ? mergeSelectedReauthAccountResult(
+            getConfiguredReauthAccounts(target, config),
+            resumeBase?.results?.find((entry) => entry.origin === target.origin),
+            selectedAccountResult,
+          )
+          : selectedAccountResult;
+        reauthResults.set(target.origin, result);
+        completedReauthProgressResults.set(target.origin, buildCompletedReauthProgressResult(
+          target,
+          result,
+          accountCount,
+          Date.now() - startedAt,
+        ));
+        reauthProgressResults.delete(target.origin);
+        await writeProgress("reauth_complete");
       } catch (error) {
         reauthResults.set(target.origin, { status: "needs_attention", reason: safeErrorMessage(error) });
       }
@@ -269,6 +343,8 @@ try {
           folderNames: target.folderNames,
           ...targetResult,
         });
+        reauthProgressResults.delete(target.origin);
+        completedReauthProgressResults.delete(target.origin);
         await writeProgress("checkin");
       }
     } finally {
@@ -291,12 +367,17 @@ try {
         if (current.status !== "login_required") continue;
         const target = selectedTargets[resultIndex];
         const provider = config.automaticOAuthProviders?.[current.origin];
+        const savedLoginUrl = resolveLoginRecoveryUrl(
+          current.origin,
+          config.savedLoginUrls?.[current.origin],
+          current.url,
+        );
         const methods = [];
         if ((config.protectedCredentialOrigins ?? []).includes(current.origin)) {
           methods.push({
             method: "protected_credential",
             executable: config.powershellExecutable || "pwsh.exe",
-            args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-ProtectedLogin.ps1"), "-Origin", current.origin, "-LoginUrl", current.url ?? `${current.origin}/login`],
+            args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-ProtectedLogin.ps1"), "-Origin", current.origin, "-LoginUrl", savedLoginUrl],
           });
         }
         if (provider) methods.push({ method: "oauth", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, provider, "--private-result"] });
@@ -307,29 +388,39 @@ try {
         methods.push({
           method: "saved_password",
           executable: process.execPath,
-          args: [path.join(sourceDirectory, "saved-password-login.mjs"), current.origin, current.url ?? ""],
+          args: [path.join(sourceDirectory, "saved-password-login.mjs"), current.origin, savedLoginUrl],
         });
         methods.push({
           method: "native_saved_password",
           executable: config.powershellExecutable || "pwsh.exe",
-          args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-NativeLogin.ps1"), "-Origin", current.origin, "-LoginUrl", current.url ?? `${current.origin}/login`],
+          args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-NativeLogin.ps1"), "-Origin", current.origin, "-LoginUrl", savedLoginUrl],
         });
 
         const attempts = [];
         let succeeded = false;
         for (const method of methods) {
           try {
-            await execFileAsync(method.executable, method.args, {
+            const helperOutput = await execFileAsync(method.executable, method.args, {
               cwd: rootDirectory,
               windowsHide: true,
               timeout: 180000,
               maxBuffer: 1024 * 1024,
             });
-            attempts.push({ method: method.method, succeeded: true });
-            succeeded = true;
-            break;
-          } catch {
-            attempts.push({ method: method.method, succeeded: false });
+            const outcome = loginHelperOutcomeFromStreams(helperOutput.stdout, helperOutput.stderr);
+            attempts.push({ method: method.method, ...outcome });
+            if (outcome.succeeded) {
+              succeeded = true;
+              break;
+            }
+          } catch (error) {
+            const fallback = error?.code === "ETIMEDOUT" ? "timeout" : "failed";
+            const outcome = loginHelperOutcomeFromStreams(error?.stdout, error?.stderr, fallback);
+            const failedOutcome = outcome.status === "logged_in" ? loginHelperOutcome("", fallback) : outcome;
+            attempts.push({
+              method: method.method,
+              ...failedOutcome,
+              succeeded: false,
+            });
           }
         }
         loginOutcomes.set(current.origin, { attempted: true, succeeded, attempts });

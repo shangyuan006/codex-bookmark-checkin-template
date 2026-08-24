@@ -7,6 +7,18 @@ $root = Split-Path -Parent $PSScriptRoot
 $schedulerScript = Join-Path $PSScriptRoot 'Start-UserScheduler.ps1'
 $configPath = Join-Path $root 'config\config.json'
 $heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
+$config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
+$configuredShell = [string]$config.powershellExecutable
+$shell = if ($configuredShell -and (Test-Path -LiteralPath $configuredShell)) {
+    [System.IO.Path]::GetFullPath($configuredShell)
+}
+elseif ($configuredShell) {
+    (Get-Command $configuredShell -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+}
+if (-not $shell) {
+    $shell = (Get-Command pwsh,powershell -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+}
+if (-not $shell) { throw 'PowerShell executable was not found.' }
 $mutexCreated = $false
 $mutex = [System.Threading.Mutex]::new($true, 'Local\CodexBookmarkDailyCheckinWatchdog', [ref]$mutexCreated)
 if (-not $mutexCreated) { exit 0 }
@@ -38,7 +50,7 @@ try {
         }
         if ($processes.Count -eq 0 -or -not $fresh) {
             $processes | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-            Start-Process -FilePath 'pwsh.exe' -ArgumentList @('-NoProfile','-NonInteractive','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$schedulerScript) -WindowStyle Hidden
+            Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-NonInteractive','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',$schedulerScript) -WindowStyle Hidden
         }
         Start-Sleep -Seconds 60
     }

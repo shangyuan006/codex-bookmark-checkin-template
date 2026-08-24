@@ -8,6 +8,8 @@ import { recognizeAlphanumericCaptcha, recognizeOpenCdCaptcha } from "./captcha-
 import { solveU2VisualChallenge } from "./u2-vision.mjs";
 import { resolveQaByWebSearch } from "./qa-solver.mjs";
 import { withRetrySchedule } from "./retry-policy.mjs";
+import { tryNewApiCaptchaCheckin, tryNewApiSignIn } from "./new-api-signin.mjs";
+import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
@@ -32,7 +34,7 @@ const CANDIDATE_STATUS_PRIORITY = new Map([
   ["error", 30],
   ["no_action", 20],
 ]);
-export const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, altcha-widget, .altcha, [data-altcha], [data-cap-api-endpoint], [class*="captcha" i]';
+export const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, .cap-verify, altcha-widget, .altcha, [data-altcha], [data-cap-api-endpoint], [class*="captcha" i]';
 const CALENDAR_DAY_ACTION_SELECTOR = 'button, [role="button"], a[href], input[type="button"], input[type="submit"], [onclick], [tabindex]:not([tabindex="-1"]), [role="gridcell"], td, li, [data-date], [aria-current="date"], [data-today], [data-is-today]';
 
 function sleep(ms) {
@@ -104,6 +106,37 @@ function targetUsesConfiguredOrigins(target, configuredOrigins) {
   return (target.allowedOrigins ?? [target.origin]).some((origin) => configured.has(origin));
 }
 
+export function reliableNewApiCaptchaCandidates(recognition, minConfidence = 30) {
+  const threshold = Number(minConfidence);
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+    throw new Error("New API captcha minConfidence must be between 0 and 100");
+  }
+  const code = String(recognition?.code ?? "").trim().toUpperCase();
+  const confidence = Number(recognition?.confidence);
+  return /^[A-Z0-9]{5}$/.test(code) && Number.isFinite(confidence) && confidence >= threshold
+    ? [code]
+    : [];
+}
+
+export async function tryConfiguredNewApiCheckin(page, activeOrigin, config = {}) {
+  const hasCaptchaRule = Object.hasOwn(config.newApiCaptchaRules ?? {}, activeOrigin);
+  const hasSignInRule = Object.hasOwn(config.newApiSignInRules ?? {}, activeOrigin);
+  if (hasCaptchaRule && hasSignInRule) {
+    throw new Error(`New API origin has conflicting captcha and sign-in rules: ${activeOrigin}`);
+  }
+  if (hasCaptchaRule) {
+    const rawRule = config.newApiCaptchaRules[activeOrigin];
+    return tryNewApiCaptchaCheckin(page, activeOrigin, config, async (image) => {
+      const recognition = await recognizeAlphanumericCaptcha(image, { minLength: 5, maxLength: 5 });
+      return reliableNewApiCaptchaCandidates(recognition, rawRule?.minConfidence ?? 30);
+    });
+  }
+  if (hasSignInRule) {
+    return tryNewApiSignIn(page, activeOrigin, config);
+  }
+  return null;
+}
+
 function targetUsesConfiguredActiveOrigin(target, activeOrigin, configuredOrigins) {
   if (!activeOrigin || !(target.allowedOrigins ?? [target.origin]).includes(activeOrigin)) return false;
   return (configuredOrigins ?? []).includes(activeOrigin);
@@ -142,6 +175,7 @@ export function getConfiguredChallengeInteractionRule(target, activeOrigin, conf
   return {
     type,
     phase: configuredPhase,
+    optional: raw.optional === true,
     waitMs: Math.max(1000, Math.min(60_000, Number(raw.waitMs) || 30_000)),
     settleMs: Math.max(500, Math.min(10_000, Number(raw.settleMs) || 3000)),
     retryAction: raw.retryAction === true,
@@ -181,6 +215,136 @@ export function getConfiguredCheckinCaptchaDialogRule(target, activeOrigin, conf
   };
 }
 
+function normalizedSequentialTexts(values, label, maximum = 20) {
+  if (values == null) return [];
+  if (!Array.isArray(values)) throw new Error(`${label} 必须是数组`);
+  const normalized = [...new Set(values.map((value) => normalizeText(value)).filter(Boolean))];
+  if (normalized.length > maximum) throw new Error(`${label} 配置过多`);
+  if (normalized.some((value) => value.length > 120)) throw new Error(`${label} 包含过长文本`);
+  return normalized;
+}
+
+function normalizedSequentialTags(values, label, maximum = 8) {
+  if (values == null) return [];
+  if (!Array.isArray(values)) throw new Error(`${label} 必须是数组`);
+  const normalized = [...new Set(values.map((value) => String(value ?? "").trim().toUpperCase()).filter(Boolean))];
+  if (normalized.length > maximum || normalized.some((value) => !/^[A-Z][A-Z0-9-]{0,31}$/.test(value))) {
+    throw new Error(`${label} 包含无效标签`);
+  }
+  return normalized;
+}
+
+function normalizeSequentialSuccessCondition(raw) {
+  const pathValue = String(raw?.path || "").trim();
+  if (!/^[A-Za-z0-9_.-]{1,120}$/.test(pathValue)) {
+    throw new Error("顺序动作响应成功字段路径无效");
+  }
+  const hasEquals = Object.hasOwn(raw ?? {}, "equals");
+  const includes = String(raw?.includes ?? "").trim();
+  if (!hasEquals && !includes) throw new Error("顺序动作响应成功条件缺少 equals 或 includes");
+  if (includes.length > 120) throw new Error("顺序动作响应成功条件过长");
+  return {
+    path: pathValue,
+    ...(hasEquals ? { equals: raw.equals } : {}),
+    ...(includes ? { includes } : {}),
+  };
+}
+
+function normalizeSequentialResponseEvidence(raw) {
+  const urlIncludes = String(raw?.urlIncludes || "").trim().toLowerCase();
+  if (!urlIncludes || urlIncludes.length > 160 || /[\u0000-\u001f\u007f]/.test(urlIncludes)) {
+    throw new Error("顺序动作响应 URL 特征无效");
+  }
+  const methods = normalizedSequentialTexts(raw.methods ?? ["POST"], "顺序动作响应方法", 6)
+    .map((value) => value.toUpperCase());
+  if (methods.some((value) => !/^[A-Z]{3,10}$/.test(value))) {
+    throw new Error("顺序动作响应方法无效");
+  }
+  const statuses = [...new Set((raw.statuses ?? []).map((value) => Number(value)))];
+  if (statuses.some((value) => !Number.isInteger(value) || value < 100 || value > 599)) {
+    throw new Error("顺序动作响应状态码无效");
+  }
+  const successAny = (raw.successAny ?? []).map(normalizeSequentialSuccessCondition);
+  if (successAny.length === 0 || successAny.length > 12) {
+    throw new Error("顺序动作响应必须配置有限的成功字段条件");
+  }
+  return { urlIncludes, methods, statuses, successAny };
+}
+
+export function getConfiguredSequentialActionRule(target, config = {}) {
+  const raw = config?.sequentialActionRules?.[target?.origin];
+  if (!raw) return null;
+  const allowedOrigins = target?.allowedOrigins ?? [target?.origin];
+  const rawSteps = raw?.steps;
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0 || rawSteps.length > 8) {
+    throw new Error("顺序动作规则必须包含 1 到 8 个步骤");
+  }
+  const steps = rawSteps.map((step, index) => {
+    const url = assertBookmarkNavigation(String(step?.url || ""), allowedOrigins);
+    const actionTexts = normalizedSequentialTexts(step?.actionTexts, `顺序动作第 ${index + 1} 步按钮文本`, 10);
+    if (actionTexts.length === 0) throw new Error(`顺序动作第 ${index + 1} 步缺少按钮文本`);
+    return {
+      url,
+      actionTexts,
+      actionTags: normalizedSequentialTags(step?.actionTags, `顺序动作第 ${index + 1} 步控件标签`),
+      preferInteractive: step?.preferInteractive === true,
+      completedTexts: normalizedSequentialTexts(step?.completedTexts, `顺序动作第 ${index + 1} 步完成文本`),
+      successTexts: normalizedSequentialTexts(step?.successTexts, `顺序动作第 ${index + 1} 步成功文本`),
+      completedIncludes: normalizedSequentialTexts(step?.completedIncludes, `顺序动作第 ${index + 1} 步完成关键词`),
+      successIncludes: normalizedSequentialTexts(step?.successIncludes, `顺序动作第 ${index + 1} 步成功关键词`),
+      responseEvidence: (step?.responseEvidence ?? []).map(normalizeSequentialResponseEvidence),
+      waitMs: Math.max(1000, Math.min(60_000, Number(step?.waitMs) || 10_000)),
+      disabledActionIsComplete: step?.disabledActionIsComplete === true,
+      acceptGenericCheckinState: step?.acceptGenericCheckinState !== false,
+      reloadOnUnconfirmed: step?.reloadOnUnconfirmed === true,
+    };
+  });
+  return { steps };
+}
+
+function valueAtJsonPath(value, pathValue) {
+  return pathValue.split(".").reduce((current, key) => (
+    current && typeof current === "object" ? current[key] : undefined
+  ), value);
+}
+
+export function configuredSequentialResponseProvesSuccess(response, rule, expectedOrigin) {
+  let url;
+  try { url = new URL(response?.url); } catch { return false; }
+  if (url.origin !== expectedOrigin || !url.pathname.toLowerCase().includes(rule.urlIncludes)) return false;
+  if (!rule.methods.includes(String(response?.method || "").toUpperCase())) return false;
+  const status = Number(response?.status);
+  if (rule.statuses.length > 0 ? !rule.statuses.includes(status) : status < 200 || status >= 300) return false;
+  return rule.successAny.some((condition) => {
+    const actual = valueAtJsonPath(response?.json, condition.path);
+    if (Object.hasOwn(condition, "equals") && Object.is(actual, condition.equals)) return true;
+    return condition.includes && String(actual ?? "").includes(condition.includes);
+  });
+}
+
+export function selectConfiguredSequentialActionCandidate(candidates, step, allowedOrigins) {
+  const originSet = new Set(allowedOrigins);
+  const matched = (Array.isArray(candidates) ? candidates : []).filter((candidate) => {
+    if (!candidate?.visible || candidate.disabled || !step.actionTexts.includes(normalizeText(candidate.text))) return false;
+    if (step.actionTags?.length > 0 && !step.actionTags.includes(String(candidate.tagName || "").toUpperCase())) return false;
+    for (const destination of [candidate.href, candidate.formAction]) {
+      if (!destination) continue;
+      try {
+        if (!originSet.has(new URL(destination).origin)) return false;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  });
+  if (matched.length === 1) return { candidate: matched[0], outcome: "ready" };
+  if (matched.length > 1 && step.preferInteractive) {
+    const interactive = matched.filter((candidate) => candidate.hasHandler || candidate.formAction);
+    if (interactive.length === 1) return { candidate: interactive[0], outcome: "ready" };
+  }
+  return { candidate: null, outcome: matched.length === 0 ? "action_not_found" : "action_not_unique" };
+}
+
 export function configuredCaptchaImageIsReady(metrics, rule) {
   if (!metrics || !rule) return false;
   if (Number(metrics.width) < rule.minImageWidth || Number(metrics.height) < rule.minImageHeight) return false;
@@ -207,6 +371,22 @@ export function selectSliderDragGeometry(candidates) {
     startY: handle.y + handle.height / 2,
     endX: track.x + track.width - handle.width / 2 - 2,
     endY: handle.y + handle.height / 2,
+  };
+}
+
+export function selectConfiguredCapChallengeCandidate(candidates) {
+  const valid = (Array.isArray(candidates) ? candidates : []).filter((candidate) => (
+    candidate?.visible
+    && !candidate.disabled
+    && Number(candidate.width) >= 180
+    && Number(candidate.width) <= 500
+    && Number(candidate.height) >= 40
+    && Number(candidate.height) <= 120
+  ));
+  if (valid.length === 1) return { candidate: valid[0], outcome: "ready" };
+  return {
+    candidate: null,
+    outcome: valid.length === 0 ? "challenge_not_found" : "challenge_not_unique",
   };
 }
 
@@ -320,7 +500,7 @@ async function snapshotState(page) {
         return String(value || "").trim().length > 0;
       });
       const explicitWidget = element.matches(
-        'iframe, .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, altcha-widget, [data-altcha], [data-cap-api-endpoint]',
+        'iframe, .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, .cap-verify, altcha-widget, [data-altcha], [data-cap-api-endpoint]',
       );
       const challengeLike = explicitWidget || responseElements.length > 0 || roots.some((root) => root.querySelector(
         'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], img[src*="captcha" i], img[alt*="captcha" i], canvas, input[type="checkbox"], [role="checkbox"], input[type="text"][name*="captcha" i], input[type="text"][id*="captcha" i], [data-sitekey]',
@@ -408,7 +588,7 @@ async function confirmConfiguredCheckinAfterWait(page, allowedOrigins, config, r
   return confirmed;
 }
 
-async function waitForManagedChallenge(page, config) {
+export async function waitForManagedChallenge(page, config) {
   const pendingState = await waitForPendingCheckinState(page, config);
   if (pendingState.status !== "managed_challenge") return pendingState;
   const deadline = Date.now() + config.cloudflareWaitMs;
@@ -417,6 +597,33 @@ async function waitForManagedChallenge(page, config) {
     if (state.status === "interactive_challenge") return state;
     if (state.status !== "managed_challenge") return state;
     await sleep(2000);
+  }
+
+  // A managed challenge can finish at the edge of the bounded wait while the
+  // site updates its check-in state only on the next document load. Refresh
+  // once and require stable page evidence before scheduling a later retry.
+  let finalState = await snapshotState(page);
+  if (finalState.status !== "managed_challenge") return finalState;
+  const originalOrigin = (() => {
+    try { return new URL(page.url()).origin; } catch { return null; }
+  })();
+  if (!originalOrigin) return { status: "needs_attention", reason: "托管验证刷新前无法确认页面来源" };
+  const reloaded = await page.reload({
+    waitUntil: "domcontentloaded",
+    timeout: config.navigationTimeoutMs,
+  }).then(() => true).catch(() => false);
+  if (reloaded) {
+    let reloadedOrigin;
+    try { reloadedOrigin = new URL(page.url()).origin; } catch { reloadedOrigin = null; }
+    if (reloadedOrigin !== originalOrigin) {
+      return { status: "needs_attention", reason: "托管验证刷新后页面离开当前来源" };
+    }
+    finalState = await waitForConfirmedCheckinState(
+      page,
+      config,
+      getCheckinConfirmationWaitMs(config.checkinStateWaitMs),
+    );
+    if (!["managed_challenge", "unconfirmed"].includes(finalState.status)) return finalState;
   }
   return withRetrySchedule({
     status: "deferred",
@@ -455,16 +662,28 @@ async function waitForConfiguredChallengeState(page, allowedOrigins, config, rul
   return latest;
 }
 
-async function clickConfiguredChallengeControl(page, rule) {
+async function clickConfiguredChallengeControl(page, rule, expectedOrigin, config) {
   const selector = [
     'altcha-widget input[type="checkbox"]',
     'altcha-widget [role="checkbox"]',
     '.h-captcha input[type="checkbox"]',
     '.cf-turnstile input[type="checkbox"]',
     '.g-recaptcha input[type="checkbox"]',
+    '[class*="captcha" i] input[type="checkbox"]',
+    '[class*="captcha" i] [role="checkbox"]',
+    '[class*="verify" i] input[type="checkbox"]',
+    '[class*="verify" i] [role="checkbox"]',
   ].join(", ");
-  const deadline = Date.now() + Math.min(5000, rule.waitMs);
+  const deadline = Date.now() + rule.waitMs;
+  let latest = await snapshotState(page);
   do {
+    if (["signed", "already_signed", "login_required", "deferred", "needs_attention"].includes(latest.status)) {
+      return latest;
+    }
+    if (rule.optional && !["interactive_challenge", "managed_challenge"].includes(latest.status)
+      && !latest.unresolvedChallenge) {
+      return latest;
+    }
     const controls = page.locator(selector);
     const visibleIndexes = [];
     for (let index = 0; index < await controls.count(); index += 1) {
@@ -486,8 +705,97 @@ async function clickConfiguredChallengeControl(page, rule) {
         return { status: "needs_attention", reason: "自动验证控件点击失败" };
       }
     }
-    await sleep(250);
+    const capWidgets = page.locator('.cap-verify');
+    const capCandidates = await capWidgets.evaluateAll((elements) => elements.slice(0, 20).map((element, index) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return {
+        index,
+        visible: style.display !== "none"
+          && style.visibility !== "hidden"
+          && rect.width > 0
+          && rect.height > 0,
+        disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
+        width: rect.width,
+        height: rect.height,
+      };
+    }));
+    const capSelection = selectConfiguredCapChallengeCandidate(capCandidates);
+    if (capSelection.outcome === "challenge_not_unique") {
+      return { status: "needs_attention", reason: "自动验证找到多个可点击 Cap.js 控件，已拒绝操作" };
+    }
+    if (capSelection.candidate) {
+      const capContainer = capWidgets.nth(capSelection.candidate.index);
+      const embeddedWidgets = capContainer.locator('cap-widget');
+      const embeddedCandidates = await embeddedWidgets.evaluateAll((elements) => elements.slice(0, 20).map((element, index) => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return {
+          index,
+          visible: style.display !== "none"
+            && style.visibility !== "hidden"
+            && rect.width > 0
+            && rect.height > 0,
+          disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
+          width: rect.width,
+          height: rect.height,
+        };
+      }));
+      const embeddedSelection = selectConfiguredCapChallengeCandidate(embeddedCandidates);
+      if (!embeddedSelection.candidate) {
+        return {
+          status: "needs_attention",
+          reason: embeddedSelection.outcome === "challenge_not_found"
+            ? "自动验证未找到唯一可见 Cap.js 组件"
+            : "自动验证找到多个可见 Cap.js 组件，已拒绝操作",
+        };
+      }
+      const capWidget = embeddedWidgets.nth(embeddedSelection.candidate.index);
+      const capControls = capWidget.locator([
+        'input[type="checkbox"]',
+        '[role="checkbox"]',
+        '[aria-checked][tabindex]',
+      ].join(", "));
+      const visibleCapControls = [];
+      for (let index = 0; index < Math.min(20, await capControls.count()); index += 1) {
+        const candidate = capControls.nth(index);
+        if (await candidate.isVisible().catch(() => false)
+          && await candidate.isEnabled().catch(() => true)) {
+          visibleCapControls.push(candidate);
+        }
+      }
+      if (visibleCapControls.length > 1) {
+        return { status: "needs_attention", reason: "自动验证找到多个可点击 Cap.js 控件，已拒绝操作" };
+      }
+      try {
+        if (visibleCapControls.length === 1) {
+          await visibleCapControls[0].click({ timeout: 10_000 });
+        } else {
+          const box = await capWidget.boundingBox();
+          if (!box) throw new Error("Cap.js control is not visible");
+          await page.mouse.click(box.x + Math.min(30, box.width * 0.15), box.y + box.height / 2);
+        }
+        assertBookmarkNavigation(page.url(), [expectedOrigin]);
+        return null;
+      } catch {
+        return { status: "needs_attention", reason: "自动 Cap.js 验证控件点击失败" };
+      }
+    }
+    const frameResult = await clickVisibleNativeChallengeControl(page, expectedOrigin, {
+      actionTexts: ["签到"],
+      clickChallenge: true,
+    });
+    if (frameResult.clicked) return null;
+    if (frameResult.outcome === "challenge_not_unique") {
+      return { status: "needs_attention", reason: "自动验证找到多个可点击控件，已拒绝操作" };
+    }
+    if (frameResult.outcome === "challenge_click_failed") {
+      return { status: "needs_attention", reason: "自动验证控件点击失败" };
+    }
+    await sleep(Math.max(100, Math.min(1000, Number(config.checkinStatePollMs) || 500)));
+    latest = await snapshotState(page);
   } while (Date.now() < deadline);
+  if (rule.optional) return latest;
   return { status: "needs_attention", reason: "自动验证未找到唯一可点击控件" };
 }
 
@@ -529,8 +837,12 @@ async function runConfiguredChallengePhase(page, target, activeOrigin, config, p
   if (["signed", "already_signed", "login_required", "deferred", "needs_attention"].includes(initial.status)) {
     return initial;
   }
+  if (rule.optional && !["interactive_challenge", "managed_challenge"].includes(initial.status)
+    && !initial.unresolvedChallenge) {
+    return initial;
+  }
   if (rule.type === "click") {
-    const failure = await clickConfiguredChallengeControl(page, rule);
+    const failure = await clickConfiguredChallengeControl(page, rule, activeOrigin, config);
     if (failure) return failure;
     return waitForConfiguredChallengeState(page, allowedOrigins, config, rule, true);
   }
@@ -992,6 +1304,207 @@ async function clickCandidate(page, candidate, { domClick = false } = {}) {
   else await locator.click({ timeout: 10000 });
 }
 
+async function readConfiguredSequentialStepEvidence(page, step, phase, responseConfirmed = false) {
+  const state = await snapshotState(page);
+  const evidence = await page.evaluate(({ actionTexts, completedTexts, successTexts, completedIncludes, successIncludes }) => {
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const bodyLines = String(document.body?.innerText ?? "").split(/[\r\n]+/).map(normalize).filter(Boolean);
+    const bodyLineSet = new Set(bodyLines);
+    const controls = [...document.querySelectorAll(
+      'button, a, [role="button"], input[type="button"], input[type="submit"]',
+    )].slice(0, 400).map((element, index) => ({
+      index,
+      tagName: element.tagName,
+      text: normalize(element.innerText || element.value || element.getAttribute("aria-label") || element.title || ""),
+      visible: visible(element),
+      disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
+      href: element instanceof HTMLAnchorElement ? element.href : null,
+      formAction: element.form ? element.form.action : null,
+      hasHandler: Boolean(element.form || element.getAttribute("onclick") || element.getAttribute("data-action")),
+    }));
+    return {
+      controls,
+      completedTextPresent: completedTexts.some((text) => bodyLineSet.has(text))
+        || completedIncludes.some((text) => bodyLines.some((line) => line.includes(text))),
+      successTextPresent: successTexts.some((text) => bodyLineSet.has(text))
+        || successIncludes.some((text) => bodyLines.some((line) => line.includes(text))),
+      disabledActionPresent: controls.some((control) => (
+        control.visible && control.disabled && actionTexts.includes(control.text)
+      )),
+    };
+  }, {
+    actionTexts: step.actionTexts,
+    completedTexts: step.completedTexts,
+    successTexts: step.successTexts,
+    completedIncludes: step.completedIncludes,
+    successIncludes: step.successIncludes,
+  });
+
+  if (step.acceptGenericCheckinState && ["signed", "already_signed"].includes(state.status)) {
+    return { done: true, status: state.status, reason: state.reason, controls: evidence.controls };
+  }
+  if (evidence.completedTextPresent) {
+    return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤页面显示完成状态", controls: evidence.controls };
+  }
+  if (phase === "after" && evidence.successTextPresent) {
+    return { done: true, status: "signed", reason: "步骤页面显示成功状态", controls: evidence.controls };
+  }
+  if (step.disabledActionIsComplete && evidence.disabledActionPresent) {
+    return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤动作控件确认已完成", controls: evidence.controls };
+  }
+  if (phase === "after" && responseConfirmed) {
+    return { done: true, status: "signed", reason: "步骤接口确认成功", controls: evidence.controls };
+  }
+  return { done: false, state, controls: evidence.controls };
+}
+
+function watchConfiguredSequentialResponses(page, step, expectedOrigin) {
+  let confirmed = false;
+  const pending = new Set();
+  const handler = (response) => {
+    const task = (async () => {
+      const request = response.request();
+      const url = response.url();
+      const pathMatches = step.responseEvidence.some((rule) => {
+        try {
+          const parsed = new URL(url);
+          return parsed.origin === expectedOrigin
+            && parsed.pathname.toLowerCase().includes(rule.urlIncludes)
+            && rule.methods.includes(request.method().toUpperCase());
+        } catch {
+          return false;
+        }
+      });
+      if (!pathMatches) return;
+      const json = await response.json().catch(() => null);
+      confirmed ||= step.responseEvidence.some((rule) => configuredSequentialResponseProvesSuccess({
+        url,
+        method: request.method(),
+        status: response.status(),
+        json,
+      }, rule, expectedOrigin));
+    })().catch(() => {});
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+  };
+  page.on("response", handler);
+  return {
+    confirmed: () => confirmed,
+    async stop() {
+      page.off("response", handler);
+      await Promise.allSettled([...pending]);
+      return confirmed;
+    },
+  };
+}
+
+async function waitForConfiguredSequentialStep(page, target, config, step, watcher) {
+  const allowedOrigins = target.allowedOrigins ?? [target.origin];
+  const deadline = Date.now() + step.waitMs;
+  do {
+    assertBookmarkNavigation(page.url(), allowedOrigins);
+    const evidence = await readConfiguredSequentialStepEvidence(page, step, "after", watcher.confirmed());
+    if (evidence.done) return evidence;
+    if (["login_required", "interactive_challenge", "managed_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(evidence.state?.status)) {
+      return { done: false, terminal: evidence.state };
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(Math.max(100, Math.min(1000, Number(config.checkinStatePollMs) || 500)));
+  } while (true);
+
+  if (step.reloadOnUnconfirmed) {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs }).catch(() => {});
+    await sleep(Math.max(500, Number(config.actionWaitMs) || 0));
+    assertBookmarkNavigation(page.url(), allowedOrigins);
+    const reloaded = await readConfiguredSequentialStepEvidence(page, step, "after", watcher.confirmed());
+    if (reloaded.done) return reloaded;
+  }
+  return { done: false };
+}
+
+async function tryConfiguredSequentialActions(page, target, config) {
+  const rule = getConfiguredSequentialActionRule(target, config);
+  if (!rule) return null;
+  const allowedOrigins = target.allowedOrigins ?? [target.origin];
+  const completedActions = [];
+  let anyActionClicked = false;
+
+  for (const step of rule.steps) {
+    await page.goto(assertBookmarkNavigation(step.url, allowedOrigins), {
+      waitUntil: "domcontentloaded",
+      timeout: config.navigationTimeoutMs,
+    });
+    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+    assertBookmarkNavigation(page.url(), allowedOrigins);
+
+    let before = await readConfiguredSequentialStepEvidence(page, step, "before");
+    if (["interactive_challenge", "managed_challenge"].includes(before.state?.status)) {
+      const activeOrigin = new URL(page.url()).origin;
+      const challengeState = await runConfiguredChallengePhase(page, target, activeOrigin, config, "before");
+      if (challengeState && ["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(challengeState.status)) {
+        return { ...challengeState, action: completedActions.join(" → ") || undefined };
+      }
+      before = await readConfiguredSequentialStepEvidence(page, step, "before");
+    }
+    if (before.done) {
+      completedActions.push(step.actionTexts[0]);
+      continue;
+    }
+    if (["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(before.state?.status)) {
+      return { ...before.state, action: completedActions.join(" → ") || undefined };
+    }
+
+    const selection = selectConfiguredSequentialActionCandidate(before.controls, step, allowedOrigins);
+    if (!selection.candidate) {
+      return {
+        status: "needs_attention",
+        reason: selection.outcome === "action_not_unique" ? "顺序动作页面出现多个同名目标控件" : "顺序动作页面未找到唯一目标控件",
+        action: completedActions.join(" → ") || undefined,
+      };
+    }
+
+    const expectedOrigin = new URL(step.url).origin;
+    const watcher = watchConfiguredSequentialResponses(page, step, expectedOrigin);
+    try {
+      await clickCandidate(page, selection.candidate);
+      anyActionClicked = true;
+      let confirmation = await waitForConfiguredSequentialStep(page, target, config, step, watcher);
+      if (["interactive_challenge", "managed_challenge"].includes(confirmation.terminal?.status)) {
+        const activeOrigin = new URL(page.url()).origin;
+        const challengeState = await runConfiguredChallengePhase(page, target, activeOrigin, config, "after");
+        if (challengeState && ["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(challengeState.status)) {
+          return { ...challengeState, action: [...completedActions, selection.candidate.text].join(" → ") };
+        }
+        confirmation = await waitForConfiguredSequentialStep(page, target, config, step, watcher);
+      }
+      if (confirmation.terminal) {
+        return { ...confirmation.terminal, action: [...completedActions, selection.candidate.text].join(" → ") };
+      }
+      if (!confirmation.done) {
+        return {
+          status: "needs_attention",
+          reason: "顺序动作已执行，但页面或接口未提供权威完成证据",
+          action: [...completedActions, selection.candidate.text].join(" → "),
+        };
+      }
+    } finally {
+      await watcher.stop();
+    }
+    completedActions.push(selection.candidate.text);
+  }
+
+  return {
+    status: anyActionClicked ? "signed" : "already_signed",
+    reason: anyActionClicked ? "全部顺序动作均获得权威完成证据" : "全部顺序动作均已完成",
+    action: completedActions.join(" → "),
+  };
+}
+
 async function visibleLocatorIndexes(locator) {
   const indexes = [];
   for (let index = 0; index < await locator.count(); index += 1) {
@@ -1387,7 +1900,7 @@ async function tryQaFlow(page, rules, origin, config) {
   return null;
 }
 
-async function tryNewApiCheckin(page) {
+export async function tryNewApiCheckin(page) {
   return page.evaluate(async () => {
     let userId = null;
     const storages = [localStorage, sessionStorage];
@@ -1417,15 +1930,21 @@ async function tryNewApiCheckin(page) {
     const headers = { Accept: "application/json", "New-Api-User": String(userId) };
     const currentDate = new Date();
     const month = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, "0")}`;
-    let statusResponse;
-    try {
-      statusResponse = await fetch(`/api/user/checkin?month=${month}`, { credentials: "include", headers });
-    } catch {
-      return null;
-    }
-    if (statusResponse.status === 404) return null;
-    let statusBody;
-    try { statusBody = await statusResponse.json(); } catch { return null; }
+    const readStatus = async () => {
+      let response;
+      try {
+        response = await fetch(`/api/user/checkin?month=${month}`, { credentials: "include", headers });
+      } catch {
+        return null;
+      }
+      if (response.status === 404) return { unavailable: true };
+      let body;
+      try { body = await response.json(); } catch { return null; }
+      return { body };
+    };
+    const initialStatus = await readStatus();
+    if (!initialStatus || initialStatus.unavailable) return null;
+    const statusBody = initialStatus.body;
     const message = String(statusBody?.message || "");
     if (!statusBody?.success) {
       if (/未启用|未啟用|not enabled/i.test(message)) {
@@ -1451,21 +1970,31 @@ async function tryNewApiCheckin(page) {
     }
     let checkinBody;
     try { checkinBody = await checkinResponse.json(); } catch { return null; }
-    if (checkinBody?.success) {
-      return {
-        status: "signed",
-        reason: "已通过站点签到接口完成，奖励额度已到账",
-      };
-    }
     const checkinMessage = String(checkinBody?.message || "");
-    if (/已签到|已簽到|already/i.test(checkinMessage)) {
-      return { status: "already_signed", reason: "站点签到接口确认今日已签到" };
-    }
     if (/turnstile|captcha|人机|人機/i.test(checkinMessage)) {
       return { status: "interactive_challenge", reason: "站点签到接口要求人机验证" };
     }
     if (/未启用|未啟用|not enabled/i.test(checkinMessage)) {
       return { status: "not_available", reason: "站点签到功能未启用" };
+    }
+    const submitted = checkinBody?.success || /已签到|已簽到|already/i.test(checkinMessage);
+    if (!submitted) return null;
+
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const verifiedStatus = await readStatus();
+      const verifiedBody = verifiedStatus?.body;
+      const verified = verifiedBody?.success && Boolean(
+        verifiedBody?.data?.stats?.checked_in_today
+        ?? verifiedBody?.data?.checked_in_today
+        ?? verifiedBody?.data?.checkedInToday
+      );
+      if (verified) {
+        return {
+          status: checkinBody?.success ? "signed" : "already_signed",
+          reason: "站点状态接口确认今日已签到",
+        };
+      }
+      if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 750));
     }
     return null;
   });
@@ -1632,6 +2161,11 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
   await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
   ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
 
+  const configuredNewApiResult = await tryConfiguredNewApiCheckin(page, activeOrigin, config);
+  if (configuredNewApiResult) {
+    return { ...configuredNewApiResult, url: safeLogUrl(page.url()) };
+  }
+
   // New API exposes an authoritative current-day status endpoint.  Query it
   // before interpreting generic page copy such as “每日签到可获得奖励”, which is
   // a feature description rather than proof that today's check-in succeeded.
@@ -1652,6 +2186,10 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
   state = await acceptConfiguredTerms(page, state, activeOrigin, config);
   ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
   state = await reconcileConfiguredGrowthCheckinPage(page, target, activeUrl, config, state);
+  if (["ready", "signed", "already_signed", "unconfirmed"].includes(state.status)) {
+    const sequentialResult = await tryConfiguredSequentialActions(page, target, config);
+    if (sequentialResult) return { ...sequentialResult, url: safeLogUrl(page.url()) };
+  }
   if (state.status !== "ready") return { ...state, url: safeLogUrl(page.url()) };
 
   const calendarDayResult = await tryCalendarDayCheckin(page, target, activeUrl, config);

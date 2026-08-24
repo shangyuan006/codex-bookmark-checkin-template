@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { classifyPageText } from "./detector.mjs";
+import { connectOverCdpWithRetry } from "./native-cdp.mjs";
 import {
   clickVisibleNativeChallengeControl,
   clickUniqueNativeCheckinAction,
@@ -22,6 +23,7 @@ const encodedActionRule = process.argv[6] || "";
 const actionRule = executeCheckin
   ? normalizeNativeCheckinActionRule(JSON.parse(Buffer.from(encodedActionRule, "base64").toString("utf8")))
   : null;
+const retryableChallengeOutcomes = new Set(["pending", "challenge_not_found", "challenge_click_failed"]);
 if (!Number.isInteger(port) || port <= 0) {
   throw new Error("usage: node src/native-browser-inspect.mjs <port> <origin> [max-wait-seconds] [mode] [action-rule-base64]");
 }
@@ -64,16 +66,11 @@ async function readPageState(page) {
   };
 }
 
-let browser = null;
-const connectDeadline = Date.now() + Math.max(5000, Math.min(15_000, maxWaitSeconds * 1000));
-while (!browser && Date.now() < connectDeadline) {
-  try {
-    browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 2000 });
-  } catch {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-}
-if (!browser) throw new Error("unable to connect to the native browser debugging port");
+const browser = await connectOverCdpWithRetry(chromium, port, {
+  timeoutMs: Math.max(5000, Math.min(15_000, maxWaitSeconds * 1000)),
+  attemptTimeoutMs: 2000,
+  retryDelayMs: 500,
+});
 
 try {
   const pageDeadline = Date.now() + maxWaitSeconds * 1000;
@@ -116,10 +113,13 @@ try {
   do {
     try {
       await page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
-      if (executeCheckin && actionAttempted && challengeOutcome === "pending") {
+      // Cloudflare may render its checkbox several seconds after the sign-in
+      // click. Keep polling boundedly after an empty or failed probe so a late
+      // challenge can still be clicked, while ambiguous controls remain fail-closed.
+      if (executeCheckin && actionAttempted && retryableChallengeOutcomes.has(challengeOutcome)) {
         const challenge = await clickVisibleNativeChallengeControl(page, expectedOrigin, actionRule);
         challengeDetails = challenge.details ?? challengeDetails;
-        if (challenge.outcome !== "challenge_not_found") challengeOutcome = challenge.outcome;
+        challengeOutcome = challenge.outcome;
       }
       current = await readPageState(page);
       output = {

@@ -12,6 +12,7 @@ const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const helperPath = path.join(root, "scripts", "ManualVerification.ps1");
 const runnerPath = path.join(root, "scripts", "Run-Checkin.ps1");
+const schedulerPath = path.join(root, "scripts", "Start-UserScheduler.ps1");
 
 const driverSource = String.raw`param(
     [string]$HelperPath,
@@ -26,6 +27,7 @@ $update = Update-ManualVerificationState -Pending $pendingBefore -Report $report
 $pendingAfter = Get-PendingManualVerification -Path $StatePath
 $afterOrigins = @()
 if ($null -ne $pendingAfter) { $afterOrigins = @($pendingAfter.Origins) }
+$handoffTargets = @(Get-ManualHandoffTargets -Report $report -Now ([datetime]$RetryAt))
 $saved = Get-Content -Raw -Encoding UTF8 -LiteralPath $StatePath | ConvertFrom-Json
 [ordered]@{
     beforeOrigins = @($pendingBefore.Origins)
@@ -34,6 +36,7 @@ $saved = Get-Content -Raw -Encoding UTF8 -LiteralPath $StatePath | ConvertFrom-J
     pendingOrigins = @($update.PendingOrigins)
     retryOrigins = @($update.RetryOrigins)
     afterOrigins = $afterOrigins
+    handoffTargets = $handoffTargets
     saved = $saved
 } | ConvertTo-Json -Depth 12 -Compress
 `;
@@ -188,11 +191,60 @@ test("下一次任务级尝试只选择人工范围内当前可立即重试的 o
   assert.ok(!result.retryOrigins.includes("https://outside.example"));
 });
 
+test("人工交接包含交互挑战和嵌套账号汇总的 needs_attention", async () => {
+  const result = await invokeStateMachine(
+    pendingState(["https://done.example"]),
+    finalReport([
+      { origin: "https://account.example", status: "needs_attention" },
+      { origin: "https://challenge.example", status: "interactive_challenge" },
+      { origin: "https://done.example", status: "signed" },
+    ]),
+  );
+
+  assert.deepEqual(
+    result.handoffTargets.map(({ origin, previousStatus }) => ({ origin, previousStatus })),
+    [
+      { origin: "https://account.example", previousStatus: "needs_attention" },
+      { origin: "https://challenge.example", previousStatus: "interactive_challenge" },
+    ],
+  );
+});
+
 test("Run-Checkin 每轮落盘状态并用 RetryOrigins 缩小下一轮参数", async () => {
   const runner = await fs.readFile(runnerPath, "utf8");
   assert.match(runner, /Update-ManualVerificationState[\s\S]*?-RetryAt/);
   assert.match(runner, /\$manualVerification\.Origins = @\(\$manualAttemptUpdate\.RetryOrigins\)/);
   assert.match(runner, /if \(\$null -ne \$manualVerification\)[\s\S]*?elseif \(\$null -ne \$resumeCandidate/);
+});
+
+test("automatic phase leaves a durable manual handoff and the scheduler consumes it", async () => {
+  const runner = await fs.readFile(runnerPath, "utf8");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const scheduler = await fs.readFile(schedulerPath, "utf8");
+  assert.match(helper, /function Get-ManualHandoffTargets\(\$Report/);
+  assert.match(runner, /manual-handoff\.json/);
+  assert.match(runner, /Write-ManualHandoff \$freshCandidate\.Report/);
+  assert.match(runner, /state = 'awaiting_manual_handoff'/);
+  assert.match(runner, /\(Test-Path -LiteralPath \$manualSessionPath\) -or \(Test-PendingManualVerificationFile\)/);
+  assert.doesNotMatch(runner, /Test-Path -LiteralPath \$manualSessionPath -or/);
+  assert.match(scheduler, /manual-session\.json/);
+  assert.match(scheduler, /manual-verification\.json/);
+  assert.match(scheduler, /ManualVerification\.ps1/);
+  assert.match(scheduler, /Mode = 'verification_ready'/);
+  assert.match(scheduler, /Test-SchedulerWaiting \$state \$now \$config \$manualHandoff/);
+  assert.match(scheduler, /lastManualVerificationChangedAt/);
+});
+
+test("manual abandonment closes without verification and suppresses only today's scheduled retry", async () => {
+  const closer = await fs.readFile(new URL("../scripts/Close-ManualLogin.ps1", import.meta.url), "utf8");
+  const scheduler = await fs.readFile(schedulerPath, "utf8");
+  assert.match(closer, /param\(\[switch\]\$Abandon\)/);
+  assert.match(closer, /manual-abandon\.json/);
+  assert.match(closer, /Write-ManualAbandonment/);
+  assert.match(closer, /if \(\$Abandon\)[\s\S]*?Clear-ManualContinuationState/);
+  assert.match(scheduler, /Get-TodayAbandonedOrigins/);
+  assert.match(scheduler, /\$Now\.ToString\('yyyyMMdd'\)/);
+  assert.match(scheduler, /-not \$abandonedOrigins\.ContainsKey\(\[string\]\$_\.origin\)/);
 });
 
 test("Run-Checkin 不会在人工复核目标已移出书签时静默成功", async () => {

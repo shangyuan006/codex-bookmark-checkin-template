@@ -1,7 +1,7 @@
 $script:ManualVerificationTerminalStatuses = @('signed', 'already_signed', 'not_available')
 $script:ManualVerificationImmediateStatuses = @(
-    'error', 'login_required', 'managed_challenge', 'managed_challenge_timeout',
-    'unconfirmed', 'clicked', 'visited'
+    'error', 'login_required', 'interactive_challenge', 'managed_challenge',
+    'managed_challenge_timeout', 'needs_attention', 'unconfirmed', 'clicked', 'visited'
 )
 
 function ConvertTo-ManualVerificationOrigin($Value) {
@@ -14,6 +14,14 @@ function ConvertTo-ManualVerificationOrigin($Value) {
 
 function Test-ManualVerificationTerminalStatus($Status) {
     return [string]$Status -in $script:ManualVerificationTerminalStatuses
+}
+
+function ConvertTo-ManualVerificationUtcDateTime($Value) {
+    if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime() }
+    if ($Value -is [datetimeoffset]) { return ([datetimeoffset]$Value).UtcDateTime }
+    $parsed = [datetime]::MinValue
+    if ([datetime]::TryParse([string]$Value, [ref]$parsed)) { return $parsed.ToUniversalTime() }
+    return $null
 }
 
 function Test-ManualVerificationFinalReport($Report) {
@@ -31,10 +39,32 @@ function Test-ManualVerificationImmediateResult($Result, [datetime]$RetryAt) {
     if ($null -eq $Result -or (Test-ManualVerificationTerminalStatus $Result.status)) { return $false }
     $status = [string]$Result.status
     if ($status -eq 'deferred') {
-        try { return -not $Result.nextEligibleAt -or [datetime]$Result.nextEligibleAt -le $RetryAt }
-        catch { return $true }
+        if (-not $Result.nextEligibleAt) { return $true }
+        $nextEligibleAt = ConvertTo-ManualVerificationUtcDateTime $Result.nextEligibleAt
+        if ($null -eq $nextEligibleAt) { return $true }
+        return $nextEligibleAt -le $RetryAt.ToUniversalTime()
     }
     return $status -in $script:ManualVerificationImmediateStatuses
+}
+
+function Get-ManualHandoffTargets($Report, [datetime]$Now = (Get-Date)) {
+    if ($null -eq $Report -or [string]$Report.runState -ne 'final' -or $Report.isComplete -ne $true) {
+        return @()
+    }
+    $targets = @()
+    $seen = @{}
+    foreach ($result in @($Report.results)) {
+        $origin = ConvertTo-ManualVerificationOrigin $result.origin
+        if (-not $origin -or $seen.ContainsKey($origin)) { continue }
+        if (Test-ManualVerificationImmediateResult $result $Now) {
+            $seen[$origin] = $true
+            $targets += [ordered]@{
+                origin = $origin
+                previousStatus = [string]$result.status
+            }
+        }
+    }
+    return @($targets)
 }
 
 function Get-PendingManualVerification([string]$Path) {
@@ -110,7 +140,9 @@ function Update-ManualVerificationState($Pending, $Report, [string]$Path, [datet
             $target.verificationStatus = [string]$result.status
             $target | Add-Member -NotePropertyName verificationReason -NotePropertyValue ([string]$result.reason) -Force
             $target | Add-Member -NotePropertyName retryCause -NotePropertyValue ([string]$result.retryCause) -Force
-            $target | Add-Member -NotePropertyName nextEligibleAt -NotePropertyValue ([string]$result.nextEligibleAt) -Force
+            $nextEligibleAt = ConvertTo-ManualVerificationUtcDateTime $result.nextEligibleAt
+            $nextEligibleAtText = if ($null -ne $nextEligibleAt) { $nextEligibleAt.ToString('o') } else { [string]$result.nextEligibleAt }
+            $target | Add-Member -NotePropertyName nextEligibleAt -NotePropertyValue $nextEligibleAtText -Force
         }
         if (-not (Test-ManualVerificationTerminalStatus $target.verificationStatus)) {
             $allConfirmed = $false

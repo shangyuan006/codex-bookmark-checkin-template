@@ -2,7 +2,8 @@
 param(
     [switch]$DryRun,
     [switch]$SuppressReport,
-    [int]$Attempts = 0
+    [int]$Attempts = 0,
+    [string]$ReauthAccountKey
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,12 +12,15 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'RunLock.ps1')
 . (Join-Path $PSScriptRoot 'ManualVerification.ps1')
 . (Join-Path $PSScriptRoot 'NativeFallbackPolicy.ps1')
+. (Join-Path $PSScriptRoot 'TaskRetryPolicy.ps1')
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $reporterScript = Join-Path $PSScriptRoot 'Submit-UnifiedCheckinReport.ps1'
 $outboxScript = Join-Path $PSScriptRoot 'Invoke-CheckinNotificationOutbox.ps1'
 $timeoutFinalizerScript = Join-Path $root 'src\finalize-timeout-report.mjs'
 $runLockPath = Join-Path $root 'tmp\run.lock'
 $manualVerificationPath = Join-Path $root 'tmp\manual-verification.json'
+$manualSessionPath = Join-Path $root 'tmp\manual-session.json'
+$manualHandoffPath = Join-Path $root 'tmp\manual-handoff.json'
 $startedAt = Get-Date
 $runnerStatus = 'failed'
 $runnerMessage = '签到任务尚未开始。'
@@ -125,6 +129,57 @@ function Test-NeedsSavedLoginSync($ResumeCandidate, [datetime]$Now) {
     return $false
 }
 
+function Test-PendingManualVerificationFile {
+    if (-not (Test-Path -LiteralPath $manualVerificationPath)) { return $false }
+    try {
+        $document = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualVerificationPath | ConvertFrom-Json
+        return [string]$document.state -eq 'pending_verification' `
+            -and $document.authoritativeEvidenceRequired -eq $true `
+            -and @($document.targets | Where-Object { -not (Test-ManualVerificationTerminalStatus $_.verificationStatus) }).Count -gt 0
+    }
+    catch { return $false }
+}
+
+function Write-ManualHandoff($Report, [datetime]$Now = (Get-Date)) {
+    # Keep the automatic-to-manual boundary durable without opening a visible
+    # browser from a hidden scheduled task. The next manual close can then be
+    # consumed immediately by the scheduler.
+    if ((Test-Path -LiteralPath $manualSessionPath) -or (Test-PendingManualVerificationFile)) {
+        return $false
+    }
+    $targets = @(Get-ManualHandoffTargets $Report $Now)
+    if ($targets.Count -eq 0) {
+        Remove-Item -LiteralPath $manualHandoffPath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    $handoff = [ordered]@{
+        schemaVersion = 1
+        state = 'awaiting_manual_handoff'
+        createdAt = $Now.ToUniversalTime().ToString('o')
+        sourceRunId = [string]$Report.runId
+        sourceFinishedAt = [string]$Report.finishedAt
+        authoritativeEvidenceRequired = $true
+        targets = $targets
+    }
+    [System.IO.Directory]::CreateDirectory((Split-Path -Parent $manualHandoffPath)) | Out-Null
+    $temporaryPath = "$manualHandoffPath.$PID.tmp"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryPath,
+            ($handoff | ConvertTo-Json -Depth 6),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporaryPath -Destination $manualHandoffPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Warning "自动签到已结束，$($targets.Count) 个站点等待人工接管；关闭手动窗口后将立即进行定向权威复核。"
+    return $true
+}
+
 try {
     Push-Location $root
     $locationPushed = $true
@@ -154,9 +209,12 @@ try {
     $indexScript = Join-Path $root 'src\index.mjs'
     $arguments = @($indexScript)
     if ($DryRun) { $arguments += '--dry-run' }
+    if ($ReauthAccountKey) {
+        $arguments += @('--origins', 'https://agentrouter.org', '--reauth-account-key', $ReauthAccountKey)
+    }
 
     if (-not $DryRun) { $resumeCandidate = Get-TodayResumeReport }
-    if (-not $DryRun) {
+    if (-not $DryRun -and -not $ReauthAccountKey) {
         $pendingManualVerification = Get-PendingManualVerification -Path $manualVerificationPath
         $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
         if ($null -ne $pendingManualVerification `
@@ -204,7 +262,10 @@ try {
                 $runArguments += @('--resume-report', [string]$resumeCandidate.Path)
             }
             if ($null -ne $manualVerification) {
-                $runArguments += @('--origins', (@($manualVerification.Origins) -join ','))
+                $runArguments += @(
+                    '--origins', (@($manualVerification.Origins) -join ','),
+                    '--consume-manual-verification'
+                )
             }
             elseif ($attempt -gt 1 -and $null -ne $resumeCandidate) {
                 $fallbackRetryOrigins = @(Get-NativeFallbackRetryOrigins `
@@ -292,7 +353,19 @@ try {
             }
             $freshCandidate = Get-FreshResumeReport $attemptStartedAt
             if ($null -ne $freshCandidate) { $resumeCandidate = $freshCandidate }
-            if ($attempt -eq 1 -and $attempt -lt $runAttempts -and $null -ne $freshCandidate) {
+            if ($ReauthAccountKey `
+                -and $null -ne $freshCandidate `
+                -and (Test-IsCompleteFinalReport $freshCandidate.Report) `
+                -and (Test-ReauthAccountAuthoritativelyComplete $freshCandidate.Report $ReauthAccountKey)) {
+                $nodeExitCode = 0
+                $runnerStatus = 'completed'
+                $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 已取得权威签到结果。"
+                $needsNativeFallbackRetry = $false
+            }
+            if (-not $ReauthAccountKey `
+                -and $attempt -eq 1 `
+                -and $attempt -lt $runAttempts `
+                -and $null -ne $freshCandidate) {
                 $needsNativeFallbackRetry = Test-NeedsNativeFallbackRetry `
                     -Report $freshCandidate.Report `
                     -Origins $nativeFallbackOnlyOrigins
@@ -314,6 +387,9 @@ try {
                         Write-Output "手动操作后的定向权威复核仍有 $(@($manualAttemptUpdate.PendingOrigins).Count) 个待处理站点。"
                     }
                 }
+            }
+            if ($null -ne $freshCandidate -and (Test-IsCompleteFinalReport $freshCandidate.Report)) {
+                [void](Write-ManualHandoff $freshCandidate.Report (Get-Date))
             }
             if ($nodeExitCode -eq 0 -and ($null -eq $freshCandidate -or -not (Test-IsCompleteFinalReport $freshCandidate.Report))) {
                 $nodeExitCode = 2
