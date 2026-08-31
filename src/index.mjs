@@ -63,10 +63,19 @@ const offsetIndex = process.argv.indexOf("--offset");
 const originsIndex = process.argv.indexOf("--origins");
 const resumeIndex = process.argv.indexOf("--resume-report");
 const consumeManualVerification = process.argv.includes("--consume-manual-verification");
+const consumeManualVerificationSubset = process.argv.includes("--consume-manual-verification-subset");
 const reauthAccountKeyIndex = process.argv.indexOf("--reauth-account-key");
 const reauthAccountKey = reauthAccountKeyIndex >= 0
   ? String(process.argv[reauthAccountKeyIndex + 1] ?? "").trim() || null
   : null;
+const forceReauth = process.argv.includes("--force-reauth");
+const postOAuthVerify = process.argv.includes("--post-oauth-verify");
+if (forceReauth && !reauthAccountKey) {
+  throw new Error("--force-reauth requires --reauth-account-key");
+}
+if (postOAuthVerify && !reauthAccountKey) {
+  throw new Error("--post-oauth-verify requires --reauth-account-key");
+}
 const limit = limitIndex >= 0 ? Math.max(1, Number.parseInt(process.argv[limitIndex + 1], 10) || 1) : null;
 const offset = offsetIndex >= 0 ? Math.max(0, Number.parseInt(process.argv[offsetIndex + 1], 10) || 0) : 0;
 let selectedOrigins = originsIndex >= 0
@@ -90,6 +99,7 @@ if (!dryRun && !listPreflightTargets && !reauthAccountKey) {
     });
   assertManualVerificationExecution(manualVerification, {
     consume: consumeManualVerification,
+    allowSubset: consumeManualVerificationSubset,
     resumeRequested: Boolean(requestedResumePath),
     selectedOrigins,
     runDate: localRunDate(),
@@ -250,7 +260,7 @@ try {
       try {
         const startedAt = Date.now();
         const runOptions = reauthAccountKey
-          ? { accountKey: reauthAccountKey }
+          ? { accountKey: reauthAccountKey, forceReauth, postOAuthVerify }
           : { onAccountResult: async (_accountResult, completedResults, accounts) => {
             if (completedResults.length === accounts.length) {
               const aggregate = aggregateReauthResults(completedResults);
@@ -364,40 +374,61 @@ try {
       const loginOutcomes = new Map();
       for (const resultIndex of recoveryIndexes) {
         const current = results[resultIndex];
-        if (current.status !== "login_required") continue;
         const target = selectedTargets[resultIndex];
         const provider = config.automaticOAuthProviders?.[current.origin];
+        const nativeOAuthCheckinEnabled = Boolean(provider)
+          && (config.nativeOAuthCheckinOrigins ?? []).includes(current.origin);
+        const nativeChallengeRecovery = current.status === "interactive_challenge"
+          && nativeOAuthCheckinEnabled;
+        if (current.status !== "login_required" && !nativeChallengeRecovery) continue;
         const savedLoginUrl = resolveLoginRecoveryUrl(
           current.origin,
           config.savedLoginUrls?.[current.origin],
           current.url,
         );
         const methods = [];
-        if ((config.protectedCredentialOrigins ?? []).includes(current.origin)) {
+        if (current.status === "login_required"
+          && (config.protectedCredentialOrigins ?? []).includes(current.origin)) {
           methods.push({
             method: "protected_credential",
             executable: config.powershellExecutable || "pwsh.exe",
             args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-ProtectedLogin.ps1"), "-Origin", current.origin, "-LoginUrl", savedLoginUrl],
           });
         }
-        if (provider) methods.push({ method: "oauth", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, provider, "--private-result"] });
-        else if (config.autoDetectLinuxDoOAuth !== false
-          && (config.autoDetectOAuthOrigins ?? []).includes(current.origin)) {
-          methods.push({ method: "oauth_autodetect", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, "LinuxDO", "--private-result"] });
+        if (nativeOAuthCheckinEnabled) {
+          methods.push({
+            method: "native_oauth_checkin",
+            executable: config.powershellExecutable || "pwsh.exe",
+            args: [
+              "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+              "-File", path.join(rootDirectory, "scripts", "Recover-NativeOAuthCheckin.ps1"),
+              "-Origin", current.origin,
+              "-Provider", provider,
+              "-LoginUrl", savedLoginUrl,
+            ],
+          });
         }
-        methods.push({
-          method: "saved_password",
-          executable: process.execPath,
-          args: [path.join(sourceDirectory, "saved-password-login.mjs"), current.origin, savedLoginUrl],
-        });
-        methods.push({
-          method: "native_saved_password",
-          executable: config.powershellExecutable || "pwsh.exe",
-          args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-NativeLogin.ps1"), "-Origin", current.origin, "-LoginUrl", savedLoginUrl],
-        });
+        if (current.status === "login_required") {
+          if (provider) methods.push({ method: "oauth", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, provider, "--private-result"] });
+          else if (config.autoDetectLinuxDoOAuth !== false
+            && (config.autoDetectOAuthOrigins ?? []).includes(current.origin)) {
+            methods.push({ method: "oauth_autodetect", executable: process.execPath, args: [path.join(sourceDirectory, "oauth-login.mjs"), current.origin, "LinuxDO", "--private-result"] });
+          }
+          methods.push({
+            method: "saved_password",
+            executable: process.execPath,
+            args: [path.join(sourceDirectory, "saved-password-login.mjs"), current.origin, savedLoginUrl],
+          });
+          methods.push({
+            method: "native_saved_password",
+            executable: config.powershellExecutable || "pwsh.exe",
+            args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(rootDirectory, "scripts", "Recover-NativeLogin.ps1"), "-Origin", current.origin, "-LoginUrl", savedLoginUrl],
+          });
+        }
 
         const attempts = [];
         let succeeded = false;
+        let authoritativeCheckinStatus = null;
         for (const method of methods) {
           try {
             const helperOutput = await execFileAsync(method.executable, method.args, {
@@ -410,6 +441,7 @@ try {
             attempts.push({ method: method.method, ...outcome });
             if (outcome.succeeded) {
               succeeded = true;
+              authoritativeCheckinStatus = outcome.checkinStatus ?? null;
               break;
             }
           } catch (error) {
@@ -423,19 +455,37 @@ try {
             });
           }
         }
-        loginOutcomes.set(current.origin, { attempted: true, succeeded, attempts });
+        loginOutcomes.set(current.origin, {
+          attempted: true,
+          succeeded,
+          ...(authoritativeCheckinStatus ? { authoritativeCheckinStatus } : {}),
+          attempts,
+        });
       }
 
       const delayMs = Math.max(0, Number(recoveryDelays[Math.min(round, recoveryDelays.length - 1)]) || 0);
       if (delayMs > 0) await wait(delayMs);
-      const recoveryContext = await launchAutomationContext(config);
+      const needsRecoveryBrowser = recoveryIndexes.some((resultIndex) => {
+        const origin = selectedTargets[resultIndex].origin;
+        return !["signed", "already_signed"].includes(loginOutcomes.get(origin)?.authoritativeCheckinStatus);
+      });
+      const recoveryContext = needsRecoveryBrowser ? await launchAutomationContext(config) : null;
       try {
         for (let recoveryIndex = 0; recoveryIndex < recoveryIndexes.length; recoveryIndex += 1) {
           const resultIndex = recoveryIndexes[recoveryIndex];
           const target = selectedTargets[resultIndex];
           const initialResult = results[resultIndex];
           console.log(`[recovery ${round + 1}.${recoveryIndex + 1}/${recoveryIndexes.length}] ${target.origin}`);
-          const recoveredResult = await runOneTarget(recoveryContext, target);
+          const loginOutcome = loginOutcomes.get(target.origin);
+          const sameSessionStatus = loginOutcome?.authoritativeCheckinStatus;
+          const recoveredResult = ["signed", "already_signed"].includes(sameSessionStatus)
+            ? {
+                status: sameSessionStatus,
+                reason: sameSessionStatus === "signed"
+                  ? "原生同会话 OAuth 后由签到接口确认今日签到完成"
+                  : "原生同会话 OAuth 后由签到接口确认今日已签到",
+              }
+            : await runOneTarget(recoveryContext, target);
           const priorHistory = initialResult.recovery?.history ?? [];
           results[resultIndex] = {
             origin: target.origin,
@@ -448,7 +498,7 @@ try {
               history: [...priorHistory, {
                 round: round + 1,
                 status: recoveredResult.status,
-                login: loginOutcomes.get(target.origin) ?? { attempted: false },
+                login: loginOutcome ?? { attempted: false },
               }],
             },
           };
@@ -458,7 +508,7 @@ try {
           });
         }
       } finally {
-        await recoveryContext.close();
+        await recoveryContext?.close();
       }
     }
 

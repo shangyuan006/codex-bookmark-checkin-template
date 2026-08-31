@@ -6,11 +6,13 @@ import {
   candidateHistoryEntry,
   challengeEvidenceIsUnresolved,
   classifyCalendarDayCheckinEvidence,
+  clickConfiguredChallengeControl,
   getConfiguredChallengeInteractionRule,
   getConfiguredCheckinCaptchaDialogRule,
   getConfiguredSequentialActionRule,
   configuredSequentialResponseProvesSuccess,
   selectConfiguredSequentialActionCandidate,
+  getConfiguredPreCheckinNavigationRule,
   getConfiguredPreCheckinDismissRule,
   getVisitCheckinWaitMs,
   getTargetTimeoutMs,
@@ -22,12 +24,15 @@ import {
   isConfiguredGrowthCheckinPage,
   isSafeDiscoveredHref,
   matchesConfiguredGrowthCompletedControlText,
+  navigateConfiguredPreCheckinPage,
   reliableNewApiCaptchaCandidates,
   preferCandidateResult,
   reconcileConfiguredGrowthCheckinState,
   selectConfiguredCapChallengeCandidate,
   selectSliderDragGeometry,
   runWithTargetTimeout,
+  shouldRetryConfiguredCheckinPageAction,
+  shouldUseConfiguredNewApiPageRetry,
   shouldBlockManualChallengeAction,
   TargetTimeoutError,
   targetNeedsManualChallenge,
@@ -36,6 +41,7 @@ import {
   tryNewApiCheckin,
   waitForConfirmedCheckinState,
   waitForManagedChallenge,
+  waitForOptionalChallengeAppearance,
   waitForPendingCheckinState,
 } from "../src/browser.mjs";
 
@@ -155,7 +161,7 @@ test("configured New API adapters reject conflicts and skip unconfigured origins
     page,
     "https://api.example.test",
     bothConfigured,
-  ), /conflicting captcha and sign-in rules/);
+  ), /conflicting captcha, sign-in, or Bearer rules/);
   assert.equal(evaluations, 0);
 
   const untouched = await tryConfiguredNewApiCheckin(page, "https://other.example.test", bothConfigured);
@@ -185,17 +191,37 @@ test("configured New API adapters reject conflicts and skip unconfigured origins
     signInOnly,
   )).status, "already_signed");
   assert.equal(evaluations, 2);
+
+  const bearerOnly = {
+    bearerCheckinRules: {
+      "https://api.example.test": { verificationDelayMs: 0 },
+    },
+  };
+  page.evaluate = async () => {
+    evaluations += 1;
+    return { state: "already_signed" };
+  };
+  assert.equal((await tryConfiguredNewApiCheckin(
+    page,
+    "https://api.example.test",
+    bearerOnly,
+  )).status, "already_signed");
+  assert.equal(evaluations, 3);
 });
 
-async function runLegacyNewApiCheckin(statuses) {
+async function runLegacyNewApiCheckin(statuses, {
+  storageUserId = 42,
+  selfStatus = 200,
+  statusHttpStatus = 200,
+} = {}) {
   const names = ["localStorage", "sessionStorage", "document", "fetch", "setTimeout"];
   const originals = new Map(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const statusQueue = [...statuses];
   const requests = [];
   const storage = {
-    length: 1,
+    length: storageUserId == null ? 0 : 1,
     key: () => "user",
-    getItem: () => JSON.stringify({ id: 42 }),
+    getItem: () => JSON.stringify({ id: storageUserId }),
   };
   try {
     Object.defineProperties(globalThis, {
@@ -207,12 +233,20 @@ async function runLegacyNewApiCheckin(statuses) {
         configurable: true,
         value: async (url, options = {}) => {
           requests.push({ url: String(url), method: options.method ?? "GET" });
+          if (String(url).includes("/api/user/self")) {
+            return {
+              status: selfStatus,
+              json: async () => selfStatus === 200
+                ? { success: true, data: { id: 42 } }
+                : { success: false, message: "unauthorized" },
+            };
+          }
           if (options.method === "POST") {
             return { status: 200, json: async () => ({ success: true }) };
           }
           const checked = statusQueue.shift() ?? false;
           return {
-            status: 200,
+            status: statusHttpStatus,
             json: async () => ({ success: true, data: { stats: { checked_in_today: checked } } }),
           };
         },
@@ -237,6 +271,19 @@ test("legacy New API POST success requires a confirming status read", async () =
   const confirmed = await runLegacyNewApiCheckin([false, true]);
   assert.equal(confirmed.result.status, "signed");
   assert.equal(confirmed.requests.filter((request) => request.method === "GET").length, 2);
+});
+
+test("legacy New API reports an invalid session instead of no_action", async () => {
+  const missingStorage = await runLegacyNewApiCheckin([], {
+    storageUserId: null,
+    selfStatus: 401,
+  });
+  assert.equal(missingStorage.result.status, "login_required");
+  assert.equal(missingStorage.requests.at(-1).url, "/api/user/self");
+
+  const staleStorage = await runLegacyNewApiCheckin([], { statusHttpStatus: 403 });
+  assert.equal(staleStorage.result.status, "login_required");
+  assert.equal(staleStorage.requests.filter((request) => request.method === "POST").length, 0);
 });
 
 test("签到入口发现拒绝被浏览器解析成同源路径的畸形 href", () => {
@@ -344,6 +391,157 @@ test("签到前公告关闭规则可有界处理复用同一关闭控件的连�
   assert.equal(remaining, 0);
 });
 
+test("pre-check-in navigation requires unique same-origin controls and an exact final path", async () => {
+  const target = {
+    origin: "https://bookmark.test",
+    allowedOrigins: ["https://bookmark.test"],
+  };
+  const config = {
+    preCheckinNavigationRules: {
+      "https://bookmark.test": {
+        steps: [
+          { selector: "button[data-profile-menu]" },
+          { role: "menuitem", name: " Profile " },
+        ],
+        expectedPath: "/profile",
+        waitMs: 1,
+        afterClickWaitMs: 1,
+      },
+    },
+  };
+  assert.deepEqual(getConfiguredPreCheckinNavigationRule(
+    target,
+    "https://bookmark.test",
+    config,
+  ), {
+    expectedPath: "/profile",
+    steps: [
+      { selector: "button[data-profile-menu]", role: "", name: "" },
+      { selector: "", role: "menuitem", name: "Profile" },
+    ],
+    waitMs: 500,
+    afterClickWaitMs: 100,
+  });
+  assert.equal(getConfiguredPreCheckinNavigationRule(
+    target,
+    "https://outside.test",
+    config,
+  ), null);
+  assert.throws(() => getConfiguredPreCheckinNavigationRule(target, target.origin, {
+    preCheckinNavigationRules: {
+      [target.origin]: {
+        steps: [{ selector: "button", role: "button", name: "Profile" }],
+        expectedPath: "/profile",
+      },
+    },
+  }), /selector or role\/name/);
+  assert.throws(() => getConfiguredPreCheckinNavigationRule(target, target.origin, {
+    preCheckinNavigationRules: {
+      [target.origin]: {
+        steps: [{ selector: "button" }],
+        expectedPath: "https://outside.test/profile",
+      },
+    },
+  }), /exact same-origin path/);
+
+  let currentUrl = "https://bookmark.test/dashboard/overview";
+  let menuOpen = false;
+  const trigger = {
+    isVisible: async () => true,
+    isEnabled: async () => true,
+    click: async () => { menuOpen = true; },
+  };
+  const profileItem = {
+    isVisible: async () => true,
+    isEnabled: async () => true,
+    click: async () => { currentUrl = "https://bookmark.test/profile"; },
+  };
+  const locatorFor = (getter) => ({
+    count: async () => getter() ? 1 : 0,
+    nth: () => ({
+      isVisible: async () => Boolean(getter()) && getter().isVisible(),
+      isEnabled: async () => Boolean(getter()) && getter().isEnabled(),
+      click: async (options) => getter().click(options),
+    }),
+  });
+  const page = {
+    url: () => currentUrl,
+    locator: () => locatorFor(() => trigger),
+    getByRole: () => locatorFor(() => menuOpen ? profileItem : null),
+    waitForTimeout: async () => {},
+  };
+  assert.equal(await navigateConfiguredPreCheckinPage(
+    page,
+    target,
+    target.origin,
+    config,
+  ), true);
+  assert.equal(currentUrl, "https://bookmark.test/profile");
+
+  for (const loginPath of ["/login", "/sign-in", "/user_log-in"]) {
+    const loginPage = {
+      url: () => `https://bookmark.test${loginPath}?redirect=%2Fprofile`,
+      locator: () => { throw new Error("login pages must not run pre-check-in navigation"); },
+      getByRole: () => { throw new Error("login pages must not run pre-check-in navigation"); },
+    };
+    assert.equal(await navigateConfiguredPreCheckinPage(
+      loginPage,
+      target,
+      target.origin,
+      config,
+    ), false);
+  }
+
+  const directActionPage = {
+    url: () => "https://bookmark.test/dashboard/overview",
+    locator: () => { throw new Error("a direct check-in action must bypass pre-check-in navigation"); },
+    getByRole: () => { throw new Error("a direct check-in action must bypass pre-check-in navigation"); },
+  };
+  assert.equal(await navigateConfiguredPreCheckinPage(
+    directActionPage,
+    target,
+    target.origin,
+    config,
+    { hasCheckinAction: true },
+  ), false);
+
+  let redirectingUrl = "https://bookmark.test/dashboard/overview";
+  const redirectingPage = {
+    url: () => redirectingUrl,
+    locator: () => ({ count: async () => 0 }),
+    getByRole: () => ({ count: async () => 0 }),
+    waitForTimeout: async () => { redirectingUrl = "https://bookmark.test/sign-in"; },
+  };
+  assert.equal(await navigateConfiguredPreCheckinPage(
+    redirectingPage,
+    target,
+    target.origin,
+    config,
+  ), false);
+  assert.equal(redirectingUrl, "https://bookmark.test/sign-in");
+
+  const ambiguousCandidates = [
+    { isVisible: async () => false },
+    { isVisible: async () => true },
+    { isVisible: async () => true },
+  ];
+  const ambiguousPage = {
+    url: () => "https://bookmark.test/dashboard/overview",
+    locator: () => ({
+      count: async () => ambiguousCandidates.length,
+      nth: (index) => ambiguousCandidates[index],
+    }),
+    getByRole: () => ({ count: async () => 0 }),
+    waitForTimeout: async () => {},
+  };
+  await assert.rejects(navigateConfiguredPreCheckinPage(
+    ambiguousPage,
+    target,
+    target.origin,
+    config,
+  ), /not unique/);
+});
+
 test("候选弱结果不会覆盖登录、挑战或延迟状态", () => {
   for (const status of ["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred"]) {
     const valuable = { status, reason: "actionable" };
@@ -399,6 +597,74 @@ test("Cap.js 容器只接受唯一、可见且尺寸合理的候选", () => {
   ]).outcome, "challenge_not_found");
 });
 
+test("Cap.js interaction waits for a delayed embedded widget", async () => {
+  let embeddedReads = 0;
+  let clicks = 0;
+  const emptyLocator = {
+    count: async () => 0,
+    nth: () => emptyLocator,
+  };
+  const capControl = {
+    isVisible: async () => true,
+    isEnabled: async () => true,
+    click: async () => { clicks += 1; },
+  };
+  const capControls = {
+    count: async () => 1,
+    nth: () => capControl,
+  };
+  const capWidget = {
+    locator: () => capControls,
+  };
+  const embeddedWidgets = {
+    evaluateAll: async () => {
+      embeddedReads += 1;
+      return embeddedReads === 1
+        ? []
+        : [{ index: 0, visible: true, disabled: false, width: 390, height: 60 }];
+    },
+    nth: () => capWidget,
+  };
+  const capWidgets = {
+    evaluateAll: async () => [
+      { index: 0, visible: true, disabled: false, width: 390, height: 60 },
+    ],
+    nth: () => ({ locator: () => embeddedWidgets }),
+  };
+  const page = {
+    url: () => "https://me.example/checkin",
+    title: async () => "",
+    evaluate: async () => ({
+      bodyText: "",
+      passwordInputs: false,
+      challengeEvidence: [{
+        visible: true,
+        challengeLike: true,
+        resolvedState: false,
+        responsePresent: false,
+      }],
+      confirmedCheckinControl: false,
+    }),
+    frames: () => [],
+    locator: (selector) => {
+      if (selector === ".cap-verify") return capWidgets;
+      return emptyLocator;
+    },
+    mouse: { click: async () => {} },
+  };
+
+  const result = await clickConfiguredChallengeControl(
+    page,
+    { waitMs: 2_000, optional: false },
+    "https://me.example",
+    { checkinStatePollMs: 5 },
+  );
+
+  assert.equal(result, null);
+  assert.equal(embeddedReads, 2);
+  assert.equal(clicks, 1);
+});
+
 test("验证控件保留在页面时只把未解决证据视为挑战", () => {
   assert.equal(challengeEvidenceIsUnresolved({ visible: true }), true);
   assert.equal(challengeEvidenceIsUnresolved({ visible: true, challengeLike: false }), false);
@@ -419,9 +685,11 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
     type: "click",
     phase: "before",
     optional: false,
+    appearanceWaitMs: 0,
     waitMs: 60_000,
     settleMs: 3000,
     retryAction: false,
+    retryDomClick: false,
     retryActionWaitMs: 0,
   });
   assert.deepEqual(getConfiguredChallengeInteractionRule(target, "https://bookmark.test", {
@@ -430,7 +698,9 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
         type: "wait",
         phase: "after",
         optional: true,
+        appearanceWaitMs: 90_000,
         retryAction: true,
+        retryDomClick: true,
         retryActionWaitMs: 90_000,
       },
     },
@@ -438,9 +708,11 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
     type: "wait",
     phase: "after",
     optional: true,
+    appearanceWaitMs: 15_000,
     waitMs: 30_000,
     settleMs: 3000,
     retryAction: true,
+    retryDomClick: true,
     retryActionWaitMs: 20_000,
   });
   assert.equal(getConfiguredChallengeInteractionRule(target, "https://bookmark.test", config, "after"), null);
@@ -448,6 +720,63 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
   assert.throws(() => getConfiguredChallengeInteractionRule(target, "https://bookmark.test", {
     challengeInteractionRules: { "https://bookmark.test": { type: "unknown" } },
   }), /类型无效/);
+});
+
+test("configured API page retry requires an explicit after-phase retry rule", () => {
+  const challenge = { status: "interactive_challenge" };
+  assert.equal(shouldUseConfiguredNewApiPageRetry(challenge, {
+    phase: "after",
+    retryAction: true,
+  }), true);
+  assert.equal(shouldUseConfiguredNewApiPageRetry({ status: "login_required" }, {
+    phase: "after",
+    retryAction: true,
+  }), true);
+  assert.equal(shouldUseConfiguredNewApiPageRetry(challenge, {
+    phase: "before",
+    retryAction: true,
+  }), false);
+  assert.equal(shouldUseConfiguredNewApiPageRetry(challenge, {
+    phase: "after",
+    retryAction: false,
+  }), false);
+  assert.equal(shouldUseConfiguredNewApiPageRetry({ status: "ready" }, {
+    phase: "after",
+    retryAction: true,
+  }), false);
+
+  const afterRetry = { phase: "after", retryAction: true };
+  assert.equal(shouldRetryConfiguredCheckinPageAction(true, afterRetry, { status: "ready" }), true);
+  assert.equal(shouldRetryConfiguredCheckinPageAction(true, afterRetry, { status: "unconfirmed" }), true);
+  for (const status of [
+    "signed",
+    "already_signed",
+    "login_required",
+    "needs_attention",
+    "interactive_challenge",
+    "managed_challenge",
+    "managed_challenge_timeout",
+    "deferred",
+  ]) {
+    assert.equal(shouldRetryConfiguredCheckinPageAction(true, afterRetry, { status }), false);
+  }
+  assert.equal(shouldRetryConfiguredCheckinPageAction(false, afterRetry, { status: "ready" }), false);
+});
+
+test("可选的点击后验证会等待延迟出现的挑战控件", async () => {
+  const states = [
+    { status: "ready" },
+    { status: "interactive_challenge", unresolvedChallenge: true },
+  ];
+  const result = await waitForOptionalChallengeAppearance(
+    {},
+    { checkinStatePollMs: 5 },
+    { appearanceWaitMs: 100 },
+    { status: "ready" },
+    async () => states.shift() ?? { status: "ready" },
+  );
+  assert.equal(result.status, "interactive_challenge");
+  assert.equal(result.unresolvedChallenge, true);
 });
 
 test("签到图片验证码规则严格限制当前书签来源并验证结构", () => {

@@ -12,10 +12,13 @@ const LOGIN_HELPER_STATUSES = new Set([
 const OAUTH_DIAGNOSTIC_STAGES = new Set([
   "target_login",
   "provider_button",
+  "login_challenge",
   "provider_transition",
   "linuxdo_session",
   "provider_authorization",
   "target_callback",
+  "session_verification",
+  "checkin_verification",
   "completed",
   "timeout",
   "helper_failed",
@@ -72,6 +75,9 @@ export function loginHelperOutcome(text, fallback = "failed") {
     succeeded: status === "logged_in",
     status,
     diagnostic: messages[status] ?? messages.failed,
+    ...(["signed", "already_signed"].includes(String(value?.checkinStatus))
+      ? { checkinStatus: String(value.checkinStatus) }
+      : {}),
     ...(OAUTH_DIAGNOSTIC_STAGES.has(String(value?.oauthStage))
       ? { oauthStage: String(value.oauthStage) }
       : {}),

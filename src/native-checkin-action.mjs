@@ -204,6 +204,9 @@ export async function clickVisibleNativeChallengeControl(page, expectedOrigin, r
     labelCandidateCount: labelCandidates.length,
     frameClickCandidateCount: frameClickCandidates.length,
   };
+  if (allowedFrameCount > 1 || allowedParentFrameCount > 1) {
+    return { clicked: false, outcome: "challenge_frame_not_unique", details };
+  }
   if (candidates.length === 0 && frameClickCandidates.length === 1) {
     const box = frameClickCandidates[0];
     try {

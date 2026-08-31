@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 . (Join-Path $PSScriptRoot 'ManualVerification.ps1')
+. (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 $configPath = Join-Path $root 'config\config.json'
 $initialConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $statePath = Join-Path $root 'data\scheduler-state.json'
@@ -37,23 +38,6 @@ function Read-SchedulerState {
     catch { return [pscustomobject]@{} }
 }
 
-function Get-TodayAbandonedOrigins([datetime]$Now) {
-    $origins = @{}
-    if (-not (Test-Path -LiteralPath $manualAbandonPath)) { return $origins }
-    try {
-        $document = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualAbandonPath | ConvertFrom-Json
-        if ([string]$document.date -ne $Now.ToString('yyyyMMdd')) { return $origins }
-        foreach ($rawOrigin in @($document.origins)) {
-            $uri = try { [uri]([string]$rawOrigin) } catch { $null }
-            if ($uri -and $uri.Scheme -eq 'https' -and $uri.Host -and -not $uri.UserInfo) {
-                $origins[$uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/')] = $true
-            }
-        }
-    }
-    catch { }
-    return $origins
-}
-
 function Get-LatestReportState([datetime]$now, $config, [Nullable[datetime]]$notBefore = $null) {
     $latestPath = Join-Path $root 'logs\latest.json'
     $empty = [pscustomobject]@{
@@ -77,10 +61,11 @@ function Get-LatestReportState([datetime]$now, $config, [Nullable[datetime]]$not
         $contractComplete = $latest.isComplete -eq $true `
             -and $processedTotal -ge $plannedTotal `
             -and $results.Count -ge $plannedTotal
-        $abandonedOrigins = Get-TodayAbandonedOrigins $now
+        $abandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now $now
         $problems = @($results | Where-Object {
+            $resultOrigin = ConvertTo-ManualAbandonmentOrigin $_.origin
             $_.status -notin @('signed', 'already_signed', 'not_available') `
-                -and -not $abandonedOrigins.ContainsKey([string]$_.origin)
+                -and (-not $resultOrigin -or -not $abandonedOrigins.ContainsKey($resultOrigin))
         })
         $missingCount = [Math]::Max(0, $plannedTotal - $processedTotal)
         $retryTimes = @($problems | Where-Object { $_.status -eq 'deferred' -and $_.nextEligibleAt } | ForEach-Object {
@@ -122,7 +107,7 @@ function Get-ManualHandoffState([datetime]$Now) {
             }).Count
             if ([string]$verification.state -eq 'pending_verification' `
                 -and $verification.authoritativeEvidenceRequired -eq $true `
-                -and [string]$verification.sourceRunId -like "$todayPrefix*" `
+                -and (Test-ManualVerificationCurrentDayDocument $verification $Now) `
                 -and $pendingCount -gt 0) {
                 return [pscustomobject]@{
                     Mode = 'verification_ready'

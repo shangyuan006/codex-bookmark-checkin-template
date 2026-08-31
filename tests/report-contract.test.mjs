@@ -11,8 +11,9 @@ const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmpRoot = path.join(root, "tmp");
 const reporter = path.join(root, "scripts", "Submit-UnifiedCheckinReport.ps1");
+const abandonmentHelper = path.join(root, "scripts", "ManualAbandonment.ps1");
 
-async function previewReport(report, runnerStatus = "completed") {
+async function previewReport(report, runnerStatus = "completed", abandonedOrigins = []) {
   await fs.mkdir(tmpRoot, { recursive: true });
   const fixtureRoot = await fs.mkdtemp(path.join(tmpRoot, "report-contract-test-"));
   const scriptsDirectory = path.join(fixtureRoot, "scripts");
@@ -24,8 +25,22 @@ async function previewReport(report, runnerStatus = "completed") {
     await fs.mkdir(scriptsDirectory, { recursive: true });
     await fs.mkdir(configDirectory, { recursive: true });
     await fs.mkdir(reportDirectory, { recursive: true });
-    await fs.copyFile(reporter, fixtureReporter);
+    await Promise.all([
+      fs.copyFile(reporter, fixtureReporter),
+      fs.copyFile(abandonmentHelper, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
+    ]);
     await fs.writeFile(path.join(configDirectory, "defaults.json"), JSON.stringify({ notification: { mode: "none" } }), "utf8");
+    if (abandonedOrigins.length > 0) {
+      const today = new Date().toLocaleDateString("en-CA", {
+        year: "numeric", month: "2-digit", day: "2-digit",
+      }).replaceAll("-", "");
+      await fs.mkdir(path.join(fixtureRoot, "tmp"), { recursive: true });
+      await fs.writeFile(path.join(fixtureRoot, "tmp", "manual-abandon.json"), JSON.stringify({
+        schemaVersion: 1,
+        date: today,
+        origins: abandonedOrigins,
+      }), "utf8");
+    }
     await fs.writeFile(reportPath, JSON.stringify(report), "utf8");
     const { stdout } = await execFileAsync(powershellExecutable, [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -39,6 +54,33 @@ async function previewReport(report, runnerStatus = "completed") {
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   }
 }
+
+test("today's abandonment is projected into report counts without hiding real problems", async () => {
+  const report = await previewReport({
+    runId: "20260825-120000",
+    runState: "final",
+    plannedTotal: 3,
+    processedTotal: 3,
+    isComplete: true,
+    selectedOrigins: ["https://abandoned.test", "https://problem.test"],
+    selectedTotal: 2,
+    selectedProcessedTotal: 2,
+    results: [
+      { origin: "https://signed.test", status: "signed" },
+      { origin: "https://abandoned.test", status: "login_required" },
+      { origin: "https://problem.test", status: "no_action" },
+    ],
+  }, "completed", ["https://abandoned.test"]);
+
+  assert.equal(report.problemCount, 1);
+  assert.equal(report.abandonedCount, 1);
+  assert.equal(report.selectedProblemCount, 1);
+  assert.equal(report.selectedAbandonedCount, 1);
+  assert.deepEqual(report.selectedSummary, { abandoned: 1, no_action: 1 });
+  assert.match(report.summary, /1 个今日放弃/);
+  assert.match(report.summary, /problem\.test/);
+  assert.doesNotMatch(report.summary, /abandoned\.test：登录失效/);
+});
 
 test("部分进度即使全部已签到也不会报告成功", async () => {
   const report = await previewReport({

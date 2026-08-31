@@ -239,6 +239,46 @@ test("health contract returns exit 0 only for today's complete result matching t
   assert.equal(result.report.checks.latestResultConfirmed, true);
 });
 
+test("health treats today's explicitly abandoned unresolved target as confirmed", async (context) => {
+  const fixtureRoot = await createFixture();
+  context.after(() => fs.rm(fixtureRoot, { recursive: true, force: true }));
+  const latestPath = path.join(fixtureRoot, "logs", "latest.json");
+  const latest = JSON.parse(await fs.readFile(latestPath, "utf8"));
+  latest.results[0].status = "login_required";
+  latest.results[0].accountResults[1].status = "login_required";
+  await fs.writeFile(latestPath, JSON.stringify(latest), "utf8");
+
+  const today = new Date().toLocaleDateString("en-CA", {
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).replaceAll("-", "");
+  const abandonmentPath = path.join(fixtureRoot, "tmp", "manual-abandon.json");
+  await fs.mkdir(path.dirname(abandonmentPath), { recursive: true });
+  await fs.writeFile(abandonmentPath, JSON.stringify({
+    schemaVersion: 1,
+    date: today,
+    origins: ["https://one.test"],
+  }), "utf8");
+
+  const abandoned = runHealth(fixtureRoot, { mockWindowsState: true });
+  assert.equal(abandoned.exitCode, 0, `${abandoned.stdout}\n${abandoned.stderr}`);
+  assert.equal(abandoned.report.latestProblemCount, 0);
+  assert.equal(abandoned.report.latestAccountProblemCount, 0);
+  assert.equal(abandoned.report.latestAbandonedCount, 1);
+  assert.equal(abandoned.report.checks.latestResultConfirmed, true);
+
+  await fs.writeFile(abandonmentPath, JSON.stringify({
+    schemaVersion: 1,
+    date: "20000101",
+    origins: ["https://one.test"],
+  }), "utf8");
+  const stale = runHealth(fixtureRoot, { mockWindowsState: true });
+  assert.equal(stale.exitCode, 2, stale.stderr);
+  assert.equal(stale.report.latestProblemCount, 1);
+  assert.equal(stale.report.latestAccountProblemCount, 1);
+  assert.equal(stale.report.latestAbandonedCount, 0);
+  assert.equal(stale.report.checks.latestResultConfirmed, false);
+});
+
 test("health contract returns exit 2 when the latest result no longer matches bookmarks", async (context) => {
   const fixtureRoot = await createFixture();
   context.after(() => fs.rm(fixtureRoot, { recursive: true, force: true }));

@@ -17,9 +17,31 @@ import {
   reauthLoginFailureReason,
   runConfiguredReauthCheckin,
   selectConfiguredReauthAccount,
+  shouldReuseCompletedReauthState,
   valueAtFieldPath,
   withReauthAccountMetadata,
 } from "../src/reauth-checkin.mjs";
+
+test("forced account reauth bypasses only today's completed state", () => {
+  const completed = { date: "20260829", status: "completed" };
+  assert.equal(shouldReuseCompletedReauthState(completed, "20260829"), true);
+  assert.equal(shouldReuseCompletedReauthState(completed, "20260829", true), false);
+  assert.equal(shouldReuseCompletedReauthState(completed, "20260830"), false);
+  assert.equal(shouldReuseCompletedReauthState({ date: "20260829", status: "logged_out" }, "20260829"), false);
+});
+
+test("forced reauth CLI remains restricted to one explicit Agent Router account", async () => {
+  const [entrypoint, runner] = await Promise.all([
+    fs.readFile(new URL("../src/index.mjs", import.meta.url), "utf8"),
+    fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8"),
+  ]);
+  assert.match(entrypoint, /forceReauth && !reauthAccountKey/);
+  assert.match(entrypoint, /\{ accountKey: reauthAccountKey, forceReauth, postOAuthVerify \}/);
+  assert.match(entrypoint, /postOAuthVerify && !reauthAccountKey/);
+  assert.match(runner, /\[switch\]\$ForceReauth/);
+  assert.match(runner, /\$ForceReauth -and -not \$ReauthAccountKey/);
+  assert.match(runner, /if \(\$ForceReauth\) \{ \$arguments \+= '--force-reauth' \}/);
+});
 
 const target = {
   origin: "https://reauth.example",
@@ -104,6 +126,10 @@ test("重认证保留配置的 OAuth 提供方并在失败时据实说明", () =
   assert.equal(
     reauthLoginFailureReason(githubRule.provider, "target_callback"),
     "GitHub 重新登录未完成（登录回调未返回目标站），需要人工处理",
+  );
+  assert.equal(
+    reauthLoginFailureReason(githubRule.provider, "login_challenge"),
+    "GitHub 重新登录未完成（安全验证完成后仍未找到提供方按钮），需要人工处理",
   );
   assert.doesNotMatch(reauthLoginFailureReason(githubRule.provider, "private-page-text"), /private-page-text/);
 });
@@ -451,25 +477,61 @@ test("LinuxDO automatic OAuth recovery runs provider and Agent Router phases seq
   const providerPhase = source.indexOf('["--provider-only"]');
   const agentRouterPhase = source.indexOf('["--agent-router-only"]');
   assert.ok(providerPhase >= 0 && agentRouterPhase > providerPhase);
-  const postLogoutPhase = source.indexOf("const oauthResult = normalizeReauthProvider(rule.provider");
-  assert.ok(postLogoutPhase > stateIndex(source, 'buildReauthStateEntry(date, "logged_out", new Date())'));
+  const loggedOutState = stateIndex(source, 'buildReauthStateEntry(date, "logged_out", new Date())');
+  const postLogoutPhase = source.indexOf("const oauthResult = normalizeReauthProvider(rule.provider", loggedOutState);
+  assert.ok(postLogoutPhase > loggedOutState);
   assert.match(source, /runAgentRouterOnlyWithRetry\(rule, accountConfig, rule\)/);
+  assert.match(source, /previous\?\.date === date && previous\.status === "logged_out"[\s\S]*?runAgentRouterOnlyWithRetry/);
   assert.match(source, /same encrypted browser profile/);
 
   const oauth = await fs.readFile(new URL("../src/oauth-login.mjs", import.meta.url), "utf8");
   assert.match(oauth, /const providerOnly = process\.argv\.includes\("--provider-only"\)/);
   assert.match(oauth, /const agentRouterOnly = process\.argv\.includes\("--agent-router-only"\)/);
+  assert.match(oauth, /const providerSessionConfirmed = process\.argv\.includes\("--provider-session-confirmed"\)/);
   assert.match(oauth, /https:\/\/linux\.do\/session\/current\.json/);
-  assert.match(oauth, /async function waitForLinuxDoSession/);
-  assert.match(oauth, /waitForLinuxDoSession\(providerPage, 2\)/);
+  assert.match(oauth, /async function probeLinuxDoSession/);
+  assert.match(oauth, /probeLinuxDoSession\(providerContext, 2\)/);
+  assert.match(oauth, /probeProviderSessionInContext\(/);
+  assert.match(oauth, /if \(initialSession !== "invalid"\) return false/);
   assert.match(oauth, /await providerPage\.waitForTimeout\(Math\.min\(2_500, providerWaitMs\)\)/);
-  assert.match(oauth, /if \(!await waitForLinuxDoSession\(page\)\)/);
+  const agentRouterWarmup = oauth.indexOf("if (agentRouterOnly)", oauth.indexOf("oauthFlow: {"));
+  const targetPageAcquisition = oauth.indexOf("acquireTargetPage(context)", agentRouterWarmup);
+  assert.ok(agentRouterWarmup >= 0 && targetPageAcquisition > agentRouterWarmup);
+  assert.match(
+    oauth.slice(agentRouterWarmup, targetPageAcquisition),
+    /probeLinuxDoSession\(context, 2\)[\s\S]*?providerSession !== "valid"/,
+  );
+  assert.match(oauth, /strict provider -> target ordering without showing a parallel window/);
+  assert.match(source, /"--agent-router-only",\s*"--provider-session-confirmed"/);
   assert.match(oauth, /destinationPage !== currentPage/);
+  assert.match(oauth, /const providerHomeRecoveryAttempts = 3/);
+  assert.match(oauth, /flowAttempt < providerHomeRecoveryAttempts/);
+  assert.match(oauth, /await page\.waitForTimeout\(Math\.min\(1_500, providerWaitMs\)\)/);
+  assert.match(oauth, /OAuth provider repeatedly resumed at its home page/);
+  assert.match(oauth, /never open a parallel provider page/);
   const providerFlowStart = oauth.indexOf("async function runProviderOnlyFlow");
   const providerFlowEnd = oauth.indexOf("if (providerOnly)", providerFlowStart);
   const providerFlow = oauth.slice(providerFlowStart, providerFlowEnd);
-  assert.match(providerFlow, /await providerContext\.close\(\);/);
+  assert.match(providerFlow, /await closeOAuthContext\(providerContext\);/);
   assert.doesNotMatch(providerFlow, /providerContext\.close\(\)\.catch/);
+  assert.match(oauth, /async function closeOAuthContext\(context\)/);
+  assert.match(oauth, /await context\.close\(\);/);
+});
+
+test("manual Agent Router completion verifies the existing OAuth result without starting another OAuth", async () => {
+  const source = await fs.readFile(new URL("../src/reauth-checkin.mjs", import.meta.url), "utf8");
+  const postOAuthBranch = source.indexOf("if (options.postOAuthVerify)");
+  const normalLoggedOutBranch = source.indexOf('if (previous?.date === date && previous.status === "logged_out")');
+  assert.ok(postOAuthBranch >= 0 && postOAuthBranch < normalLoggedOutBranch);
+  const verificationOnlySource = source.slice(postOAuthBranch, normalLoggedOutBranch);
+  assert.match(verificationOnlySource, /inspectCurrentLogin\(accountConfig, rule\)/);
+  assert.match(verificationOnlySource, /explicitLoginSuccess/);
+  assert.doesNotMatch(verificationOnlySource, /runAgentRouterOnlyWithRetry|runPrivateOAuthWithRetry/);
+
+  const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
+  assert.match(runner, /\[switch\]\$PostOAuthVerify/);
+  assert.match(runner, /--post-oauth-verify/);
+  assert.match(runner, /未取得 signed 或 already_signed 权威结果/);
 });
 
 function stateIndex(source, expression) {

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import {
   configuredSavedLoginSessionRule,
   verifyConfiguredSavedLoginSession,
@@ -75,6 +76,42 @@ test("saved login session verification is explicit and same-origin", () => {
   );
 });
 
+test("Bearer refresh session verification requires and uses its authoritative adapter", async () => {
+  const bearerConfig = {
+    savedLoginSessionRules: {
+      [ORIGIN]: { type: "bearer_refresh" },
+    },
+    bearerCheckinRules: {
+      [ORIGIN]: { verificationDelayMs: 0 },
+    },
+  };
+  assert.deepEqual(configuredSavedLoginSessionRule(ORIGIN, bearerConfig), { type: "bearer_refresh" });
+  assert.throws(
+    () => configuredSavedLoginSessionRule(ORIGIN, {
+      savedLoginSessionRules: bearerConfig.savedLoginSessionRules,
+    }),
+    /requires a bearerCheckinRules entry/,
+  );
+
+  const result = await verifyConfiguredSavedLoginSession(page(async (rawUrl, options = {}) => {
+    const url = new URL(String(rawUrl));
+    if (url.pathname === "/api/user/auth/refresh") {
+      assert.equal(options.method, "POST");
+      return response({
+        success: true,
+        data: {
+          ["access" + "_token"]: ["opaque", "value"].join("-"),
+          token_type: "Bearer",
+        },
+      });
+    }
+    assert.equal(url.pathname, "/api/data/self");
+    assert.equal(options.headers.Authorization, ["Bearer opaque", "value"].join("-"));
+    return response({ success: true, data: { user: { id: 42 } } });
+  }), ORIGIN, bearerConfig);
+  assert.deepEqual(result, { status: "valid" });
+});
+
 test("New API session requires one storage ID and matching authoritative identity", async () => {
   let requestCount = 0;
   const result = await verifyConfiguredSavedLoginSession(page(async (url, options) => {
@@ -120,4 +157,12 @@ test("New API session fails closed for ambiguous identity or server failure", as
     { local: { user: { id: 42 } } },
   ), ORIGIN, config());
   assert.deepEqual(unavailable, { status: "unknown" });
+});
+
+test("native saved-login recovery requires configured authoritative session verification", async () => {
+  const source = await fs.readFile(new URL("../src/native-login.mjs", import.meta.url), "utf8");
+  assert.match(source, /import \{ verifyConfiguredSavedLoginSession \} from "\.\/saved-login-session\.mjs"/);
+  assert.match(source, /await verifyConfiguredSavedLoginSession\(page, expectedOrigin, config\)/);
+  assert.match(source, /verifiedSession\.status !== "valid"[\s\S]*?status = "needs_attention"/);
+  assert.doesNotMatch(source, /finalUrl:|title:/);
 });

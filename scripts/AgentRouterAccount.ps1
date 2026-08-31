@@ -6,6 +6,26 @@ function ConvertTo-AgentRouterAccountKey([object]$Value) {
     return $normalized
 }
 
+function Resolve-AgentRouterPowerShellExecutable {
+    $current = try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { $null }
+    foreach ($candidate in @(
+        $current,
+        (Join-Path $PSHOME 'pwsh.exe'),
+        (Join-Path $PSHOME 'powershell.exe')
+    )) {
+        if (-not $candidate) { continue }
+        $name = [System.IO.Path]::GetFileName([string]$candidate)
+        if ($name -in @('pwsh.exe', 'powershell.exe') -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return [System.IO.Path]::GetFullPath([string]$candidate)
+        }
+    }
+    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+        $command = Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($command -and $command.Source) { return [string]$command.Source }
+    }
+    throw 'Unable to resolve the current PowerShell executable.'
+}
+
 function ConvertTo-AgentRouterOrigin([object]$Value) {
     $raw = [string]$Value
     $uri = try { [uri]$raw } catch { $null }

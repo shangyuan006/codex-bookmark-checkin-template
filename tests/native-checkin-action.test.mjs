@@ -63,16 +63,33 @@ test("原生签到完成控件只接受明确的今日完成文本", () => {
   assert.equal(matchesNativeCompletedControlText("签到说明"), false);
 });
 
-test("原生预热脚本只对显式动作规则启用受限签到模式", async () => {
+test("原生预热脚本只对显式规则启用受限签到模式", async () => {
   const fs = await import("node:fs/promises");
   const source = await fs.readFile(new URL("../scripts/Prepare-NativeWafSession.ps1", import.meta.url), "utf8");
-  assert.match(source, /\$inspectionMode = if \(\$hasAction\) \{ 'execute-checkin' \}/);
+  assert.match(source, /elseif \(\$hasNewApiCheckin\) \{ 'execute-new-api' \}/);
   assert.match(source, /ToBase64String/);
   assert.match(source, /被动原生验证不能同时配置签到动作/);
-  assert.match(source, /-not \$hasAction -and -not \[bool\]\$item\.trustAsSigned/);
+  assert.match(source, /被动原生验证不能同时配置 New API 签到/);
+  assert.match(source, /原生按钮签到和 New API 签到不能同时配置/);
+  assert.match(source, /原生 New API 签到来源未加入 newApiCheckinOrigins/);
+  assert.match(source, /-not \$hasAction -and -not \$hasNewApiCheckin -and -not \[bool\]\$item\.trustAsSigned/);
+  assert.match(source, /-not \$hasNewApiCheckin -or \[bool\]\$inspection\.newApiConfirmed/);
   assert.match(source, /\$lastInspection = \$inspection/);
   assert.match(source, /\$reportedInspection = if \(\$null -ne \$inspection\)/);
   assert.match(source, /actionOutcome = if \(\$null -ne \$reportedInspection\)/);
+  assert.match(source, /newApiConfirmed = \$null -ne \$reportedInspection/);
+});
+
+test("原生 New API 签到只接受接口权威状态", async () => {
+  const fs = await import("node:fs/promises");
+  const source = await fs.readFile(new URL("../src/native-browser-inspect.mjs", import.meta.url), "utf8");
+  assert.match(source, /inspectionMode === "execute-new-api"/);
+  assert.match(source, /await evaluateOverRawCdp\(port, expectedOrigin, expression/);
+  assert.match(source, /runNewApiCheckinInBrowser\.toString\(\)/);
+  assert.match(source, /newApiConfirmed = \["signed", "already_signed"\]\.includes\(state\.status\)/);
+  assert.match(source, /status: "unconfirmed"/);
+  assert.match(source, /newApiConfirmed,/);
+  assert.match(source, /if \(executeNewApiCheckin\) await inspectNewApiWithRawCdp\(\)/);
 });
 
 test("原生签到从实际点击后重新计算完整确认等待窗口", async () => {
@@ -99,6 +116,8 @@ test("Cloudflare 隐藏 checkbox 时只回退到与其关联的可见 label", as
   assert.match(source, /frameBox\.height < 40 \|\| frameBox\.height > 180/);
   assert.match(source, /page\.locator\('iframe\[src\]'\)/);
   assert.match(source, /allowedParentFrameCount/);
+  assert.match(source, /allowedFrameCount > 1 \|\| allowedParentFrameCount > 1/);
+  assert.match(source, /challenge_frame_not_unique/);
   assert.match(source, /frameClickCandidates\.length === 1/);
   assert.match(source, /challenge_frame_clicked/);
 });

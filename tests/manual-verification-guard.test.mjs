@@ -44,6 +44,37 @@ test("wrapper consumption requires the exact pending scope and a resume report",
   }), /完整报告/);
 });
 
+test("wrapper subset consumption accepts only a non-empty pending subset", () => {
+  const multiplePending = {
+    ...pending,
+    targets: [
+      ...pending.targets,
+      { origin: "https://two.example", verificationStatus: "pending_verification" },
+    ],
+  };
+  assert.doesNotThrow(() => assertManualVerificationExecution(multiplePending, {
+    consume: true,
+    allowSubset: true,
+    selectedOrigins: new Set(["https://one.example"]),
+    resumeRequested: true,
+    runDate: "20260812",
+  }));
+  assert.throws(() => assertManualVerificationExecution(multiplePending, {
+    consume: true,
+    allowSubset: true,
+    selectedOrigins: new Set(),
+    resumeRequested: true,
+    runDate: "20260812",
+  }), /非空子集/);
+  assert.throws(() => assertManualVerificationExecution(multiplePending, {
+    consume: true,
+    allowSubset: true,
+    selectedOrigins: new Set(["https://outside.example"]),
+    resumeRequested: true,
+    runDate: "20260812",
+  }), /非空子集/);
+});
+
 test("completed records do not block ordinary runs", () => {
   assert.doesNotThrow(() => assertManualVerificationExecution({
     ...pending,

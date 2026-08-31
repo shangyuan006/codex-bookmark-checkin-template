@@ -3,7 +3,10 @@ param(
     [switch]$DryRun,
     [switch]$SuppressReport,
     [int]$Attempts = 0,
-    [string]$ReauthAccountKey
+    [string[]]$Origins = @(),
+    [string]$ReauthAccountKey,
+    [switch]$ForceReauth,
+    [switch]$PostOAuthVerify
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,6 +14,7 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 . (Join-Path $PSScriptRoot 'RunLock.ps1')
 . (Join-Path $PSScriptRoot 'ManualVerification.ps1')
+. (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 . (Join-Path $PSScriptRoot 'NativeFallbackPolicy.ps1')
 . (Join-Path $PSScriptRoot 'TaskRetryPolicy.ps1')
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
@@ -21,6 +25,7 @@ $runLockPath = Join-Path $root 'tmp\run.lock'
 $manualVerificationPath = Join-Path $root 'tmp\manual-verification.json'
 $manualSessionPath = Join-Path $root 'tmp\manual-session.json'
 $manualHandoffPath = Join-Path $root 'tmp\manual-handoff.json'
+$manualAbandonPath = Join-Path $root 'tmp\manual-abandon.json'
 $startedAt = Get-Date
 $runnerStatus = 'failed'
 $runnerMessage = '签到任务尚未开始。'
@@ -117,6 +122,60 @@ function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
     return $false
 }
 
+function Resolve-RequestedCheckinOrigins([string[]]$Values) {
+    $resolved = @()
+    $seen = @{}
+    foreach ($raw in @($Values)) {
+        foreach ($item in @([string]$raw -split ',')) {
+            $value = $item.Trim()
+            $uri = try { [uri]$value } catch { $null }
+            if (-not $value -or -not $uri -or $uri.Scheme -ne 'https' -or -not $uri.Host `
+                -or $uri.UserInfo -or $uri.AbsolutePath -ne '/' -or $uri.Query -or $uri.Fragment) {
+                throw "定向签到只接受无路径、查询参数或凭据的规范 HTTPS origin：$value"
+            }
+            $origin = $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/')
+            $key = $origin.ToLowerInvariant()
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $resolved += $origin
+            }
+        }
+    }
+    return @($resolved)
+}
+
+function Test-RequestedOriginsAuthoritativelyComplete($Report, [string[]]$RequestedOrigins) {
+    if (-not (Test-IsCompleteFinalReport $Report) -or @($RequestedOrigins).Count -eq 0) { return $false }
+    $expected = @{}
+    foreach ($origin in @($RequestedOrigins)) { $expected[$origin.ToLowerInvariant()] = $true }
+    $selected = @{}
+    foreach ($value in @($Report.selectedOrigins)) {
+        $origin = ConvertTo-ManualVerificationOrigin $value
+        if (-not $origin) { return $false }
+        $selected[$origin.ToLowerInvariant()] = $true
+    }
+    if ($selected.Count -ne $expected.Count) { return $false }
+    foreach ($origin in @($expected.Keys)) {
+        if (-not $selected.ContainsKey($origin)) { return $false }
+    }
+
+    $results = @{}
+    foreach ($result in @($Report.results)) {
+        $origin = ConvertTo-ManualVerificationOrigin $result.origin
+        if (-not $origin) { continue }
+        $key = $origin.ToLowerInvariant()
+        if ($results.ContainsKey($key)) { return $false }
+        $results[$key] = $result
+    }
+    foreach ($origin in @($expected.Keys)) {
+        if (-not $results.ContainsKey($origin) `
+            -or [string]$results[$origin].status -notin @('signed', 'already_signed')) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-NeedsSavedLoginSync($ResumeCandidate, [datetime]$Now) {
     if ($null -eq $ResumeCandidate) { return $true }
     foreach ($result in @($ResumeCandidate.Report.results)) {
@@ -129,25 +188,18 @@ function Test-NeedsSavedLoginSync($ResumeCandidate, [datetime]$Now) {
     return $false
 }
 
-function Test-PendingManualVerificationFile {
-    if (-not (Test-Path -LiteralPath $manualVerificationPath)) { return $false }
-    try {
-        $document = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualVerificationPath | ConvertFrom-Json
-        return [string]$document.state -eq 'pending_verification' `
-            -and $document.authoritativeEvidenceRequired -eq $true `
-            -and @($document.targets | Where-Object { -not (Test-ManualVerificationTerminalStatus $_.verificationStatus) }).Count -gt 0
-    }
-    catch { return $false }
-}
-
 function Write-ManualHandoff($Report, [datetime]$Now = (Get-Date)) {
     # Keep the automatic-to-manual boundary durable without opening a visible
     # browser from a hidden scheduled task. The next manual close can then be
     # consumed immediately by the scheduler.
-    if ((Test-Path -LiteralPath $manualSessionPath) -or (Test-PendingManualVerificationFile)) {
+    if (Test-Path -LiteralPath $manualSessionPath) {
         return $false
     }
-    $targets = @(Get-ManualHandoffTargets $Report $Now)
+    $abandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now $Now
+    $targets = @(Get-ManualHandoffTargets $Report $Now | Where-Object {
+        $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
+        -not $origin -or -not $abandonedOrigins.ContainsKey($origin)
+    })
     if ($targets.Count -eq 0) {
         Remove-Item -LiteralPath $manualHandoffPath -Force -ErrorAction SilentlyContinue
         return $false
@@ -187,7 +239,19 @@ try {
     if (-not (Test-Path -LiteralPath $configPath)) { throw '尚未初始化，请先运行 scripts\Initialize-Checkin.ps1。' }
     $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
     $node = Resolve-CheckinNode $config
-    $nativeFallbackOnlyOrigins = @(Get-NativeFallbackOnlyOrigins $config)
+    $requestedOrigins = @(Resolve-RequestedCheckinOrigins $Origins)
+    if ($ReauthAccountKey -and $requestedOrigins.Count -gt 0) {
+        throw 'Origins 不能与 Agent Router 的 ReauthAccountKey 同时使用。'
+    }
+    if ($ForceReauth -and -not $ReauthAccountKey) {
+        throw 'ForceReauth 只能与明确的 ReauthAccountKey 同时使用。'
+    }
+    if ($PostOAuthVerify -and -not $ReauthAccountKey) {
+        throw 'PostOAuthVerify 只能与明确的 ReauthAccountKey 同时使用。'
+    }
+    $nativeFallbackOnlyOrigins = @(Get-NativeFallbackOnlyOrigins $config | Where-Object {
+        $requestedOrigins.Count -eq 0 -or $requestedOrigins -contains [string]$_
+    })
 
     $wrapperMutexName = if ($config.runMutexName) { [string]$config.runMutexName } else { 'Local\CodexBookmarkCheckinRun' }
     $wrapperMutex = [System.Threading.Mutex]::new($false, $wrapperMutexName)
@@ -211,6 +275,11 @@ try {
     if ($DryRun) { $arguments += '--dry-run' }
     if ($ReauthAccountKey) {
         $arguments += @('--origins', 'https://agentrouter.org', '--reauth-account-key', $ReauthAccountKey)
+        if ($ForceReauth) { $arguments += '--force-reauth' }
+        if ($PostOAuthVerify) { $arguments += '--post-oauth-verify' }
+    }
+    elseif ($requestedOrigins.Count -gt 0) {
+        $arguments += @('--origins', ($requestedOrigins -join ','))
     }
 
     if (-not $DryRun) { $resumeCandidate = Get-TodayResumeReport }
@@ -220,7 +289,28 @@ try {
         if ($null -ne $pendingManualVerification `
             -and $null -ne $resumeCandidate `
             -and [string]$pendingManualVerification.Document.sourceRunId -like "$todayPrefix*") {
-            $manualVerification = $pendingManualVerification
+            if ($requestedOrigins.Count -eq 0) {
+                $manualVerification = $pendingManualVerification
+            }
+            else {
+                $pendingOriginSet = @{}
+                foreach ($origin in @($pendingManualVerification.Origins)) {
+                    $pendingOriginSet[[string]$origin] = $true
+                }
+                $requestedOriginsArePending = $true
+                foreach ($origin in @($requestedOrigins)) {
+                    if (-not $pendingOriginSet.ContainsKey([string]$origin)) {
+                        $requestedOriginsArePending = $false
+                        break
+                    }
+                }
+                if ($requestedOriginsArePending) {
+                    $manualVerification = [pscustomobject]@{
+                        Document = $pendingManualVerification.Document
+                        Origins = @($requestedOrigins)
+                    }
+                }
+            }
         }
         elseif ($null -ne $pendingManualVerification) {
             Write-Warning '手动复核记录不是今天的有效运行，未强制续跑；请重新打开待处理站点。'
@@ -262,12 +352,15 @@ try {
                 $runArguments += @('--resume-report', [string]$resumeCandidate.Path)
             }
             if ($null -ne $manualVerification) {
+                if ($requestedOrigins.Count -eq 0) {
+                    $runArguments += @('--origins', (@($manualVerification.Origins) -join ','))
+                }
                 $runArguments += @(
-                    '--origins', (@($manualVerification.Origins) -join ','),
-                    '--consume-manual-verification'
+                    '--consume-manual-verification',
+                    '--consume-manual-verification-subset'
                 )
             }
-            elseif ($attempt -gt 1 -and $null -ne $resumeCandidate) {
+            elseif ($attempt -gt 1 -and $requestedOrigins.Count -eq 0 -and $null -ne $resumeCandidate) {
                 $fallbackRetryOrigins = @(Get-NativeFallbackRetryOrigins `
                     -Report $resumeCandidate.Report `
                     -Origins $nativeFallbackOnlyOrigins)
@@ -299,6 +392,13 @@ try {
                     }
                     $preflightTargets = @($preflightTargets | Where-Object {
                         $manualOriginSet.ContainsKey([string]$_.origin)
+                    })
+                }
+                elseif ($requestedOrigins.Count -gt 0) {
+                    $requestedOriginSet = @{}
+                    foreach ($origin in @($requestedOrigins)) { $requestedOriginSet[$origin] = $true }
+                    $preflightTargets = @($preflightTargets | Where-Object {
+                        $requestedOriginSet.ContainsKey([string]$_.origin)
                     })
                 }
                 if ($attempt -eq 1 -and $nativeFallbackOnlyOrigins.Count -gt 0) {
@@ -353,14 +453,28 @@ try {
             }
             $freshCandidate = Get-FreshResumeReport $attemptStartedAt
             if ($null -ne $freshCandidate) { $resumeCandidate = $freshCandidate }
-            if ($ReauthAccountKey `
+            if ($requestedOrigins.Count -gt 0 `
                 -and $null -ne $freshCandidate `
-                -and (Test-IsCompleteFinalReport $freshCandidate.Report) `
-                -and (Test-ReauthAccountAuthoritativelyComplete $freshCandidate.Report $ReauthAccountKey)) {
+                -and (Test-RequestedOriginsAuthoritativelyComplete $freshCandidate.Report $requestedOrigins)) {
                 $nodeExitCode = 0
                 $runnerStatus = 'completed'
-                $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 已取得权威签到结果。"
+                $runnerMessage = "$($requestedOrigins.Count) 个定向站点已取得权威签到结果。"
                 $needsNativeFallbackRetry = $false
+            }
+            if ($ReauthAccountKey `
+                -and $null -ne $freshCandidate `
+                -and (Test-IsCompleteFinalReport $freshCandidate.Report)) {
+                $needsNativeFallbackRetry = $false
+                if (Test-ReauthAccountAuthoritativelyComplete $freshCandidate.Report $ReauthAccountKey) {
+                    $nodeExitCode = 0
+                    $runnerStatus = 'completed'
+                    $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 已取得权威签到结果。"
+                }
+                else {
+                    $nodeExitCode = 2
+                    $runnerStatus = 'needs_attention'
+                    $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 未取得 signed 或 already_signed 权威结果。"
+                }
             }
             if (-not $ReauthAccountKey `
                 -and $attempt -eq 1 `

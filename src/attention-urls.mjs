@@ -22,11 +22,46 @@ export function requiresManualAttention(result) {
 
 export function canExplicitlyRequestManualAttention(result) {
   if (!result) return true;
-  return requiresManualAttention(result) || result.status === "no_action";
+  return requiresManualAttention(result) || ["no_action", "clicked"].includes(result.status);
 }
 
 function runDate(runId) {
   return String(runId ?? "").match(/^(\d{8})-/)?.[1] ?? null;
+}
+
+function localDateKey(date = new Date()) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("");
+}
+
+async function loadCurrentAbandonedOrigins(rootDirectory, latest) {
+  const document = await fs.readFile(path.join(rootDirectory, "tmp", "manual-abandon.json"), "utf8")
+    .then(JSON.parse)
+    .catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+  if (!document || String(document.date ?? "") !== (runDate(latest?.runId) ?? localDateKey())) return [];
+  return Array.isArray(document.origins) ? document.origins : [];
+}
+
+async function loadCurrentManualHandoffOrigins(rootDirectory, latest) {
+  const document = await fs.readFile(path.join(rootDirectory, "tmp", "manual-handoff.json"), "utf8")
+    .then(JSON.parse)
+    .catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+  if (!document
+    || document.state !== "awaiting_manual_handoff"
+    || document.authoritativeEvidenceRequired !== true
+    || !Array.isArray(document.targets)) return null;
+  const expectedDate = runDate(latest?.runId);
+  if (expectedDate && runDate(document.sourceRunId) !== expectedDate) return null;
+  return document.targets.map((target) => target?.origin);
 }
 
 export function mergeAttentionEvidence(latest, runReports = []) {
@@ -110,7 +145,9 @@ export function buildAttentionHandoff({
   latest,
   preferredOrigins = [],
   requestedOrigins = [],
+  handoffOrigins = null,
   selection = [],
+  excludedOrigins = [],
   bookmarkLastModifiedAt = null,
 }) {
   if (requestedOrigins.length > 0 && selection.length > 0) {
@@ -119,9 +156,10 @@ export function buildAttentionHandoff({
 
   const targetByOrigin = new Map(plan.targets.map((target) => [target.origin, target]));
   const resultByOrigin = new Map((latest.results ?? []).map((result) => [result.origin, result]));
+  const excludedOriginSet = new Set(excludedOrigins.map(normalizeRequestedOrigin));
   const pending = sortAttentionItems(
     [...resultByOrigin.values()]
-      .filter(requiresManualAttention)
+      .filter((result) => requiresManualAttention(result) && !excludedOriginSet.has(result.origin))
       .map((result) => {
         const target = targetByOrigin.get(result.origin);
         if (!target?.candidates?.length) return null;
@@ -144,6 +182,7 @@ export function buildAttentionHandoff({
       const target = targetByOrigin.get(origin);
       const previous = resultByOrigin.get(origin);
       if (!target?.candidates?.length) return null;
+      if (excludedOriginSet.has(origin)) return null;
       if (!canExplicitlyRequestManualAttention(previous)) return null;
       return {
         origin,
@@ -156,6 +195,27 @@ export function buildAttentionHandoff({
       throw new Error(`所选站点不在当前待处理列表中：${missing.join(", ")}`);
     }
     targets = selected;
+  } else if (Array.isArray(handoffOrigins)) {
+    selectionMode = "handoff";
+    const pendingByOrigin = new Map(pending.map((target) => [target.origin, target]));
+    const combinedOrigins = [
+      ...handoffOrigins.map(normalizeRequestedOrigin),
+      ...pending.map((target) => target.origin),
+    ];
+    targets = [...new Set(combinedOrigins)]
+      .map((origin) => {
+        if (pendingByOrigin.has(origin)) return pendingByOrigin.get(origin);
+        const target = targetByOrigin.get(origin);
+        const previous = resultByOrigin.get(origin);
+        if (!target?.candidates?.length || excludedOriginSet.has(origin)) return null;
+        if (!canExplicitlyRequestManualAttention(previous)) return null;
+        return {
+          origin,
+          url: target.candidates[0],
+          previousStatus: previous?.status ?? "new_target",
+        };
+      })
+      .filter(Boolean);
   } else if (selection.length > 0) {
     selectionMode = "selection";
     const indexes = [...new Set(selection.map((value) => Number(value)))];
@@ -172,7 +232,7 @@ export function buildAttentionHandoff({
     sourceFinishedAt: latest.finishedAt ?? null,
     bookmarkPlanGeneratedAt: plan.generatedAt ?? null,
     bookmarkLastModifiedAt,
-    availableCount: pending.length,
+    availableCount: selectionMode === "handoff" ? targets.length : pending.length,
     targets,
   };
 }
@@ -211,12 +271,17 @@ export async function loadAttentionHandoff(rootDirectory, argv = []) {
     await loadCurrentDayRunReports(logsDirectory, latest),
   );
   const { requestedOrigins, selection } = parseAttentionArguments(argv);
+  const handoffOrigins = requestedOrigins.length === 0 && selection.length === 0
+    ? await loadCurrentManualHandoffOrigins(rootDirectory, attentionLatest)
+    : null;
   return buildAttentionHandoff({
     plan,
     latest: attentionLatest,
     preferredOrigins: config.attentionPreferredOrigins ?? [],
     requestedOrigins,
+    handoffOrigins,
     selection,
+    excludedOrigins: await loadCurrentAbandonedOrigins(rootDirectory, attentionLatest),
     bookmarkLastModifiedAt,
   });
 }

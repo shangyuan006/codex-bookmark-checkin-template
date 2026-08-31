@@ -114,6 +114,42 @@ test("no-action sites require an explicit origin before manual handoff", () => {
   }]);
 });
 
+test("persisted handoff accepts clicked evidence and excludes abandoned origins", () => {
+  const unresolved = {
+    ...latest,
+    results: [
+      { origin: "https://alpha.example", status: "clicked" },
+      { origin: "https://beta.example", status: "deferred", retryCause: "login_required" },
+      { origin: "https://done.example", status: "signed" },
+    ],
+  };
+
+  assert.equal(canExplicitlyRequestManualAttention({ status: "clicked" }), true);
+  const handoff = buildAttentionHandoff({
+    plan,
+    latest: unresolved,
+    handoffOrigins: ["https://alpha.example"],
+    excludedOrigins: ["https://beta.example"],
+  });
+  assert.equal(handoff.selectionMode, "handoff");
+  assert.deepEqual(handoff.targets, [{
+    origin: "https://alpha.example",
+    url: "https://alpha.example/user/attendance",
+    previousStatus: "clicked",
+  }]);
+  assert.deepEqual(buildAttentionHandoff({
+    plan,
+    latest: unresolved,
+    excludedOrigins: ["https://beta.example"],
+  }).targets, []);
+  assert.throws(() => buildAttentionHandoff({
+    plan,
+    latest: unresolved,
+    requestedOrigins: ["https://beta.example"],
+    excludedOrigins: ["https://beta.example"],
+  }));
+});
+
 test("序号选择基于稳定排序后的当前待处理列表", () => {
   const handoff = buildAttentionHandoff({
     plan,
@@ -364,6 +400,76 @@ test("multi-source handoff reads every live primary file and uses the newest mti
 
     await fs.unlink(additionalPath);
     await assert.rejects(() => loadAttentionHandoff(root));
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("loading manual attention unions the stored handoff with current pending sites", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "manual-handoff-priority-"));
+  const configDirectory = path.join(root, "config");
+  const logsDirectory = path.join(root, "logs");
+  const tmpDirectory = path.join(root, "tmp");
+  const bookmarksPath = path.join(root, "Bookmarks");
+  try {
+    await Promise.all([
+      fs.mkdir(configDirectory, { recursive: true }),
+      fs.mkdir(logsDirectory, { recursive: true }),
+      fs.mkdir(tmpDirectory, { recursive: true }),
+    ]);
+    await fs.writeFile(bookmarksPath, JSON.stringify({
+      roots: {
+        synced: {
+          id: "1", type: "folder", name: "Container", children: [{
+            id: "2", type: "folder", name: "Daily", children: [
+              { id: "3", type: "url", name: "Clicked", url: "https://alpha.example/current-checkin" },
+              { id: "4", type: "url", name: "Pending", url: "https://beta.example/checkin" },
+              { id: "5", type: "url", name: "Abandoned", url: "https://gamma.example/checkin" },
+            ],
+          }],
+        },
+      },
+    }), "utf8");
+    await fs.writeFile(path.join(configDirectory, "config.json"), JSON.stringify({
+      bookmarksPath,
+      mobileFolderNames: ["Container"],
+      targetFolderNames: ["Daily"],
+    }), "utf8");
+    await fs.writeFile(path.join(logsDirectory, "latest.json"), JSON.stringify({
+      runId: "20260728-120000",
+      finishedAt: "2026-07-28T04:10:00.000Z",
+      results: [
+        { origin: "https://alpha.example", status: "clicked" },
+        { origin: "https://beta.example", status: "deferred", retryCause: "login_required" },
+        { origin: "https://gamma.example", status: "deferred", retryCause: "login_required" },
+      ],
+    }), "utf8");
+    await fs.writeFile(path.join(tmpDirectory, "manual-handoff.json"), JSON.stringify({
+      state: "awaiting_manual_handoff",
+      sourceRunId: "20260728-120000",
+      authoritativeEvidenceRequired: true,
+      targets: [{ origin: "https://alpha.example", previousStatus: "clicked" }],
+    }), "utf8");
+    await fs.writeFile(path.join(tmpDirectory, "manual-abandon.json"), JSON.stringify({
+      date: "20260728",
+      origins: ["https://gamma.example"],
+    }), "utf8");
+
+    const handoff = await loadAttentionHandoff(root);
+    assert.equal(handoff.selectionMode, "handoff");
+    assert.equal(handoff.availableCount, 2);
+    assert.deepEqual(handoff.targets, [
+      {
+        origin: "https://alpha.example",
+        url: "https://alpha.example/current-checkin",
+        previousStatus: "clicked",
+      },
+      {
+        origin: "https://beta.example",
+        url: "https://beta.example/checkin",
+        previousStatus: "deferred",
+      },
+    ]);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

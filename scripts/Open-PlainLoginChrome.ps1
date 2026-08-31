@@ -17,6 +17,8 @@ $node = Resolve-CheckinNode $config
 $browser = Resolve-CheckinBrowser $config
 $statePath = Join-Path $root 'tmp\manual-session.json'
 $verificationPath = Join-Path $root 'tmp\manual-verification.json'
+$navigationExtensionPath = Join-Path $root 'tmp\manual-precheckin-extension'
+$navigationInputPath = Join-Path $root 'tmp\manual-precheckin-extension.input.json'
 
 if ($TrackManualSession -and (-not $NativeMinimal -or $Offscreen -or $RemoteDebuggingPort -gt 0)) {
     throw '手动登录会话必须使用可见的最小原生模式，且不得启用远程调试。'
@@ -104,6 +106,29 @@ if ($selectedAgentRouterItems.Count -gt 0) {
     })
 }
 if (@($items).Count -eq 0) { throw '当前没有符合选择条件的待处理站点。' }
+$manualNavigationEnabled = $false
+if ($TrackManualSession) {
+    [System.IO.Directory]::CreateDirectory((Split-Path -Parent $navigationInputPath)) | Out-Null
+    $navigationInput = [ordered]@{
+        targets = @($items | Select-Object `
+            @{ Name = 'origin'; Expression = { [string]$_.origin } }, `
+            @{ Name = 'url'; Expression = { [string]$_.url } })
+    }
+    try {
+        [System.IO.File]::WriteAllText(
+            $navigationInputPath,
+            ($navigationInput | ConvertTo-Json -Depth 6),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        $rawNavigation = @(& $node (Join-Path $root 'src\manual-precheckin-extension.mjs') $navigationInputPath)
+        if ($LASTEXITCODE -ne 0) { throw '无法准备手动接管的签到前导航。' }
+        $navigation = ($rawNavigation -join [Environment]::NewLine) | ConvertFrom-Json
+        $manualNavigationEnabled = [bool]$navigation.enabled
+    }
+    finally {
+        Remove-Item -LiteralPath $navigationInputPath -Force -ErrorAction SilentlyContinue
+    }
+}
 $windowPosition = if ($Offscreen) { '-32000,-32000' } else { '60,60' }
 $launchMarker = [guid]::NewGuid().ToString('N')
 $arguments = @(
@@ -135,9 +160,20 @@ if ($RemoteDebuggingPort -gt 0) {
     $arguments += "--remote-debugging-port=$RemoteDebuggingPort"
     $arguments += "--remote-allow-origins=http://127.0.0.1:$RemoteDebuggingPort"
 }
+if ($manualNavigationEnabled) {
+    $arguments += "--load-extension=$navigationExtensionPath"
+}
 $arguments += @($items | ForEach-Object { [string]$_.url })
 
-$process = Start-Process -FilePath ([string]$browser.Executable) -ArgumentList $arguments -PassThru
+$process = try {
+    Start-Process -FilePath ([string]$browser.Executable) -ArgumentList $arguments -PassThru
+}
+catch {
+    if ($manualNavigationEnabled) {
+        Remove-Item -LiteralPath $navigationExtensionPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    throw
+}
 if ($TrackManualSession) {
     Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue
     $processStartedAt = try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null }
@@ -154,6 +190,7 @@ if ($TrackManualSession) {
         sourceFinishedAt = $handoff.sourceFinishedAt
         bookmarkPlanGeneratedAt = $handoff.bookmarkPlanGeneratedAt
         bookmarkLastModifiedAt = $handoff.bookmarkLastModifiedAt
+        preCheckinNavigationEnabled = $manualNavigationEnabled
         targetCount = @($items).Count
         targets = @($items | ForEach-Object {
             [ordered]@{

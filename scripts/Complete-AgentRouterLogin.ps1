@@ -19,7 +19,7 @@ if ([string]$account.provider -eq 'LinuxDO' -and [string]$state.stage -ne 'agent
 }
 
 & (Join-Path $PSScriptRoot 'Close-AgentRouterLogin.ps1') -AccountKey $requestedAccountKey
-$powershell = Join-Path $PSHOME 'powershell.exe'
+$powershell = Resolve-AgentRouterPowerShellExecutable
 $runScript = Join-Path $PSScriptRoot 'Run-Checkin.ps1'
 & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runScript `
     -ReauthAccountKey $requestedAccountKey -SuppressReport
@@ -29,4 +29,7 @@ if ($checkinExitCode -eq 2) {
     exit 2
 }
 if ($checkinExitCode -ne 0) { exit $checkinExitCode }
+if ([string]$account.provider -eq 'LinuxDO') {
+    Remove-Item -LiteralPath (Join-Path $root 'tmp\agentrouter-linuxdo-provider-state.json') -Force -ErrorAction SilentlyContinue
+}
 Write-Output "Completed Agent Router accountKey '$requestedAccountKey' and reconciled today's authoritative result."

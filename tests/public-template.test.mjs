@@ -20,12 +20,19 @@ test("公开默认配置不启用外部通知", async () => {
   assert.deepEqual(defaults.checkinCaptchaDialogRules, {});
   assert.deepEqual(defaults.newApiCaptchaRules, {});
   assert.deepEqual(defaults.newApiSignInRules, {});
+  assert.deepEqual(defaults.bearerCheckinRules, {});
+  assert.deepEqual(defaults.nativeOAuthCheckinOrigins, []);
   assert.deepEqual(defaults.savedLoginSessionRules, {});
+  assert.deepEqual(defaults.preCheckinNavigationRules, {});
   assert.deepEqual(defaults.calendarDayCheckinOrigins, []);
   assert.deepEqual(defaults.calendarDayCheckinPaths, {});
   assert.deepEqual(Object.keys(localExample.newApiCaptchaRules), ["https://captcha.example.com"]);
   assert.deepEqual(Object.keys(localExample.newApiSignInRules), ["https://signin.example.com"]);
-  assert.deepEqual(Object.keys(localExample.savedLoginSessionRules), ["https://example.com"]);
+  assert.deepEqual(Object.keys(localExample.bearerCheckinRules), ["https://bearer.example.com"]);
+  assert.deepEqual(Object.keys(localExample.savedLoginSessionRules), [
+    "https://example.com",
+    "https://bearer.example.com",
+  ]);
 });
 
 test("OAuth 恢复始终不保存页面截图或正文摘录", async () => {
@@ -36,6 +43,28 @@ test("OAuth 恢复始终不保存页面截图或正文摘录", async () => {
   assert.match(runner, /oauth-login\.mjs"\), current\.origin, provider, "--private-result"/);
   assert.doesNotMatch(oauth, /page\.screenshot|screenshotPath|excerpt|bodyText/);
   assert.match(oauth, /waitUntil: "commit"/);
+  assert.match(oauth, /verifyConfiguredSavedLoginSession\(page, origin, config\)/);
+  assert.match(oauth, /verifiedSession\?\.status === "valid"/);
+  assert.match(oauth, /clickConfiguredLoginChallengeControl\(currentPage, origin, config\)/);
+});
+
+test("原生同会话 OAuth 签到默认关闭并使用短生命周期本机调试", async () => {
+  const [defaultsSource, helper, oauth, runner] = await Promise.all([
+    fs.readFile(new URL("../config/defaults.json", import.meta.url), "utf8"),
+    fs.readFile(new URL("../scripts/Recover-NativeOAuthCheckin.ps1", import.meta.url), "utf8"),
+    fs.readFile(new URL("../src/oauth-login.mjs", import.meta.url), "utf8"),
+    fs.readFile(new URL("../src/index.mjs", import.meta.url), "utf8"),
+  ]);
+  const defaults = JSON.parse(defaultsSource);
+  assert.deepEqual(defaults.nativeOAuthCheckinOrigins, []);
+  assert.match(helper, /nativeOAuthCheckinOrigins/);
+  assert.match(helper, /-RemoteDebuggingPort \$debugPort/);
+  assert.match(helper, /--checkin-after-login/);
+  assert.match(helper, /Get-CheckinAutomationBrowserProcesses/);
+  assert.match(oauth, /connectOverCdpWithRetry/);
+  assert.match(oauth, /\(config\.nativeOAuthCheckinOrigins \?\? \[\]\)\.includes\(origin\)/);
+  assert.match(runner, /native_oauth_checkin/);
+  assert.doesNotMatch(helper, /cookie|password|localStorage|sessionStorage/i);
 });
 
 test("Agent Router account login helper does not request or persist secrets", async () => {
@@ -115,6 +144,9 @@ test("手动登录使用无 Playwright 和无远程调试的最小原生浏览�
   assert.match(nativeLauncher, /launchMarker = \$launchMarker/);
   assert.match(nativeLauncher, /--checkin-launch=/);
   assert.match(nativeLauncher, /prepare-native-browser-profile\.mjs/);
+  assert.match(nativeLauncher, /manual-precheckin-extension\.mjs/);
+  assert.match(nativeLauncher, /--load-extension=\$navigationExtensionPath/);
+  assert.doesNotMatch(nativeLauncher, /manualNavigationEnabled[\s\S]{0,500}remote-debugging-port/);
   assert.match(nativeLauncher, /targets = @\(\$items/);
   assert.match(closer, /Get-CheckinManualSessionBrowserProcesses/);
   assert.doesNotMatch(runtimeResolver, /Where-Object\s*\{[\s\S]*?if \(-not \$candidate\) \{ return \$false \}/);
@@ -159,7 +191,12 @@ test("targeted timeout and notification code retain selected-scope fields", asyn
 });
 
 test("原生登录生命周期脚本保留 Windows PowerShell 5.1 可识别的 UTF-8 BOM", async () => {
-  for (const script of ["Open-ManualLogin.ps1", "Open-PlainLoginChrome.ps1", "Close-ManualLogin.ps1"]) {
+  for (const script of [
+    "Open-ManualLogin.ps1",
+    "Open-PlainLoginChrome.ps1",
+    "Close-ManualLogin.ps1",
+    "Recover-NativeOAuthCheckin.ps1",
+  ]) {
     const contents = await fs.readFile(new URL(`../scripts/${script}`, import.meta.url));
     assert.deepEqual([...contents.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
   }
@@ -322,6 +359,13 @@ test("公开站点规则只包含无凭据 HTTPS URL", async () => {
   }
 });
 
+test("lyclaude keeps the registered OAuth redirect and rewrites only the returned callback origin", async () => {
+  const rules = JSON.parse(await fs.readFile(new URL("../config/site-rules.public.json", import.meta.url), "utf8"));
+  const target = "https://free.lyclaude.site";
+  assert.equal(rules.oauthRedirectOverrides?.[target], undefined);
+  assert.deepEqual(rules.oauthCallbackOriginAliases?.[target], ["https://free.vipclaude.codes"]);
+});
+
 test("显式目标公开示例只扩展已确认目录内的无凭据 HTTPS 站点", async () => {
   const example = JSON.parse(await fs.readFile(new URL("../config/config.local.example.json", import.meta.url), "utf8"));
   const readme = await fs.readFile(new URL("../README.md", import.meta.url), "utf8");
@@ -400,8 +444,9 @@ test("手动操作后的续跑强制复核记录中的 origin 且不从点击推
   assert.match(runner, /tmp\\manual-verification\.json/);
   assert.match(stateMachine, /state -ne 'pending_verification'/);
   assert.match(stateMachine, /authoritativeEvidenceRequired -ne \$true/);
-  assert.match(runner, /'--origins', \(@\(\$manualVerification\.Origins\) -join ','\),[\s\S]*?'--consume-manual-verification'/);
+  assert.match(runner, /if \(\$requestedOrigins\.Count -eq 0\) \{[\s\S]*?\$runArguments \+= @\('--origins', \(@\(\$manualVerification\.Origins\) -join ','\)\)[\s\S]*?\}/);
   assert.match(runner, /--consume-manual-verification/);
+  assert.match(runner, /--consume-manual-verification-subset/);
   assert.match(stateMachine, /verificationStatus = \[string\]\$result\.status/);
   assert.match(stateMachine, /if \(\$allConfirmed\) \{ 'verification_complete' \} else \{ 'pending_verification' \}/);
   assert.doesNotMatch(`${runner}\n${stateMachine}`, /verificationStatus\s*=\s*'(?:signed|already_signed|clicked)'/);

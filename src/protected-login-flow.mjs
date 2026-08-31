@@ -1,3 +1,7 @@
+import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
+
+const challengeClickedPages = new WeakSet();
+
 function normalizedHttpsOrigin(value) {
   try {
     const url = new URL(value);
@@ -29,7 +33,7 @@ async function visibleUnique(locator) {
     && await locator.isVisible().catch(() => false);
 }
 
-async function clickKnownChallengeControl(page, timeout) {
+async function clickKnownChallengeControl(page, timeout, expectedOrigin) {
   const capButton = page.getByRole("button", { name: /确认.*真人|真人.*确认/ });
   if (await visibleUnique(capButton)) {
     return capButton.click({ timeout }).then(() => true).catch(() => false);
@@ -40,12 +44,26 @@ async function clickKnownChallengeControl(page, timeout) {
     return capWidget.click({ timeout }).then(() => true).catch(() => false);
   }
 
-  const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile" i]');
-  const checkbox = frame.locator('input[type="checkbox"]');
-  if (await checkbox.count().catch(() => 0) === 1) {
-    return checkbox.click({ timeout }).then(() => true).catch(() => false);
-  }
-  return false;
+  const challenge = await clickVisibleNativeChallengeControl(page, expectedOrigin, {
+    actionTexts: ["__login_challenge_only__"],
+    clickChallenge: true,
+  }).catch(() => ({ clicked: false }));
+  return challenge.clicked === true;
+}
+
+export async function clickConfiguredLoginChallengeControl(page, origin, config = {}, timeoutMs = null) {
+  const expectedOrigin = normalizedHttpsOrigin(origin);
+  if (!expectedOrigin
+    || !configuredForOrigin(config.autoClickTurnstileOrigins, expectedOrigin)
+    || !pageMatchesOrigin(page, expectedOrigin)) return false;
+  const configuredTimeoutMs = boundedMilliseconds(config.actionTimeoutMs, 10000, 1000, 10000);
+  const clickTimeoutMs = Number.isFinite(Number(timeoutMs))
+    ? Math.max(1, Math.min(configuredTimeoutMs, Number(timeoutMs)))
+    : configuredTimeoutMs;
+  if (challengeClickedPages.has(page)) return false;
+  const clicked = await clickKnownChallengeControl(page, clickTimeoutMs, expectedOrigin);
+  if (clicked) challengeClickedPages.add(page);
+  return clicked;
 }
 
 export async function acceptConfiguredLoginTerms(page, origin, config = {}) {
@@ -79,7 +97,7 @@ export async function waitForLoginSubmitEnabled(page, submit, origin, config = {
     if (await submit.isEnabled().catch(() => false)) return true;
     if (!challengeClicked) {
       const remaining = Math.max(1, deadline - Date.now());
-      challengeClicked = await clickKnownChallengeControl(page, Math.min(5000, remaining));
+      challengeClicked = await clickConfiguredLoginChallengeControl(page, expectedOrigin, config, remaining);
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;

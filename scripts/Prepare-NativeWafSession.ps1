@@ -27,6 +27,7 @@ $items = @($config.nativeWafPreflightUrls | ForEach-Object {
         trustAsSigned = $true
         passiveOnly = $passiveOnly
         action = $null
+        newApiCheckin = $false
     }
 })
 $items += @($config.nativeChallengePreflight | ForEach-Object {
@@ -34,9 +35,16 @@ $items += @($config.nativeChallengePreflight | ForEach-Object {
     $waitSeconds = [int]$_.waitSeconds
     $passiveOnly = [bool]$_.passiveOnly
     $action = if ($null -ne $_.action) { $_.action } else { $null }
+    $newApiCheckin = [bool]$_.newApiCheckin
+    $entryOrigin = $uri.GetLeftPart([System.UriPartial]::Authority)
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "原生验证预热地址无效：$($_.url)" }
     if ($waitSeconds -lt 5 -or $waitSeconds -gt 120) { throw "原生验证等待时间必须为 5 到 120 秒：$($_.url)" }
     if ($passiveOnly -and $null -ne $action) { throw "被动原生验证不能同时配置签到动作：$($_.url)" }
+    if ($passiveOnly -and $newApiCheckin) { throw "被动原生验证不能同时配置 New API 签到：$($_.url)" }
+    if ($null -ne $action -and $newApiCheckin) { throw "原生按钮签到和 New API 签到不能同时配置：$($_.url)" }
+    if ($newApiCheckin -and @($config.newApiCheckinOrigins) -notcontains $entryOrigin) {
+        throw "原生 New API 签到来源未加入 newApiCheckinOrigins：$($_.url)"
+    }
     if ($null -ne $action) {
         $actionTexts = @($action.actionTexts | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
         $dismissTexts = @($action.dismissButtonTexts | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
@@ -54,6 +62,7 @@ $items += @($config.nativeChallengePreflight | ForEach-Object {
         trustAsSigned = $false
         passiveOnly = $passiveOnly
         action = $action
+        newApiCheckin = $newApiCheckin
     }
 })
 
@@ -142,7 +151,8 @@ foreach ($item in $items) {
     $inspection = $null
     $lastInspection = $null
     $hasAction = $null -ne $item.action
-    $inspectionMode = if ($hasAction) { 'execute-checkin' } elseif ([bool]$item.trustAsSigned) { 'allow-endpoint' } else { 'require-confirmed' }
+    $hasNewApiCheckin = [bool]$item.newApiCheckin
+    $inspectionMode = if ($hasAction) { 'execute-checkin' } elseif ($hasNewApiCheckin) { 'execute-new-api' } elseif ([bool]$item.trustAsSigned) { 'allow-endpoint' } else { 'require-confirmed' }
     $actionConfigBase64 = if ($hasAction) {
         $actionJson = $item.action | ConvertTo-Json -Depth 5 -Compress
         [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($actionJson))
@@ -157,10 +167,11 @@ foreach ($item in $items) {
             if ($LASTEXITCODE -eq 0 -and $inspectionText) {
                 $inspection = $inspectionText | ConvertFrom-Json
                 $lastInspection = $inspection
-                $attemptExplicit = [string]$inspection.status -in @('signed', 'already_signed')
+                $attemptExplicit = [string]$inspection.status -in @('signed', 'already_signed') `
+                    -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
                 $attemptEndpoint = [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
                     -and [bool]$inspection.attendanceEndpoint -and [string]$inspection.status -eq 'ready'
-                $attemptPrepared = -not $hasAction -and -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
+                $attemptPrepared = -not $hasAction -and -not $hasNewApiCheckin -and -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
                     -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
                 if (-not $attemptExplicit -and -not $attemptEndpoint -and -not $attemptPrepared) { $inspection = $null }
             }
@@ -169,11 +180,12 @@ foreach ($item in $items) {
         Close-AutomationBrowser
         if ($null -eq $inspection -and $inspectionAttempt -lt 2) { Start-Sleep -Seconds 1 }
     }
-    $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed')
+    $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed') `
+        -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
     $endpointConfirmed = [bool]$item.trustAsSigned -and $null -ne $inspection `
         -and [bool]$inspection.siteBodyLoaded -and [bool]$inspection.attendanceEndpoint `
         -and [string]$inspection.status -eq 'ready'
-    $prepared = -not $hasAction -and $null -ne $inspection -and [bool]$inspection.siteBodyLoaded `
+    $prepared = -not $hasAction -and -not $hasNewApiCheckin -and $null -ne $inspection -and [bool]$inspection.siteBodyLoaded `
         -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
     $reportedInspection = if ($null -ne $inspection) { $inspection } else { $lastInspection }
     if (-not $explicitlyConfirmed -and -not $endpointConfirmed -and -not $prepared) {
@@ -185,6 +197,8 @@ foreach ($item in $items) {
         status = if ($explicitlyConfirmed -or $endpointConfirmed) { 'signed' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
         reason = if ($explicitlyConfirmed -and $hasAction -and [bool]$inspection.actionAttempted) {
             "原生 $($browser.DisplayName) 已执行签到动作，并由页面明确确认今天已签到"
+        } elseif ($explicitlyConfirmed -and $hasNewApiCheckin -and [bool]$inspection.newApiConfirmed) {
+            "原生 $($browser.DisplayName) 已执行 New API 签到，并由状态接口确认今天已签到"
         } elseif ($explicitlyConfirmed -and $hasAction) {
             "原生 $($browser.DisplayName) 页面明确确认今天已签到"
         } elseif ($explicitlyConfirmed) {
@@ -205,6 +219,10 @@ foreach ($item in $items) {
             '原生签到点击后在有限等待内未确认成功'
         } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'not_attempted') {
             '原生签到页面尚未达到可执行状态'
+        } elseif ($hasNewApiCheckin -and [string]$reportedInspection.status -eq 'login_required') {
+            '原生 New API 签到接口显示登录状态无效'
+        } elseif ($hasNewApiCheckin) {
+            '原生 New API 签到未取得权威完成状态'
         } else {
             '原生验证页面未能确认签到结果'
         }
@@ -213,6 +231,8 @@ foreach ($item in $items) {
         actionOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.actionOutcome } else { 'unavailable' }
         challengeOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.challengeOutcome } else { 'unavailable' }
         challengeDetails = if ($null -ne $reportedInspection) { $reportedInspection.challengeDetails } else { $null }
+        newApiAttempted = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiAttempted
+        newApiConfirmed = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiConfirmed
     }
 }
 

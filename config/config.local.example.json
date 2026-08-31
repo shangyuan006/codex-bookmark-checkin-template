@@ -46,6 +46,18 @@
       "verificationDelayMs": 750
     }
   },
+  "bearerCheckinRules": {
+    "https://bearer.example.com": {
+      "refreshPath": "/api/user/auth/refresh",
+      "selfPath": "/api/data/self",
+      "checkinPath": "/api/user/checkin",
+      "verificationAttempts": 3,
+      "verificationDelayMs": 750
+    }
+  },
+  "nativeOAuthCheckinOrigins": [
+    "https://example.com"
+  ],
   "visitCheckinRules": {
     "https://example.com": { "after": "08:00" }
   },
@@ -87,6 +99,17 @@
       }
     }
   },
+  "preCheckinNavigationRules": {
+    "https://example.com": {
+      "steps": [
+        { "selector": "button[data-profile-menu]" },
+        { "role": "menuitem", "name": "Profile" }
+      ],
+      "expectedPath": "/profile",
+      "waitMs": 3000,
+      "afterClickWaitMs": 500
+    }
+  },
   "preCheckinDismissRules": {
     "https://example.com": {
       "buttonTexts": ["关闭公告"],
@@ -112,6 +135,9 @@
       "type": "new_api",
       "selfPath": "/api/user/self",
       "userStorageKeys": ["user"]
+    },
+    "https://bearer.example.com": {
+      "type": "bearer_refresh"
     }
   },
   "challengeInteractionRules": {

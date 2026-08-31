@@ -42,9 +42,19 @@ export function assertManualVerificationExecution(document, options = {}) {
   if (options.resumeRequested !== true) {
     throw new Error("人工复核消费必须携带当天完整报告");
   }
-  const selectedOrigins = [...new Set([...(options.selectedOrigins ?? [])]
-    .map(normalizeOrigin)
-    .filter(Boolean))].sort();
+  const requestedOrigins = [...(options.selectedOrigins ?? [])];
+  const selectedOrigins = [...new Set(requestedOrigins.map(normalizeOrigin).filter(Boolean))].sort();
+  if (selectedOrigins.length !== requestedOrigins.length) {
+    throw new Error("人工复核消费范围包含无效或重复的站点");
+  }
+  if (options.allowSubset === true) {
+    const pendingOriginSet = new Set(pendingOrigins);
+    if (selectedOrigins.length === 0
+      || selectedOrigins.some((origin) => !pendingOriginSet.has(origin))) {
+      throw new Error("人工复核子集消费范围必须是待复核记录的非空子集");
+    }
+    return;
+  }
   if (selectedOrigins.length !== pendingOrigins.length
     || selectedOrigins.some((origin, index) => origin !== pendingOrigins[index])) {
     throw new Error("人工复核消费范围必须与待复核记录完全一致");

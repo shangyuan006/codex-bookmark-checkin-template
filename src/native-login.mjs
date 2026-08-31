@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { connectOverCdpWithRetry } from "./native-cdp.mjs";
 import { expandSavedPasswordLogin } from "./login-form.mjs";
-import { safeLogUrl } from "./security.mjs";
+import { verifyConfiguredSavedLoginSession } from "./saved-login-session.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
@@ -20,6 +20,7 @@ const browser = await connectOverCdpWithRetry(chromium, port, {
   retryDelayMs: 500,
 });
 let status = "needs_attention";
+let loginStage = "navigation";
 let page = null;
 try {
   page = browser.contexts().flatMap((context) => context.pages()).find((candidate) => {
@@ -142,12 +143,21 @@ try {
     && !visiblePassword) {
     status = "logged_in";
   }
-  if (status === "logged_in") await page.waitForTimeout(3000);
+  if (status === "logged_in") {
+    loginStage = "session_present";
+    const verifiedSession = await verifyConfiguredSavedLoginSession(page, expectedOrigin, config);
+    if (verifiedSession && verifiedSession.status !== "valid") {
+      status = "needs_attention";
+      loginStage = "session_verification";
+    } else {
+      loginStage = "completed";
+      await page.waitForTimeout(3000);
+    }
+  }
   console.log(JSON.stringify({
     origin: expectedOrigin,
     status,
-    finalUrl: safeLogUrl(page.url()),
-    title: await page.title(),
+    loginStage,
   }));
   if (status !== "logged_in") process.exitCode = 2;
 } finally {

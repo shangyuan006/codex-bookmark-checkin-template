@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
+import { runNewApiCheckinInBrowser } from "./browser.mjs";
 import { classifyPageText } from "./detector.mjs";
-import { connectOverCdpWithRetry } from "./native-cdp.mjs";
+import { connectOverCdpWithRetry, evaluateOverRawCdp } from "./native-cdp.mjs";
 import {
   clickVisibleNativeChallengeControl,
   clickUniqueNativeCheckinAction,
@@ -19,6 +20,7 @@ const maxWaitSeconds = Math.max(0, Math.min(120, Number.parseInt(process.argv[4]
 const inspectionMode = process.argv[5] || "require-confirmed";
 const allowEndpointReady = inspectionMode === "allow-endpoint";
 const executeCheckin = inspectionMode === "execute-checkin";
+const executeNewApiCheckin = inspectionMode === "execute-new-api";
 const encodedActionRule = process.argv[6] || "";
 const actionRule = executeCheckin
   ? normalizeNativeCheckinActionRule(JSON.parse(Buffer.from(encodedActionRule, "base64").toString("utf8")))
@@ -27,7 +29,7 @@ const retryableChallengeOutcomes = new Set(["pending", "challenge_not_found", "c
 if (!Number.isInteger(port) || port <= 0) {
   throw new Error("usage: node src/native-browser-inspect.mjs <port> <origin> [max-wait-seconds] [mode] [action-rule-base64]");
 }
-if (!new Set(["require-confirmed", "allow-endpoint", "execute-checkin"]).has(inspectionMode)) {
+if (!new Set(["require-confirmed", "allow-endpoint", "execute-checkin", "execute-new-api"]).has(inspectionMode)) {
   throw new Error("native browser inspection mode is invalid");
 }
 
@@ -66,13 +68,43 @@ async function readPageState(page) {
   };
 }
 
-const browser = await connectOverCdpWithRetry(chromium, port, {
-  timeoutMs: Math.max(5000, Math.min(15_000, maxWaitSeconds * 1000)),
-  attemptTimeoutMs: 2000,
-  retryDelayMs: 500,
-});
+async function inspectNewApiWithRawCdp() {
+  const expression = `(async () => {
+    const state = await (${runNewApiCheckinInBrowser.toString()})();
+    return {
+      state,
+      siteBodyLoaded: String(document.body?.innerText || "").trim().length > 80,
+    };
+  })()`;
+  const result = await evaluateOverRawCdp(port, expectedOrigin, expression, {
+    timeoutMs: Math.max(5000, Math.min(15_000, maxWaitSeconds * 1000)),
+    retryDelayMs: 500,
+  });
+  const state = result?.state ?? {
+    status: "unconfirmed",
+    reason: "native New API check-in did not return an authoritative status",
+  };
+  const newApiConfirmed = ["signed", "already_signed"].includes(state.status);
+  console.log(JSON.stringify({
+    status: state.status,
+    siteBodyLoaded: Boolean(result?.siteBodyLoaded),
+    attendanceEndpoint: false,
+    actionAttempted: false,
+    actionOutcome: "not_configured",
+    challengeOutcome: "not_configured",
+    challengeDetails: null,
+    newApiAttempted: true,
+    newApiConfirmed,
+  }));
+}
 
-try {
+async function inspectWithPlaywright() {
+  const browser = await connectOverCdpWithRetry(chromium, port, {
+    timeoutMs: Math.max(5000, Math.min(15_000, maxWaitSeconds * 1000)),
+    attemptTimeoutMs: 2000,
+    retryDelayMs: 500,
+  });
+  try {
   const pageDeadline = Date.now() + maxWaitSeconds * 1000;
   let page = null;
   while (!page && Date.now() <= pageDeadline) {
@@ -130,6 +162,8 @@ try {
         actionOutcome,
         challengeOutcome,
         challengeDetails,
+        newApiAttempted: false,
+        newApiConfirmed: false,
       };
       const explicitlyConfirmed = ["signed", "already_signed"].includes(current.state.status);
       const endpointReady = allowEndpointReady && current.state.status === "ready"
@@ -146,6 +180,10 @@ try {
     await page.waitForTimeout(1000);
   } while (true);
   console.log(JSON.stringify(output));
-} finally {
-  await browser.close().catch(() => {});
+  } finally {
+    await browser.close().catch(() => {});
+  }
 }
+
+if (executeNewApiCheckin) await inspectNewApiWithRawCdp();
+else await inspectWithPlaywright();

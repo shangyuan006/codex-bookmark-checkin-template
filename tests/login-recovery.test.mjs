@@ -20,6 +20,10 @@ test("登录助手必须明确返回 logged_in 才算成功", () => {
     "linuxdo_session",
   );
   assert.equal(
+    loginHelperOutcome('{"status":"needs_attention","oauthStage":"login_challenge"}').oauthStage,
+    "login_challenge",
+  );
+  assert.equal(
     Object.hasOwn(loginHelperOutcome('{"status":"needs_attention","oauthStage":"private-page-text"}'), "oauthStage"),
     false,
   );
@@ -43,6 +47,22 @@ test("OAuth helper result can be parsed from stderr without persisting raw diagn
   assert.equal(outcome.status, "needs_attention");
   assert.equal(outcome.oauthStage, "provider_authorization");
   assert.equal(Object.hasOwn(outcome, "raw"), false);
+});
+
+test("same-session OAuth helper exposes only authoritative check-in statuses", () => {
+  assert.equal(loginHelperOutcome(JSON.stringify({
+    status: "logged_in",
+    oauthStage: "checkin_verification",
+    checkinStatus: "signed",
+  })).checkinStatus, "signed");
+  assert.equal(loginHelperOutcome(JSON.stringify({
+    status: "logged_in",
+    checkinStatus: "clicked",
+  })).checkinStatus, undefined);
+  assert.equal(loginHelperOutcome(JSON.stringify({
+    status: "logged_in",
+    checkinStatus: "already_signed",
+  })).checkinStatus, "already_signed");
 });
 
 test("stdout status remains authoritative while stderr supplies a missing fixed stage", () => {
@@ -115,14 +135,45 @@ test("恢复调度只复用清理后的登录 URL 并解析助手状态", async 
   assert.match(source, /outcome\.status === "logged_in" \? loginHelperOutcome\("", fallback\) : outcome/);
   assert.doesNotMatch(source, /"-LoginUrl", current\.url/);
   assert.doesNotMatch(source, /"saved-password-login\.mjs"\), current\.origin, current\.url/);
+  assert.match(source, /Recover-NativeOAuthCheckin\.ps1/);
+  assert.match(source, /current\.status === "interactive_challenge"[\s\S]*?nativeOAuthCheckinEnabled/);
+  assert.match(source, /current\.status !== "login_required" && !nativeChallengeRecovery/);
+  assert.match(source, /if \(current\.status === "login_required"\) \{[\s\S]*?method: "saved_password"/);
+  assert.match(source, /authoritativeCheckinStatus/);
+  assert.match(source, /\["signed", "already_signed"\]\.includes\(sameSessionStatus\)/);
+  assert.match(source, /const needsRecoveryBrowser = recoveryIndexes\.some/);
+  assert.match(source, /needsRecoveryBrowser \? await launchAutomationContext\(config\) : null/);
+  assert.match(source, /await recoveryContext\?\.close\(\)/);
 });
 
 test("OAuth helper exposes only fixed diagnostic stages", async () => {
   const source = await fs.readFile(new URL("../src/oauth-login.mjs", import.meta.url), "utf8");
   assert.match(source, /setOAuthStage\("provider_transition"\)/);
+  assert.match(source, /setOAuthStage\("login_challenge"\)/);
   assert.match(source, /setOAuthStage\("linuxdo_session"\)/);
+  assert.match(source, /probeProviderSessionInContext\(\s*context,[\s\S]*?session\/current\.json/);
+  assert.match(source, /if \(initialSession !== "invalid"\) return false/);
+  assert.doesNotMatch(source, /page\.goto\("https:\/\/linux\.do\/session\/current\.json"/);
+  assert.match(source, /agentRouterOnly && !providerSessionConfirmed/);
+  assert.match(source, /if \(agentRouterOnly\) \{[\s\S]*?probeLinuxDoSession\(context, 2\)/);
+  assert.match(source, /probeLinuxDoSession\(context, 2\)[\s\S]*?acquireTargetPage\(context\)/);
   assert.match(source, /setOAuthStage\("provider_authorization"\)/);
+  assert.match(source, /describeConfiguredAuthorizationSurface\(page, provider\)/);
+  assert.match(source, /authorizationSurfaceReported = true/);
+  assert.match(source, /clickConfiguredLoginChallengeControl\([\s\S]*?providerOrigin/);
+  assert.match(source, /isConfiguredProviderAuthorizationPage\(page\.url\(\), provider\)[\s\S]*?authorizationDeadline/);
+  assert.match(source, /authorizationSubmitted = true[\s\S]*?providerChallengeClicked[\s\S]*?authorizationSubmitted = false/);
+  assert.match(source, /if \(isConfiguredProviderAuthorizationPage\(page\.url\(\), provider\)\) \{[\s\S]*?authorization did not complete/);
   assert.match(source, /setOAuthStage\("target_callback"\)/);
+  assert.match(source, /setOAuthStage\("checkin_verification"\)/);
+  assert.match(source, /nativeOAuthCheckinOrigins/);
+  assert.match(source, /processCandidate\(page, bookmarkTarget, candidateUrl, config, \[\]\)/);
+  assert.match(source, /reuseExistingNativeTargetSession/);
+  assert.match(source, /await navigateNativeTargetCandidate\(page\)/);
+  assert.match(source, /assertBookmarkNavigation\(bookmarkTarget\.candidates\[0\], allowedOrigins\)/);
+  assert.match(source, /!isTargetOriginPage\(page\) \|\| isTargetLoginPage\(page\)/);
+  assert.match(source, /if \(checkinAfterLogin\)[\s\S]*?runConfiguredTargetCheckin\(page\)[\s\S]*?return \{ checkinStatus: checkinResult\.status \}/);
+  assert.match(source, /selectPreferredOAuthTargetPage/);
   assert.match(source, /process\.stderr\.write/);
   assert.doesNotMatch(source, /oauthStage\s*=\s*(?:page\.|error\.|finalUrl|page\.url)/);
   assert.doesNotMatch(source, /printResult\([^)]*(?:page\.url|finalUrl|error)/s);

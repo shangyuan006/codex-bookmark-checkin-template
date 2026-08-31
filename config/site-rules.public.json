@@ -1,7 +1,7 @@
 {
   "_meta": {
     "schemaVersion": 1,
-    "lastVerifiedAt": "2026-07-20"
+    "lastVerifiedAt": "2026-08-28"
   },
   "relatedCandidateUrls": {
     "https://x666.me": ["https://up.x666.me/"],
@@ -49,10 +49,10 @@
     { "url": "https://audiences.me/attendance.php", "waitSeconds": 20 },
     { "url": "https://ourbits.club/attendance.php", "waitSeconds": 30 }
   ],
-  "oauthRedirectOverrides": {
-    "https://free.lyclaude.site": {
-      "LinuxDO": "https://free.lyclaude.site/oauth/linuxdo"
-    }
+  "oauthCallbackOriginAliases": {
+    "https://free.lyclaude.site": [
+      "https://free.vipclaude.codes"
+    ]
   },
   "oauthLoginUrls": {
     "https://checkin.new-api.abrdns.com": "https://checkin.new-api.abrdns.com/"

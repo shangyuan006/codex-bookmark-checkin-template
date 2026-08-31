@@ -378,10 +378,12 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
   const stageReasons = {
     target_login: "目标站登录页未就绪",
     provider_button: "未找到登录提供方按钮",
+    login_challenge: "安全验证完成后仍未找到提供方按钮",
     provider_transition: "登录提供方跳转未完成",
     linuxdo_session: "LinuxDO 会话恢复未完成",
-    provider_authorization: "LinuxDO 授权未完成",
+    ["provider_authorization"]: "登录提供方授权未完成",
     target_callback: "登录回调未返回目标站",
+    session_verification: "目标站权威会话验证未通过",
     timeout: "登录流程超时",
     helper_failed: "登录助手执行失败",
   };
@@ -792,7 +794,10 @@ async function runAgentRouterOnlyWithRetry(rule, config, account) {
     rule,
     config,
     account,
-    () => runOAuthHelper(rule, config, account, ["--agent-router-only"]),
+    () => runOAuthHelper(rule, config, account, [
+      "--agent-router-only",
+      "--provider-session-confirmed",
+    ]),
   );
 }
 
@@ -857,13 +862,33 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   const accountConfig = { ...config, automationUserDataDir: rule.automationUserDataDir };
   const state = await readState(statePath);
   const previous = state.entries?.[stateKey] ?? state.entries?.[rule.origin];
-  if (previous?.date === date && previous.status === "completed") {
+  if (shouldReuseCompletedReauthState(previous, date, options.forceReauth)) {
     return { status: "already_signed", reason: "今日已通过重新登录确认额度到账" };
+  }
+  if (options.postOAuthVerify) {
+    if (previous?.date !== date || previous.status !== "logged_out") {
+      return {
+        status: "needs_attention",
+        reason: "OAuth 后复核缺少今天的已退出状态，未再次发起登录",
+      };
+    }
+    const currentLogin = await inspectCurrentLogin(accountConfig, rule);
+    if (!currentLogin.valid || !currentLogin.explicitLoginSuccess) {
+      return {
+        status: "needs_attention",
+        reason: "OAuth 后未取得目标站权威登录或额度到账信号，未再次发起登录",
+      };
+    }
+    const refreshed = await readState(statePath);
+    await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));
+    return { status: "signed", reason: "重新登录后站点确认额度已到账" };
   }
   if (previous?.date === date && previous.status === "logged_out") {
     let currentLogin = await inspectCurrentLogin(accountConfig, rule);
     if (!currentLogin.valid) {
-      const oauthResult = await runPrivateOAuthWithRetry(rule, accountConfig, rule);
+      const oauthResult = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO"
+        ? await runAgentRouterOnlyWithRetry(rule, accountConfig, rule)
+        : await runPrivateOAuthWithRetry(rule, accountConfig, rule);
       if (!oauthResult.succeeded) {
         return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider, oauthResult.oauthStage) };
       }
@@ -968,6 +993,12 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   } finally {
     await afterSession?.context.close().catch(() => {});
   }
+}
+
+export function shouldReuseCompletedReauthState(previous, date, forceReauth = false) {
+  return forceReauth !== true
+    && previous?.date === date
+    && previous.status === "completed";
 }
 
 export async function runConfiguredReauthCheckin(target, config, options = {}) {

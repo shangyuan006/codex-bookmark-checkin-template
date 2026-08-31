@@ -3,6 +3,7 @@ $script:ManualVerificationImmediateStatuses = @(
     'error', 'login_required', 'interactive_challenge', 'managed_challenge',
     'managed_challenge_timeout', 'needs_attention', 'unconfirmed', 'clicked', 'visited'
 )
+$script:ManualVerificationHandoffDeferredCauses = @('login_required', 'managed_challenge_timeout')
 
 function ConvertTo-ManualVerificationOrigin($Value) {
     $uri = try { [uri]([string]$Value) } catch { $null }
@@ -22,6 +23,31 @@ function ConvertTo-ManualVerificationUtcDateTime($Value) {
     $parsed = [datetime]::MinValue
     if ([datetime]::TryParse([string]$Value, [ref]$parsed)) { return $parsed.ToUniversalTime() }
     return $null
+}
+
+function Get-ManualVerificationShanghaiDate([datetime]$Value) {
+    $utc = $Value.ToUniversalTime()
+    try {
+        $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById('China Standard Time')
+        return [TimeZoneInfo]::ConvertTimeFromUtc($utc, $timeZone).ToString('yyyyMMdd')
+    }
+    catch {
+        return $utc.AddHours(8).ToString('yyyyMMdd')
+    }
+}
+
+function Test-ManualVerificationCurrentDayDocument($Document, [datetime]$Now = (Get-Date)) {
+    if ($null -eq $Document) { return $false }
+    $expectedDate = Get-ManualVerificationShanghaiDate $Now
+    if ([string]$Document.sourceRunId -notlike "$expectedDate-*") { return $false }
+
+    foreach ($value in @($Document.createdAt, $Document.sourceFinishedAt)) {
+        $timestamp = ConvertTo-ManualVerificationUtcDateTime $value
+        if ($null -eq $timestamp -or (Get-ManualVerificationShanghaiDate $timestamp) -ne $expectedDate) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Test-ManualVerificationFinalReport($Report) {
@@ -47,6 +73,14 @@ function Test-ManualVerificationImmediateResult($Result, [datetime]$RetryAt) {
     return $status -in $script:ManualVerificationImmediateStatuses
 }
 
+function Test-ManualVerificationHandoffResult($Result) {
+    if ($null -eq $Result -or (Test-ManualVerificationTerminalStatus $Result.status)) { return $false }
+    if ([string]$Result.status -eq 'deferred') {
+        return [string]$Result.retryCause -in $script:ManualVerificationHandoffDeferredCauses
+    }
+    return [string]$Result.status -in $script:ManualVerificationImmediateStatuses
+}
+
 function Get-ManualHandoffTargets($Report, [datetime]$Now = (Get-Date)) {
     if ($null -eq $Report -or [string]$Report.runState -ne 'final' -or $Report.isComplete -ne $true) {
         return @()
@@ -56,7 +90,9 @@ function Get-ManualHandoffTargets($Report, [datetime]$Now = (Get-Date)) {
     foreach ($result in @($Report.results)) {
         $origin = ConvertTo-ManualVerificationOrigin $result.origin
         if (-not $origin -or $seen.ContainsKey($origin)) { continue }
-        if (Test-ManualVerificationImmediateResult $result $Now) {
+        # Automatic retry backoff must not postpone an available human login
+        # or challenge handoff. The cooldown still governs unattended retries.
+        if (Test-ManualVerificationHandoffResult $result) {
             $seen[$origin] = $true
             $targets += [ordered]@{
                 origin = $origin

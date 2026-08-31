@@ -19,6 +19,7 @@ trap {
 $root = if ($Root) { [System.IO.Path]::GetFullPath($Root) } else { Split-Path -Parent $PSScriptRoot }
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+. (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 
 function Test-HealthPath([string]$Path) {
     return [bool]$Path -and (Test-Path -LiteralPath $Path)
@@ -116,6 +117,7 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $browserExecutable = if ($config.browserExecutable) { [string]$config.browserExecutable } else { [string]$config.chromeExecutable }
 $latestPath = Join-Path $root 'logs\latest.json'
+$manualAbandonPath = Join-Path $root 'tmp\manual-abandon.json'
 $statePath = Join-Path $root 'data\site-state.json'
 $notificationQuarantinePath = Join-Path $root 'data\notification-outbox\quarantine'
 $notificationQuarantinedCount = @(Get-ChildItem -LiteralPath $notificationQuarantinePath -Filter '*.invalid.json' -File -ErrorAction SilentlyContinue).Count
@@ -182,11 +184,20 @@ try {
     $currentPlanReadable = $false
 }
 
-$problemCount = if ($latest) { @($latest.results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') }).Count } else { $null }
 $minimumTargets = [Math]::Max(1, [int]$config.minimumBookmarkTargetCount)
 $latestPlannedTotal = if ($latest -and $null -ne $latest.plannedTotal) { [int]$latest.plannedTotal } else { 0 }
 $latestProcessedTotal = if ($latest -and $null -ne $latest.processedTotal) { [int]$latest.processedTotal } elseif ($latest) { @($latest.results).Count } else { 0 }
 $latestRunToday = $latest -and [string]$latest.runId -like "$(Get-Date -Format 'yyyyMMdd')-*"
+$abandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now (Get-Date)
+$latestAbandonedCount = if ($latestRunToday) { @($latest.results | Where-Object {
+    $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
+    $origin -and $abandonedOrigins.ContainsKey($origin)
+}).Count } else { 0 }
+$problemCount = if ($latest) { @($latest.results | Where-Object {
+    $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
+    $isAbandoned = $latestRunToday -and $origin -and $abandonedOrigins.ContainsKey($origin)
+    $_.status -notin @('signed', 'already_signed', 'not_available') -and -not $isAbandoned
+}).Count } else { $null }
 $latestResultComplete = $latest `
     -and $latestRunToday `
     -and [string]$latest.runState -eq 'final' `
@@ -229,6 +240,7 @@ if ($latest) {
             Origin = $parentOrigin
             Result = $result
             AccountResults = @($accountResultsProperty.Value)
+            Abandoned = [bool]($latestRunToday -and $abandonedOrigins.ContainsKey($parentOrigin))
         }
     }
 }
@@ -248,7 +260,9 @@ $nestedAccountParentOriginsMatch = $currentPlanReadable `
     -and $nestedAccountParentOriginDifferenceCount -eq 0
 $latestAccountIdentityCount = 0
 $latestAccountProblemCount = @($latestNestedAccountParents | ForEach-Object {
-    @($_.AccountResults) | Where-Object { $_.status -notin @('signed', 'already_signed') }
+    if (-not $_.Abandoned) {
+        @($_.AccountResults) | Where-Object { $_.status -notin @('signed', 'already_signed') }
+    }
 }).Count
 $latestAccountAggregateMismatchCount = 0
 $latestAccountPlanMismatchCount = 0
@@ -361,6 +375,7 @@ $healthy = $failedChecks.Count -eq 0
     currentAccountIdentityCount = $currentAccountIdentityCount
     latestAccountIdentityCount = $latestAccountIdentityCount
     latestProblemCount = $problemCount
+    latestAbandonedCount = $latestAbandonedCount
     latestAccountProblemCount = $latestAccountProblemCount
     latestAccountAggregateMismatchCount = $latestAccountAggregateMismatchCount
     latestAccountPlanMismatchCount = $latestAccountPlanMismatchCount

@@ -1,13 +1,45 @@
 ﻿[CmdletBinding()]
-param([switch]$Abandon)
+param(
+    [switch]$Abandon,
+    [string[]]$Origins = @(),
+    [int[]]$Selection = @()
+)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 $signalPath = Join-Path $root 'tmp\close-manual-session.signal'
 $statePath = Join-Path $root 'tmp\manual-session.json'
 $verificationPath = Join-Path $root 'tmp\manual-verification.json'
 $handoffPath = Join-Path $root 'tmp\manual-handoff.json'
 $abandonPath = Join-Path $root 'tmp\manual-abandon.json'
+$navigationExtensionPath = Join-Path $root 'tmp\manual-precheckin-extension'
+
+function Remove-ManualNavigationExtension {
+    $tmpRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'tmp'))
+    $extensionRoot = [System.IO.Path]::GetFullPath($navigationExtensionPath)
+    if (-not $extensionRoot.StartsWith(
+        $tmpRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw '手动签到前导航目录越出 tmp 边界。'
+    }
+    if (Test-Path -LiteralPath $extensionRoot) {
+        $item = Get-Item -LiteralPath $extensionRoot -Force
+        if (-not $item.PSIsContainer `
+            -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw '拒绝删除不安全的手动签到前导航目录。'
+        }
+        Remove-Item -LiteralPath $extensionRoot -Recurse -Force
+    }
+}
+
+if (-not $Abandon -and ($Origins.Count -gt 0 -or $Selection.Count -gt 0)) {
+    throw 'Origins 和 Selection 只能与 -Abandon 一起使用。'
+}
+if ($Origins.Count -gt 0 -and $Selection.Count -gt 0) {
+    throw 'Origins 和 Selection 不能同时使用。'
+}
 
 function Clear-ManualContinuationState {
     Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue
@@ -15,23 +47,20 @@ function Clear-ManualContinuationState {
 }
 
 function Write-ManualAbandonment($Targets) {
-    $today = (Get-Date).ToString('yyyyMMdd')
-    $existingOrigins = @()
-    if (Test-Path -LiteralPath $abandonPath) {
-        try {
-            $existing = Get-Content -Raw -Encoding UTF8 -LiteralPath $abandonPath | ConvertFrom-Json
-            if ([string]$existing.date -eq $today) { $existingOrigins = @($existing.origins) }
-        }
-        catch { $existingOrigins = @() }
+    $now = Get-Date
+    $originSet = Get-TodayAbandonedOrigins -Path $abandonPath -Now $now
+    foreach ($target in @($Targets)) {
+        $origin = ConvertTo-ManualAbandonmentOrigin $target.origin
+        if (-not $origin) { throw '今日放弃目标必须是规范的 HTTPS origin。' }
+        $originSet[$origin] = $true
     }
-    $origins = @($existingOrigins + @($Targets | ForEach-Object { [string]$_.origin }) `
-        | Where-Object { $_ } | Sort-Object -Unique)
     $document = [ordered]@{
         schemaVersion = 1
-        date = $today
-        createdAt = (Get-Date).ToUniversalTime().ToString('o')
-        origins = $origins
+        date = $now.ToString('yyyyMMdd')
+        createdAt = $now.ToUniversalTime().ToString('o')
+        origins = @($originSet.Keys | Sort-Object)
     }
+    [System.IO.Directory]::CreateDirectory((Split-Path -Parent $abandonPath)) | Out-Null
     $temporaryPath = "$abandonPath.$PID.tmp"
     [System.IO.File]::WriteAllText(
         $temporaryPath,
@@ -39,6 +68,47 @@ function Write-ManualAbandonment($Targets) {
         [System.Text.UTF8Encoding]::new($false)
     )
     Move-Item -LiteralPath $temporaryPath -Destination $abandonPath -Force
+}
+
+function Resolve-ManualAbandonmentSelection($Targets) {
+    $allTargets = @($Targets)
+    if ($Origins.Count -eq 0 -and $Selection.Count -eq 0) {
+        return [pscustomobject]@{ Abandoned = $allTargets; Remaining = @() }
+    }
+    if ($allTargets.Count -eq 0) { throw '当前手动会话没有可供选择的站点。' }
+
+    $selectedIndexes = @{}
+    foreach ($number in @($Selection)) {
+        if ($number -lt 1 -or $number -gt $allTargets.Count) {
+            throw "Selection 序号 $number 超出当前手动会话范围 1-$($allTargets.Count)。"
+        }
+        $selectedIndexes[$number - 1] = $true
+    }
+
+    $selectedOrigins = @{}
+    foreach ($rawOrigin in @($Origins)) {
+        $origin = ConvertTo-ManualAbandonmentOrigin $rawOrigin
+        if (-not $origin) { throw "无效的放弃 origin：$rawOrigin" }
+        $selectedOrigins[$origin] = $true
+    }
+    foreach ($origin in @($selectedOrigins.Keys)) {
+        $present = @($allTargets | Where-Object {
+            (ConvertTo-ManualAbandonmentOrigin $_.origin) -eq $origin
+        }).Count -gt 0
+        if (-not $present) { throw "放弃 origin 不在当前手动会话中：$origin" }
+    }
+
+    $abandoned = @()
+    $remaining = @()
+    for ($index = 0; $index -lt $allTargets.Count; $index++) {
+        $target = $allTargets[$index]
+        $origin = ConvertTo-ManualAbandonmentOrigin $target.origin
+        $selected = $selectedIndexes.ContainsKey($index) `
+            -or ($origin -and $selectedOrigins.ContainsKey($origin))
+        if ($selected) { $abandoned += $target } else { $remaining += $target }
+    }
+    if ($abandoned.Count -eq 0) { throw '没有选中任何当前手动会话站点。' }
+    return [pscustomobject]@{ Abandoned = @($abandoned); Remaining = @($remaining) }
 }
 
 function Get-ManualVerificationTargets($SessionState) {
@@ -84,8 +154,25 @@ function Write-ManualVerification($SessionState, $VerificationTargets) {
     Move-Item -LiteralPath $temporaryPath -Destination $verificationPath -Force
 }
 
+function Set-ManualAbandonmentContinuation($SessionState, $VerificationTargets) {
+    $split = Resolve-ManualAbandonmentSelection $VerificationTargets
+    Write-ManualAbandonment $split.Abandoned
+    Remove-Item -LiteralPath $handoffPath -Force -ErrorAction SilentlyContinue
+    if (@($split.Remaining).Count -gt 0) {
+        Write-ManualVerification $SessionState $split.Remaining
+    }
+    else {
+        Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue
+    }
+    return $split
+}
+
 if (-not (Test-Path -LiteralPath $statePath)) {
+    if ($Abandon -and ($Origins.Count -gt 0 -or $Selection.Count -gt 0)) {
+        throw '没有正在运行的手动登录会话，无法解析部分放弃目标。'
+    }
     if ($Abandon) { Clear-ManualContinuationState }
+    Remove-ManualNavigationExtension
     Write-Output '没有正在运行的手动登录会话。'
     return
 }
@@ -139,19 +226,22 @@ if ($state -and [string]$state.mode -eq 'native') {
         -and $verificationTargets.Count -gt 0 `
         -and $hasRecordedTargetCount `
         -and $verificationTargets.Count -eq $recordedTargetCount
+    if ($Abandon -and ($Origins.Count -gt 0 -or $Selection.Count -gt 0) -and -not $canCreateVerification) {
+        throw '当前手动会话缺少完整目标元数据，无法安全执行部分放弃。'
+    }
 
     if (-not $trackedProcess -and $targets.Count -eq 0 -and $canCreateVerification) {
         if ($Abandon) {
-            Write-ManualAbandonment $verificationTargets
-            Clear-ManualContinuationState
+            $abandonment = Set-ManualAbandonmentContinuation $state $verificationTargets
         }
         else {
             Write-ManualVerification $state $verificationTargets
         }
         Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
+        Remove-ManualNavigationExtension
         if ($Abandon) {
-            Write-Output "手动窗口已关闭；已将 $($verificationTargets.Count) 个站点标记为今日放弃。"
+            Write-Output "手动窗口已关闭；今日放弃 $(@($abandonment.Abandoned).Count) 个，保留 $(@($abandonment.Remaining).Count) 个等待权威复核。"
         }
         else {
             Write-Output "手动窗口已关闭；已记录 $($verificationTargets.Count) 个等待权威复核的站点。"
@@ -165,6 +255,7 @@ if ($state -and [string]$state.mode -eq 'native') {
         }
         Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
+        Remove-ManualNavigationExtension
         Write-Output '手动登录记录已失效，已清理。'
         return
     }
@@ -183,16 +274,16 @@ if ($state -and [string]$state.mode -eq 'native') {
     if ($remaining.Count -gt 0) { throw '原生手动登录窗口未能正常退出，请手动关闭后重试。' }
 
     if ($Abandon) {
-        Write-ManualAbandonment $verificationTargets
-        Clear-ManualContinuationState
+        $abandonment = Set-ManualAbandonmentContinuation $state $verificationTargets
     }
     elseif ($canCreateVerification) {
         Write-ManualVerification $state $verificationTargets
     }
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
+    Remove-ManualNavigationExtension
     if ($Abandon) {
-        Write-Output "机器人专用浏览器已保存会话并正常关闭；已将 $($verificationTargets.Count) 个站点标记为今日放弃。"
+        Write-Output "机器人专用浏览器已保存会话并正常关闭；今日放弃 $(@($abandonment.Abandoned).Count) 个，保留 $(@($abandonment.Remaining).Count) 个等待权威复核。"
     }
     elseif ($canCreateVerification) {
         Write-Output "机器人专用浏览器已保存会话并正常关闭；已记录 $($verificationTargets.Count) 个等待权威复核的站点。"
@@ -205,8 +296,15 @@ if ($state -and [string]$state.mode -eq 'native') {
 
 if ($Abandon) {
     $abandonTargets = @(Get-ManualVerificationTargets $state)
-    if ($abandonTargets.Count -gt 0) { Write-ManualAbandonment $abandonTargets }
-    Clear-ManualContinuationState
+    if (($Origins.Count -gt 0 -or $Selection.Count -gt 0) -and $abandonTargets.Count -eq 0) {
+        throw '旧版手动会话没有可用的目标元数据，无法安全执行部分放弃。'
+    }
+    $abandonment = Set-ManualAbandonmentContinuation $state $abandonTargets
 }
 [System.IO.File]::WriteAllText($signalPath, (Get-Date).ToString('o'), [System.Text.UTF8Encoding]::new($false))
-Write-Output '已请求旧版手动登录会话保存并正常关闭。'
+if ($Abandon) {
+    Write-Output "已请求旧版手动登录会话保存并正常关闭；今日放弃 $(@($abandonment.Abandoned).Count) 个，保留 $(@($abandonment.Remaining).Count) 个等待权威复核。"
+}
+else {
+    Write-Output '已请求旧版手动登录会话保存并正常关闭。'
+}

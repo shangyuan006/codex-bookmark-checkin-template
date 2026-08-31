@@ -9,7 +9,17 @@ import { solveU2VisualChallenge } from "./u2-vision.mjs";
 import { resolveQaByWebSearch } from "./qa-solver.mjs";
 import { withRetrySchedule } from "./retry-policy.mjs";
 import { tryNewApiCaptchaCheckin, tryNewApiSignIn } from "./new-api-signin.mjs";
+import { tryBearerCheckin } from "./bearer-checkin.mjs";
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
+import {
+  getConfiguredPreCheckinNavigationRule,
+  navigateConfiguredPreCheckinPage,
+} from "./pre-checkin-navigation.mjs";
+
+export {
+  getConfiguredPreCheckinNavigationRule,
+  navigateConfiguredPreCheckinPage,
+} from "./pre-checkin-navigation.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
@@ -121,8 +131,9 @@ export function reliableNewApiCaptchaCandidates(recognition, minConfidence = 30)
 export async function tryConfiguredNewApiCheckin(page, activeOrigin, config = {}) {
   const hasCaptchaRule = Object.hasOwn(config.newApiCaptchaRules ?? {}, activeOrigin);
   const hasSignInRule = Object.hasOwn(config.newApiSignInRules ?? {}, activeOrigin);
-  if (hasCaptchaRule && hasSignInRule) {
-    throw new Error(`New API origin has conflicting captcha and sign-in rules: ${activeOrigin}`);
+  const hasBearerRule = Object.hasOwn(config.bearerCheckinRules ?? {}, activeOrigin);
+  if ([hasCaptchaRule, hasSignInRule, hasBearerRule].filter(Boolean).length > 1) {
+    throw new Error(`New API origin has conflicting captcha, sign-in, or Bearer rules: ${activeOrigin}`);
   }
   if (hasCaptchaRule) {
     const rawRule = config.newApiCaptchaRules[activeOrigin];
@@ -133,6 +144,9 @@ export async function tryConfiguredNewApiCheckin(page, activeOrigin, config = {}
   }
   if (hasSignInRule) {
     return tryNewApiSignIn(page, activeOrigin, config);
+  }
+  if (hasBearerRule) {
+    return tryBearerCheckin(page, activeOrigin, config);
   }
   return null;
 }
@@ -172,17 +186,42 @@ export function getConfiguredChallengeInteractionRule(target, activeOrigin, conf
   if (!["click", "slide", "wait"].includes(type)) throw new Error("验证交互规则类型无效");
   if (!["before", "after"].includes(configuredPhase)) throw new Error("验证交互规则阶段无效");
   if (phase && configuredPhase !== phase) return null;
+  const configuredAppearanceWaitMs = Number(raw.appearanceWaitMs);
   return {
     type,
     phase: configuredPhase,
     optional: raw.optional === true,
+    appearanceWaitMs: raw.optional === true && configuredPhase === "after"
+      ? Math.max(0, Math.min(15_000, Number.isFinite(configuredAppearanceWaitMs) ? configuredAppearanceWaitMs : 5_000))
+      : 0,
     waitMs: Math.max(1000, Math.min(60_000, Number(raw.waitMs) || 30_000)),
     settleMs: Math.max(500, Math.min(10_000, Number(raw.settleMs) || 3000)),
     retryAction: raw.retryAction === true,
+    retryDomClick: raw.retryAction === true && raw.retryDomClick === true,
     retryActionWaitMs: raw.retryAction === true
       ? Math.max(500, Math.min(20_000, Number(raw.retryActionWaitMs) || 5000))
       : 0,
   };
+}
+
+export function shouldUseConfiguredNewApiPageRetry(initialResult, rule) {
+  return ["interactive_challenge", "login_required"].includes(initialResult?.status)
+    && rule?.phase === "after"
+    && rule?.retryAction === true;
+}
+
+export function shouldRetryConfiguredCheckinPageAction(pendingApiRetry, rule, state) {
+  if (!pendingApiRetry || rule?.phase !== "after" || rule?.retryAction !== true) return false;
+  return ![
+    "signed",
+    "already_signed",
+    "login_required",
+    "needs_attention",
+    "interactive_challenge",
+    "managed_challenge",
+    "managed_challenge_timeout",
+    "deferred",
+  ].includes(state?.status);
 }
 
 export function getConfiguredCheckinCaptchaDialogRule(target, activeOrigin, config) {
@@ -662,7 +701,7 @@ async function waitForConfiguredChallengeState(page, allowedOrigins, config, rul
   return latest;
 }
 
-async function clickConfiguredChallengeControl(page, rule, expectedOrigin, config) {
+export async function clickConfiguredChallengeControl(page, rule, expectedOrigin, config) {
   const selector = [
     'altcha-widget input[type="checkbox"]',
     'altcha-widget [role="checkbox"]',
@@ -742,43 +781,43 @@ async function clickConfiguredChallengeControl(page, rule, expectedOrigin, confi
         };
       }));
       const embeddedSelection = selectConfiguredCapChallengeCandidate(embeddedCandidates);
-      if (!embeddedSelection.candidate) {
+      if (embeddedSelection.outcome === "challenge_not_unique") {
         return {
           status: "needs_attention",
-          reason: embeddedSelection.outcome === "challenge_not_found"
-            ? "自动验证未找到唯一可见 Cap.js 组件"
-            : "自动验证找到多个可见 Cap.js 组件，已拒绝操作",
+          reason: "自动验证找到多个可见 Cap.js 组件，已拒绝操作",
         };
       }
-      const capWidget = embeddedWidgets.nth(embeddedSelection.candidate.index);
-      const capControls = capWidget.locator([
-        'input[type="checkbox"]',
-        '[role="checkbox"]',
-        '[aria-checked][tabindex]',
-      ].join(", "));
-      const visibleCapControls = [];
-      for (let index = 0; index < Math.min(20, await capControls.count()); index += 1) {
-        const candidate = capControls.nth(index);
-        if (await candidate.isVisible().catch(() => false)
-          && await candidate.isEnabled().catch(() => true)) {
-          visibleCapControls.push(candidate);
+      if (embeddedSelection.candidate) {
+        const capWidget = embeddedWidgets.nth(embeddedSelection.candidate.index);
+        const capControls = capWidget.locator([
+          'input[type="checkbox"]',
+          '[role="checkbox"]',
+          '[aria-checked][tabindex]',
+        ].join(", "));
+        const visibleCapControls = [];
+        for (let index = 0; index < Math.min(20, await capControls.count()); index += 1) {
+          const candidate = capControls.nth(index);
+          if (await candidate.isVisible().catch(() => false)
+            && await candidate.isEnabled().catch(() => true)) {
+            visibleCapControls.push(candidate);
+          }
         }
-      }
-      if (visibleCapControls.length > 1) {
-        return { status: "needs_attention", reason: "自动验证找到多个可点击 Cap.js 控件，已拒绝操作" };
-      }
-      try {
-        if (visibleCapControls.length === 1) {
-          await visibleCapControls[0].click({ timeout: 10_000 });
-        } else {
-          const box = await capWidget.boundingBox();
-          if (!box) throw new Error("Cap.js control is not visible");
-          await page.mouse.click(box.x + Math.min(30, box.width * 0.15), box.y + box.height / 2);
+        if (visibleCapControls.length > 1) {
+          return { status: "needs_attention", reason: "自动验证找到多个可点击 Cap.js 控件，已拒绝操作" };
         }
-        assertBookmarkNavigation(page.url(), [expectedOrigin]);
-        return null;
-      } catch {
-        return { status: "needs_attention", reason: "自动 Cap.js 验证控件点击失败" };
+        try {
+          if (visibleCapControls.length === 1) {
+            await visibleCapControls[0].click({ timeout: 10_000 });
+          } else {
+            const box = await capWidget.boundingBox();
+            if (!box) throw new Error("Cap.js control is not visible");
+            await page.mouse.click(box.x + Math.min(30, box.width * 0.15), box.y + box.height / 2);
+          }
+          assertBookmarkNavigation(page.url(), [expectedOrigin]);
+          return null;
+        } catch {
+          return { status: "needs_attention", reason: "自动 Cap.js 验证控件点击失败" };
+        }
       }
     }
     const frameResult = await clickVisibleNativeChallengeControl(page, expectedOrigin, {
@@ -828,18 +867,41 @@ async function inspectConfiguredSlider(page) {
   });
 }
 
+export async function waitForOptionalChallengeAppearance(
+  page,
+  config,
+  rule,
+  initial,
+  readState = snapshotState,
+) {
+  let latest = initial;
+  const deadline = Date.now() + rule.appearanceWaitMs;
+  while (Date.now() < deadline) {
+    await sleep(Math.max(5, Math.min(1000, Number(config.checkinStatePollMs) || 500)));
+    latest = await readState(page);
+    if (["signed", "already_signed", "login_required", "deferred", "needs_attention"].includes(latest.status)) {
+      return latest;
+    }
+    if (["interactive_challenge", "managed_challenge"].includes(latest.status)
+      || latest.unresolvedChallenge) return latest;
+  }
+  return latest;
+}
+
 async function runConfiguredChallengePhase(page, target, activeOrigin, config, phase) {
   const rule = getConfiguredChallengeInteractionRule(target, activeOrigin, config, phase);
   if (!rule) return null;
   const allowedOrigins = target.allowedOrigins ?? [target.origin];
   assertBookmarkNavigation(page.url(), allowedOrigins);
-  const initial = await snapshotState(page);
+  let initial = await snapshotState(page);
   if (["signed", "already_signed", "login_required", "deferred", "needs_attention"].includes(initial.status)) {
     return initial;
   }
   if (rule.optional && !["interactive_challenge", "managed_challenge"].includes(initial.status)
     && !initial.unresolvedChallenge) {
-    return initial;
+    initial = await waitForOptionalChallengeAppearance(page, config, rule, initial);
+    if (!["interactive_challenge", "managed_challenge"].includes(initial.status)
+      && !initial.unresolvedChallenge) return initial;
   }
   if (rule.type === "click") {
     const failure = await clickConfiguredChallengeControl(page, rule, activeOrigin, config);
@@ -1900,8 +1962,7 @@ async function tryQaFlow(page, rules, origin, config) {
   return null;
 }
 
-export async function tryNewApiCheckin(page) {
-  return page.evaluate(async () => {
+export async function runNewApiCheckinInBrowser() {
     let userId = null;
     const storages = [localStorage, sessionStorage];
     for (const storage of storages) {
@@ -1921,6 +1982,9 @@ export async function tryNewApiCheckin(page) {
     if (userId == null) {
       try {
         const response = await fetch("/api/user/self", { credentials: "include", headers: { Accept: "application/json" } });
+        if ([401, 403].includes(response.status)) {
+          return { status: "login_required", reason: "签到接口显示登录状态无效" };
+        }
         const body = await response.json();
         userId = body?.data?.id ?? body?.data?.user?.id ?? null;
       } catch { /* not a compatible API */ }
@@ -1938,12 +2002,16 @@ export async function tryNewApiCheckin(page) {
         return null;
       }
       if (response.status === 404) return { unavailable: true };
+      if ([401, 403].includes(response.status)) return { loginRequired: true };
       let body;
       try { body = await response.json(); } catch { return null; }
       return { body };
     };
     const initialStatus = await readStatus();
     if (!initialStatus || initialStatus.unavailable) return null;
+    if (initialStatus.loginRequired) {
+      return { status: "login_required", reason: "签到接口显示登录状态无效" };
+    }
     const statusBody = initialStatus.body;
     const message = String(statusBody?.message || "");
     if (!statusBody?.success) {
@@ -1968,6 +2036,9 @@ export async function tryNewApiCheckin(page) {
     } catch {
       return null;
     }
+    if ([401, 403].includes(checkinResponse.status)) {
+      return { status: "login_required", reason: "签到接口显示登录状态无效" };
+    }
     let checkinBody;
     try { checkinBody = await checkinResponse.json(); } catch { return null; }
     const checkinMessage = String(checkinBody?.message || "");
@@ -1982,6 +2053,9 @@ export async function tryNewApiCheckin(page) {
 
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       const verifiedStatus = await readStatus();
+      if (verifiedStatus?.loginRequired) {
+        return { status: "login_required", reason: "签到接口显示登录状态无效" };
+      }
       const verifiedBody = verifiedStatus?.body;
       const verified = verifiedBody?.success && Boolean(
         verifiedBody?.data?.stats?.checked_in_today
@@ -1997,7 +2071,10 @@ export async function tryNewApiCheckin(page) {
       if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 750));
     }
     return null;
-  });
+}
+
+export async function tryNewApiCheckin(page) {
+  return page.evaluate(runNewApiCheckinInBrowser);
 }
 
 async function tryOpenCdCaptcha(page, expectedOrigin) {
@@ -2131,7 +2208,7 @@ async function tryU2Captcha(page, expectedOrigin, config) {
   return { status: "interactive_challenge", reason: "U2 答案已提交，但页面未显示签到成功" };
 }
 
-async function processCandidate(page, target, candidateUrl, config, qaRules) {
+export async function processCandidate(page, target, candidateUrl, config, qaRules) {
   const allowedOrigins = target.allowedOrigins ?? [target.origin];
   const useNewApiCheckin = targetUsesConfiguredOrigins(target, config.newApiCheckinOrigins);
   const useExtendedDiscovery = targetUsesConfiguredOrigins(target, config.extendedDiscoveryOrigins);
@@ -2160,20 +2237,50 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
 
   await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
   ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+  const hasConfiguredPreCheckinNavigation = Boolean(
+    getConfiguredPreCheckinNavigationRule(target, activeOrigin, config),
+  );
+  const directCheckinAction = hasConfiguredPreCheckinNavigation
+    ? await findCheckinAction(page, allowedOrigins)
+    : null;
+  const preCheckinNavigated = await navigateConfiguredPreCheckinPage(
+    page,
+    target,
+    activeOrigin,
+    config,
+    { hasCheckinAction: Boolean(directCheckinAction) },
+  );
+  ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+  if (preCheckinNavigated) {
+    await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
+    ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+  }
 
   const configuredNewApiResult = await tryConfiguredNewApiCheckin(page, activeOrigin, config);
+  let pendingConfiguredNewApiRetry = false;
   if (configuredNewApiResult) {
-    return { ...configuredNewApiResult, url: safeLogUrl(page.url()) };
+    const challengeRule = getConfiguredChallengeInteractionRule(target, activeOrigin, config, "after");
+    if (shouldUseConfiguredNewApiPageRetry(configuredNewApiResult, challengeRule)) {
+      pendingConfiguredNewApiRetry = true;
+    } else {
+      return { ...configuredNewApiResult, url: safeLogUrl(page.url()) };
+    }
   }
 
   // New API exposes an authoritative current-day status endpoint.  Query it
   // before interpreting generic page copy such as “每日签到可获得奖励”, which is
   // a feature description rather than proof that today's check-in succeeded.
   let initialApiResult = null;
+  let pendingNewApiRetry = false;
   if (useNewApiCheckin) {
     initialApiResult = await tryNewApiCheckin(page);
     if (initialApiResult && initialApiResult.status !== "not_available") {
-      return { ...initialApiResult, url: safeLogUrl(page.url()) };
+      const challengeRule = getConfiguredChallengeInteractionRule(target, activeOrigin, config, "after");
+      if (shouldUseConfiguredNewApiPageRetry(initialApiResult, challengeRule)) {
+        pendingNewApiRetry = true;
+      } else {
+        return { ...initialApiResult, url: safeLogUrl(page.url()) };
+      }
     }
     if (initialApiResult?.status === "not_available"
       && (config.knownNoCheckinFeatureOrigins ?? []).includes(activeOrigin)) {
@@ -2256,6 +2363,13 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
       url: safeLogUrl(page.url()),
     };
   }
+  if (!action && (pendingConfiguredNewApiRetry || pendingNewApiRetry)) {
+    return {
+      status: "needs_attention",
+      reason: "签到接口要求验证，但页面未找到唯一签到入口",
+      url: safeLogUrl(page.url()),
+    };
+  }
   if (action) {
     const captchaDialogRule = getConfiguredCheckinCaptchaDialogRule(target, activeOrigin, config);
     await clickCandidate(page, action, { domClick: Boolean(captchaDialogRule) });
@@ -2270,6 +2384,65 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
       state = await waitForManagedChallenge(page, config);
     }
     state = await acceptConfiguredTerms(page, state, activeOrigin, config);
+    let retryActionText = null;
+    const pendingApiPageRetry = pendingConfiguredNewApiRetry || pendingNewApiRetry;
+    if (shouldRetryConfiguredCheckinPageAction(
+      pendingApiPageRetry,
+      configuredAfterRule,
+      state,
+    )) {
+      let retryAction = await findCheckinAction(page, allowedOrigins, null);
+      if (!retryAction) {
+        const retryDeadline = Date.now() + configuredAfterRule.retryActionWaitMs;
+        do {
+          await sleep(Math.max(100, Math.min(1000, Number(config.checkinStatePollMs) || 500)));
+          assertBookmarkNavigation(page.url(), allowedOrigins);
+          state = await snapshotState(page);
+          if ([
+            "signed",
+            "already_signed",
+            "login_required",
+            "needs_attention",
+            "interactive_challenge",
+            "managed_challenge_timeout",
+            "deferred",
+          ].includes(state.status)) break;
+          retryAction = await findCheckinAction(page, allowedOrigins, null);
+        } while (!retryAction && Date.now() < retryDeadline);
+      }
+      if (retryAction) {
+        try {
+          await clickCandidate(page, retryAction, { domClick: configuredAfterRule.retryDomClick });
+        } catch {
+          return {
+            status: "needs_attention",
+            reason: "安全验证完成后的有限签到重试未能提交",
+            action: action.text,
+            url: safeLogUrl(page.url()),
+          };
+        }
+        retryActionText = retryAction.text;
+        activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
+        activeOrigin = new URL(activeUrl).origin;
+        state = await runConfiguredChallengePhase(page, target, activeOrigin, config, "after");
+        if (!state) {
+          await sleep(config.actionWaitMs);
+          state = await waitForManagedChallenge(page, config);
+        }
+        state = await acceptConfiguredTerms(page, state, activeOrigin, config);
+      } else if (shouldRetryConfiguredCheckinPageAction(
+        pendingApiPageRetry,
+        configuredAfterRule,
+        state,
+      )) {
+        return {
+          status: "needs_attention",
+          reason: "安全验证完成后未找到唯一签到按钮进行有限重试",
+          action: action.text,
+          url: safeLogUrl(page.url()),
+        };
+      }
+    }
     state = await confirmConfiguredCheckinAfterWait(
       page,
       allowedOrigins,
@@ -2277,6 +2450,49 @@ async function processCandidate(page, target, candidateUrl, config, qaRules) {
       configuredAfterRule,
       state,
     );
+    if (pendingConfiguredNewApiRetry) {
+      if (["signed", "already_signed"].includes(state.status)) {
+        return { ...state, action: retryActionText ? `${action.text} → ${retryActionText}` : action.text, url: safeLogUrl(page.url()) };
+      }
+      if (["login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred"].includes(state.status)) {
+        return { ...state, action: action.text, url: safeLogUrl(page.url()) };
+      }
+      const retryConfiguredResult = await tryConfiguredNewApiCheckin(page, activeOrigin, config);
+      if (["signed", "already_signed", "login_required", "deferred", "not_available"].includes(retryConfiguredResult?.status)) {
+        return { ...retryConfiguredResult, action: retryActionText ? `${action.text} → ${retryActionText}` : action.text, url: safeLogUrl(page.url()) };
+      }
+      return {
+        status: retryConfiguredResult?.status === "interactive_challenge" ? "interactive_challenge" : "needs_attention",
+        reason: retryConfiguredResult?.status === "interactive_challenge"
+          ? "页面验证完成后，配置化签到接口仍要求人机验证"
+          : "页面验证完成后，配置化签到接口未确认今日已签到",
+        action: action.text,
+        url: safeLogUrl(page.url()),
+      };
+    }
+    if (pendingNewApiRetry) {
+      if (["signed", "already_signed"].includes(state.status)) {
+        return { ...state, action: retryActionText ? `${action.text} → ${retryActionText}` : action.text, url: safeLogUrl(page.url()) };
+      }
+      if (["login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred"].includes(state.status)) {
+        return { ...state, action: action.text, url: safeLogUrl(page.url()) };
+      }
+      const retryApiResult = await tryNewApiCheckin(page);
+      if (["signed", "already_signed"].includes(retryApiResult?.status)) {
+        return { ...retryApiResult, action: retryActionText ? `${action.text} → ${retryActionText}` : action.text, url: safeLogUrl(page.url()) };
+      }
+      if (retryApiResult?.status === "login_required") {
+        return { ...retryApiResult, action: action.text, url: safeLogUrl(page.url()) };
+      }
+      return {
+        status: retryApiResult?.status === "interactive_challenge" ? "interactive_challenge" : "needs_attention",
+        reason: retryApiResult?.status === "interactive_challenge"
+          ? "页面验证完成后，签到接口仍要求人机验证"
+          : "页面验证完成后，签到接口未确认今日已签到",
+        action: action.text,
+        url: safeLogUrl(page.url()),
+      };
+    }
     if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred", "unconfirmed"].includes(state.status)) {
       return { ...state, action: action.text, url: safeLogUrl(page.url()) };
     }

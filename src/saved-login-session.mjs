@@ -1,3 +1,8 @@
+import {
+  configuredBearerCheckinRule,
+  verifyConfiguredBearerSession,
+} from "./bearer-checkin.mjs";
+
 const DEFAULT_USER_STORAGE_KEYS = ["user"];
 
 function secureOrigin(value, field = "origin") {
@@ -54,8 +59,14 @@ export function configuredSavedLoginSessionRule(origin, config = {}) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("savedLoginSessionRules rule must be an object");
   }
-  if (raw.type !== "new_api") {
-    throw new Error("savedLoginSessionRules type must be new_api");
+  if (!["new_api", "bearer_refresh"].includes(raw.type)) {
+    throw new Error("savedLoginSessionRules type must be new_api or bearer_refresh");
+  }
+  if (raw.type === "bearer_refresh") {
+    if (!configuredBearerCheckinRule(expectedOrigin, config)) {
+      throw new Error("bearer_refresh session verification requires a bearerCheckinRules entry");
+    }
+    return { type: "bearer_refresh" };
   }
   return {
     type: "new_api",
@@ -67,6 +78,9 @@ export function configuredSavedLoginSessionRule(origin, config = {}) {
 export async function verifyConfiguredSavedLoginSession(page, origin, config = {}) {
   const rule = configuredSavedLoginSessionRule(origin, config);
   if (!rule) return null;
+  if (rule.type === "bearer_refresh") {
+    return verifyConfiguredBearerSession(page, origin, config);
+  }
   return page.evaluate(async (activeRule) => {
     const extractUserId = (value) => value?.id
       ?? value?.user?.id

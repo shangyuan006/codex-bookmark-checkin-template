@@ -22,10 +22,13 @@ function Get-Sha256Hex([byte[]]$Bytes) {
     }
 }
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 $localConfigPath = Join-Path $root 'config\config.json'
 $defaultsPath = Join-Path $root 'config\defaults.json'
 $effectiveConfigPath = if ($ConfigPath) { $ConfigPath } elseif (Test-Path -LiteralPath $localConfigPath) { $localConfigPath } else { $defaultsPath }
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $effectiveConfigPath | ConvertFrom-Json
+$manualAbandonPath = Join-Path $root 'tmp\manual-abandon.json'
+$abandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now (Get-Date)
 $report = $null
 $results = @()
 
@@ -167,6 +170,16 @@ function Test-ResultHasNestedAccountConflict([object]$Result) {
     return (Get-NestedAccountConflictCount $Result) -gt 0
 }
 
+function Test-ResultIsAbandoned([object]$Result) {
+    $origin = ConvertTo-ManualAbandonmentOrigin $Result.origin
+    return [bool]$origin -and $abandonedOrigins.ContainsKey($origin)
+}
+
+function Get-ProjectedResultStatus([object]$Result) {
+    if (Test-ResultIsAbandoned $Result) { return 'abandoned' }
+    return [string]$Result.status
+}
+
 if ($ReportPath) {
     $resolvedReport = (Resolve-Path -LiteralPath $ReportPath).Path
     $logsRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'logs'))
@@ -176,7 +189,7 @@ if ($ReportPath) {
     $results = @($report.results)
 }
 
-$statuses = @($results | ForEach-Object { [string]$_.status })
+$statuses = @($results | ForEach-Object { Get-ProjectedResultStatus $_ })
 $reportRunState = if ($null -ne $report) { [string]$report.runState } else { '' }
 $plannedTotal = if ($null -ne $report -and $null -ne $report.plannedTotal) { [int]$report.plannedTotal } else { $results.Count }
 $processedTotal = if ($null -ne $report -and $null -ne $report.processedTotal) { [int]$report.processedTotal } else { $results.Count }
@@ -192,7 +205,9 @@ else { @($results) })
 $selectedTotal = if ($null -ne $report -and $null -ne $report.selectedTotal) { [int]$report.selectedTotal } elseif ($hasSelectedScope) { $selectedOriginList.Count } else { $results.Count }
 $selectedProcessedTotal = if ($null -ne $report -and $null -ne $report.selectedProcessedTotal) { [int]$report.selectedProcessedTotal } else { $selectedResults.Count }
 $selectedStatuses = @($selectedResults | ForEach-Object {
-    if (Test-ResultHasNestedAccountConflict $_) { 'needs_attention' } else { [string]$_.status }
+    if (Test-ResultIsAbandoned $_) { 'abandoned' }
+    elseif (Test-ResultHasNestedAccountConflict $_) { 'needs_attention' }
+    else { [string]$_.status }
 })
 $selectedSummary = [ordered]@{}
 foreach ($selectedStatus in @($selectedStatuses | Sort-Object -Unique)) {
@@ -200,8 +215,10 @@ foreach ($selectedStatus in @($selectedStatuses | Sort-Object -Unique)) {
 }
 $selectedDone = @($selectedStatuses | Where-Object { $_ -in @('signed', 'already_signed') }).Count
 $selectedNotAvailable = @($selectedStatuses | Where-Object { $_ -eq 'not_available' }).Count
+$selectedAbandonedCount = @($selectedStatuses | Where-Object { $_ -eq 'abandoned' }).Count
 $selectedProblems = @($selectedResults | Where-Object {
-    $_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_)
+    -not (Test-ResultIsAbandoned $_) `
+        -and ($_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_))
 })
 $isTargetedReport = $hasSelectedScope -and $plannedTotal -gt 0 -and $selectedTotal -lt $plannedTotal
 $isCompleteFinalReport = $null -ne $report `
@@ -211,14 +228,22 @@ $isCompleteFinalReport = $null -ne $report `
     -and $processedTotal -ge $plannedTotal `
     -and $results.Count -ge $plannedTotal
 $isPartialReport = $null -ne $report -and -not $isCompleteFinalReport
-$nestedConflictResults = @($results | Where-Object { Test-ResultHasNestedAccountConflict $_ })
+$nestedConflictResults = @($results | Where-Object {
+    -not (Test-ResultIsAbandoned $_) -and (Test-ResultHasNestedAccountConflict $_)
+})
 $done = @($results | Where-Object {
-    $_.status -in @('signed', 'already_signed') -and -not (Test-ResultHasNestedAccountConflict $_)
+    -not (Test-ResultIsAbandoned $_) `
+        -and $_.status -in @('signed', 'already_signed') `
+        -and -not (Test-ResultHasNestedAccountConflict $_)
 }).Count
 $notAvailable = @($statuses | Where-Object { $_ -eq 'not_available' }).Count
-$parentProblems = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+$abandonedCount = @($statuses | Where-Object { $_ -eq 'abandoned' }).Count
+$parentProblems = @($results | Where-Object {
+    -not (Test-ResultIsAbandoned $_) -and $_.status -notin @('signed', 'already_signed', 'not_available')
+})
 $problems = @($results | Where-Object {
-    $_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_)
+    -not (Test-ResultIsAbandoned $_) `
+        -and ($_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_))
 })
 $attentionCount = @($parentProblems | Where-Object { $_.status -in @('interactive_challenge', 'login_required', 'needs_attention') }).Count + $nestedConflictResults.Count
 $timeoutCount = @($parentProblems | Where-Object { $_.status -eq 'managed_challenge_timeout' }).Count
@@ -242,11 +267,11 @@ else { $status = 'unconfirmed' }
 $summary = if ($results.Count -gt 0 -or ($null -ne $report -and $plannedTotal -gt 0)) {
     if ($isTargetedReport) {
         $dailyHeading = if ($isCompleteFinalReport) { "今日累计：共 $plannedTotal 站" } else { "今日累计：已处理 $processedTotal/$plannedTotal 站（任务未完成）" }
-        "本轮 $selectedProcessedTotal/$selectedTotal 站：`n$selectedDone 个签到正常`n$selectedNotAvailable 个未开放签到`n$dailyHeading`n$done 个签到正常`n$notAvailable 个未开放签到"
+        "本轮 $selectedProcessedTotal/$selectedTotal 站：`n$selectedDone 个签到正常`n$selectedNotAvailable 个未开放签到`n$selectedAbandonedCount 个今日放弃`n$dailyHeading`n$done 个签到正常`n$notAvailable 个未开放签到`n$abandonedCount 个今日放弃"
     }
     else {
         $heading = if ($isCompleteFinalReport) { "共 $plannedTotal 站：" } else { "已处理 $processedTotal/$plannedTotal 站（任务未完成）：" }
-        "$heading`n$done 个签到正常`n$notAvailable 个未开放签到"
+        "$heading`n$done 个签到正常`n$notAvailable 个未开放签到`n$abandonedCount 个今日放弃"
     }
 }
 else { Compress-Text $RunnerMessage 160 }
@@ -284,7 +309,7 @@ if ($nestedConflictResults.Count -gt 0) {
     }
     $summary += "`n需关注 $($nestedConflictResults.Count) 个站点的账号明细：$nestedConflictAccountCount 个账号未确认"
 }
-$accountDetailLines = @($results | Sort-Object origin | ForEach-Object {
+$accountDetailLines = @($results | Where-Object { -not (Test-ResultIsAbandoned $_) } | Sort-Object origin | ForEach-Object {
     $result = $_
     $hostName = try { ([uri]$result.origin).DnsSafeHost } catch { '站点' }
     $accountResultsProperty = $result.PSObject.Properties['accountResults']
@@ -322,13 +347,19 @@ $source = if ($notification.source) { [string]$notification.source } else { 'bro
 
 $stateParts = @($results | Sort-Object origin | ForEach-Object {
     $result = $_
-    "$([string]$result.origin)=$([string]$result.status):$([string]$result.retryCause)"
-    Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
+    $projectedStatus = Get-ProjectedResultStatus $result
+    "$([string]$result.origin)=$projectedStatus`:$([string]$result.retryCause)"
+    if ($projectedStatus -ne 'abandoned') {
+        Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
+    }
 })
 $selectedStateParts = @($selectedResults | Sort-Object origin | ForEach-Object {
     $result = $_
-    "$([string]$result.origin)=$([string]$result.status):$([string]$result.retryCause)"
-    Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
+    $projectedStatus = Get-ProjectedResultStatus $result
+    "$([string]$result.origin)=$projectedStatus`:$([string]$result.retryCause)"
+    if ($projectedStatus -ne 'abandoned') {
+        Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
+    }
 })
 $scopeMaterial = if ($hasSelectedScope) { "|selected=$selectedTotal/$selectedProcessedTotal|$($selectedOriginList -join ',')|$($selectedStateParts -join '|')" } else { '' }
 $stateMaterial = if ($stateParts.Count -gt 0) { "$status|$reportRunState|$($stateParts -join '|')$scopeMaterial" } else { "$status|$RunnerStatus$scopeMaterial" }
@@ -340,8 +371,10 @@ $payload = [ordered]@{
     summary = $summary
     siteCount = $results.Count
     problemCount = $problems.Count
+    abandonedCount = $abandonedCount
     selectedSiteCount = $selectedResults.Count
     selectedProblemCount = $selectedProblems.Count
+    selectedAbandonedCount = $selectedAbandonedCount
     selectedOrigins = $selectedOriginList
     selectedTotal = $selectedTotal
     selectedProcessedTotal = $selectedProcessedTotal
@@ -385,8 +418,10 @@ $item = [ordered]@{
     source = $source
     status = $status
     summary = $summary
+    abandonedCount = $abandonedCount
     selectedSiteCount = $selectedResults.Count
     selectedProblemCount = $selectedProblems.Count
+    selectedAbandonedCount = $selectedAbandonedCount
     selectedOrigins = $selectedOriginList
     selectedTotal = $selectedTotal
     selectedProcessedTotal = $selectedProcessedTotal

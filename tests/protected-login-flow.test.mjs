@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import { acceptConfiguredLoginTerms, waitForLoginSubmitEnabled } from "../src/protected-login-flow.mjs";
+import {
+  acceptConfiguredLoginTerms,
+  clickConfiguredLoginChallengeControl,
+  waitForLoginSubmitEnabled,
+} from "../src/protected-login-flow.mjs";
 
 test("受保护登录先接受显式配置的新条款", async () => {
   let clicked = false;
@@ -46,6 +50,28 @@ test("受保护登录等待唯一的可访问挑战控件完成并启用提交�
     cloudflareWaitMs: 10000,
   }), true);
   assert.equal(clicked, true);
+});
+
+test("OAuth 登录也只能推进已配置同源页面中的唯一挑战控件", async () => {
+  let clicked = 0;
+  const page = {
+    url: () => "https://protected.example/sign-in",
+    getByRole: () => ({
+      count: async () => 1,
+      isVisible: async () => true,
+      click: async () => { clicked += 1; },
+    }),
+    locator: () => ({ count: async () => 0 }),
+  };
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", {
+    autoClickTurnstileOrigins: ["https://protected.example"],
+    actionTimeoutMs: 5000,
+  }), true);
+  assert.equal(clicked, 1);
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://outside.example", {
+    autoClickTurnstileOrigins: ["https://protected.example"],
+  }), false);
+  assert.equal(clicked, 1);
 });
 
 test("未授权自动验证的登录页不会检查或点击挑战控件", async () => {
@@ -115,4 +141,68 @@ test("凭据与保存密码登录按顺序接入 opt-in 条款和挑战处理", 
 test("原生保存密码恢复暂不接入受保护登录提交策略", async () => {
   const source = await fs.readFile(new URL("../src/native-login.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /protected-login-flow|acceptConfiguredLoginTerms|waitForLoginSubmitEnabled/);
+});
+
+function emptyChallengeLocator() {
+  return {
+    count: async () => 0,
+    isVisible: async () => false,
+  };
+}
+
+function challengeFrame(url, box) {
+  return {
+    url: () => url,
+    frameElement: async () => ({ boundingBox: async () => box }),
+    locator: () => emptyChallengeLocator(),
+  };
+}
+
+function parentFrameLocator(frames) {
+  return {
+    count: async () => frames.length,
+    nth: (index) => ({
+      getAttribute: async () => frames[index].url,
+      isVisible: async () => true,
+      boundingBox: async () => frames[index].box,
+    }),
+  };
+}
+
+test("OAuth login challenge uses one configured same-origin Cloudflare frame and never clicks it twice", async () => {
+  let clicked = 0;
+  const box = { x: 100, y: 50, width: 300, height: 70 };
+  const frameUrl = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2";
+  const frames = [{ url: frameUrl, box }];
+  const page = {
+    url: () => "https://protected.example/sign-in",
+    getByRole: () => emptyChallengeLocator(),
+    locator: (selector) => selector === "iframe[src]" ? parentFrameLocator(frames) : emptyChallengeLocator(),
+    frames: () => [challengeFrame(frameUrl, box)],
+    mouse: { click: async () => { clicked += 1; } },
+  };
+  const config = { autoClickTurnstileOrigins: ["https://protected.example"] };
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", config), true);
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", config), false);
+  assert.equal(clicked, 1);
+});
+
+test("OAuth login challenge fails closed when multiple Cloudflare frames are visible", async () => {
+  let clicked = 0;
+  const frameUrl = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2";
+  const frames = [
+    { url: frameUrl, box: { x: 100, y: 50, width: 300, height: 70 } },
+    { url: frameUrl, box: { x: 100, y: 150, width: 300, height: 70 } },
+  ];
+  const page = {
+    url: () => "https://protected.example/sign-in",
+    getByRole: () => emptyChallengeLocator(),
+    locator: (selector) => selector === "iframe[src]" ? parentFrameLocator(frames) : emptyChallengeLocator(),
+    frames: () => frames.map((frame) => challengeFrame(frame.url, frame.box)),
+    mouse: { click: async () => { clicked += 1; } },
+  };
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", {
+    autoClickTurnstileOrigins: ["https://protected.example"],
+  }), false);
+  assert.equal(clicked, 0);
 });

@@ -22,6 +22,105 @@ export function providerSessionProbeUrl(provider) {
     : null;
 }
 
+function normalizeProbeStatus(value) {
+  return ["valid", "invalid", "unknown"].includes(value) ? value : "unknown";
+}
+
+export async function probeSessionWithRetry(readSession, options = {}) {
+  if (typeof readSession !== "function") throw new TypeError("readSession must be a function");
+  const retryDelaysMs = Array.isArray(options.retryDelaysMs)
+    ? options.retryDelaysMs.slice(0, 2).map((value) => Math.max(0, Math.min(5_000, Number(value) || 0)))
+    : [1_000, 1_500];
+  const wait = options.wait ?? ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+  if (typeof wait !== "function") throw new TypeError("wait must be a function");
+
+  const observed = [];
+  const attempts = retryDelaysMs.length + 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const status = normalizeProbeStatus(await Promise.resolve().then(readSession).catch(() => "unknown"));
+    observed.push(status);
+    if (status === "valid") return { status, attempts: observed.length };
+    if (attempt < retryDelaysMs.length) await wait(retryDelaysMs[attempt]);
+  }
+  return {
+    status: observed.every((status) => status === "invalid") ? "invalid" : "unknown",
+    attempts: observed.length,
+  };
+}
+
+export async function readProviderSession(requestContext, endpoint, navigationTimeoutMs) {
+  const response = await requestContext.get(endpoint, {
+    timeout: navigationTimeoutMs,
+  }).catch(() => null);
+  if (!response) return "unknown";
+  if ([401, 403].includes(response.status())) return "invalid";
+  if (!response.ok()) return "unknown";
+  const value = await response.json().catch(() => null);
+  return classifyLinuxDoSession(value);
+}
+
+export async function readProviderSessionPage(page, endpoint, navigationTimeoutMs) {
+  const response = await page.goto(endpoint, {
+    waitUntil: "domcontentloaded",
+    timeout: navigationTimeoutMs,
+  }).catch(() => null);
+  if (!response) return "unknown";
+  if ([401, 403].includes(response.status())) return "invalid";
+  if (!response.ok()) return "unknown";
+  const value = await response.json().catch(() => null);
+  return classifyLinuxDoSession(value);
+}
+
+export async function probeProviderSessionInContext(
+  context,
+  endpoint,
+  navigationTimeoutMs,
+  options = {},
+) {
+  const requestProbe = await probeSessionWithRetry(
+    () => readProviderSession(context.request, endpoint, navigationTimeoutMs),
+    options,
+  );
+  if (requestProbe.status === "valid") return requestProbe;
+
+  // A cold persistent Edge profile can expose its encrypted cookies to a
+  // renderer navigation before BrowserContext.request sees them. Confirm the
+  // same fixed endpoint through one background page before opening login UI.
+  const page = await context.newPage();
+  let pageProbe = { status: "unknown", attempts: 0 };
+  try {
+    const pageRetryDelaysMs = Array.isArray(options.pageRetryDelaysMs)
+      ? options.pageRetryDelaysMs
+      : options.retryDelaysMs;
+    pageProbe = await probeSessionWithRetry(
+      () => readProviderSessionPage(page, endpoint, navigationTimeoutMs),
+      {
+        ...(Array.isArray(pageRetryDelaysMs) ? { retryDelaysMs: pageRetryDelaysMs } : {}),
+        ...(typeof options.wait === "function" ? { wait: options.wait } : {}),
+      },
+    );
+  } finally {
+    await page.close().catch(() => {});
+  }
+  if (pageProbe.status === "valid") {
+    return { status: "valid", attempts: requestProbe.attempts + pageProbe.attempts };
+  }
+  return {
+    status: requestProbe.status === "invalid" && pageProbe.status === "invalid"
+      ? "invalid"
+      : "unknown",
+    attempts: requestProbe.attempts + pageProbe.attempts,
+  };
+}
+
+export async function probeProviderSessionContext(context, endpoint, navigationTimeoutMs) {
+  try {
+    return await probeProviderSessionInContext(context, endpoint, navigationTimeoutMs);
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
 export async function probeProviderSession({ origin, provider, automationUserDataDir, config }) {
   const endpoint = providerSessionProbeUrl(provider);
   if (!endpoint) return { status: "not_supported" };
@@ -30,22 +129,7 @@ export async function probeProviderSession({ origin, provider, automationUserDat
     ...config,
     automationUserDataDir: path.resolve(rootDirectory, automationUserDataDir),
   });
-  try {
-    const page = await context.newPage();
-    const response = await page.goto(endpoint, {
-      waitUntil: "domcontentloaded",
-      timeout: config.navigationTimeoutMs,
-    });
-    if (!response) return { status: "unknown" };
-    if ([401, 403].includes(response.status())) return { status: "invalid" };
-    if (!response.ok()) return { status: "unknown" };
-    const value = await response.json().catch(() => null);
-    return { status: classifyLinuxDoSession(value) };
-  } catch {
-    return { status: "unknown" };
-  } finally {
-    await context.close().catch(() => {});
-  }
+  return probeProviderSessionContext(context, endpoint, config.navigationTimeoutMs);
 }
 
 async function main() {
