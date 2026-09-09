@@ -13,6 +13,7 @@ import {
   configuredSequentialResponseProvesSuccess,
   selectConfiguredSequentialActionCandidate,
   getConfiguredPreCheckinNavigationRule,
+  getConfiguredPreCheckinTerminalPath,
   getConfiguredPreCheckinDismissRule,
   getVisitCheckinWaitMs,
   getTargetTimeoutMs,
@@ -21,10 +22,13 @@ import {
   dismissConfiguredPreCheckinOverlay,
   extractSingleChoiceQuestion,
   getCheckinConfirmationWaitMs,
+  getCheckinActionDiscoveryWaitMs,
   isConfiguredGrowthCheckinPage,
   isSafeDiscoveredHref,
   matchesConfiguredGrowthCompletedControlText,
   navigateConfiguredPreCheckinPage,
+  processCandidate,
+  processTarget,
   reliableNewApiCaptchaCandidates,
   preferCandidateResult,
   reconcileConfiguredGrowthCheckinState,
@@ -40,6 +44,7 @@ import {
   tryConfiguredNewApiCheckin,
   tryNewApiCheckin,
   waitForConfirmedCheckinState,
+  waitForCheckinAction,
   waitForManagedChallenge,
   waitForOptionalChallengeAppearance,
   waitForPendingCheckinState,
@@ -213,6 +218,7 @@ async function runLegacyNewApiCheckin(statuses, {
   storageUserId = 42,
   selfStatus = 200,
   statusHttpStatus = 200,
+  statusMessage = null,
 } = {}) {
   const names = ["localStorage", "sessionStorage", "document", "fetch", "setTimeout"];
   const originals = new Map(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
@@ -247,7 +253,9 @@ async function runLegacyNewApiCheckin(statuses, {
           const checked = statusQueue.shift() ?? false;
           return {
             status: statusHttpStatus,
-            json: async () => ({ success: true, data: { stats: { checked_in_today: checked } } }),
+            json: async () => statusMessage
+              ? ({ success: false, message: statusMessage })
+              : ({ success: true, data: { stats: { checked_in_today: checked } } }),
           };
         },
       },
@@ -286,6 +294,20 @@ test("legacy New API reports an invalid session instead of no_action", async () 
   assert.equal(staleStorage.requests.filter((request) => request.method === "POST").length, 0);
 });
 
+test("legacy New API treats an explicit disabled response as authoritative", async () => {
+  const disabled = await runLegacyNewApiCheckin([], { statusMessage: "签到功能未启用" });
+  assert.equal(disabled.result.status, "not_available");
+  assert.equal(disabled.requests.filter((request) => request.method === "POST").length, 0);
+
+  const source = await (await import("node:fs/promises"))
+    .readFile(new URL("../src/browser.mjs", import.meta.url), "utf8");
+  const apiProbe = source.indexOf("let initialApiResult = null");
+  const disabledTerminal = source.indexOf('initialApiResult?.status === "not_available"', apiProbe);
+  const sequentialActions = source.indexOf("tryConfiguredSequentialActions(page", apiProbe);
+  assert.ok(apiProbe >= 0 && disabledTerminal > apiProbe);
+  assert.ok(sequentialActions > disabledTerminal);
+});
+
 test("签到入口发现拒绝被浏览器解析成同源路径的畸形 href", () => {
   assert.equal(isSafeDiscoveredHref("/profile"), true);
   assert.equal(isSafeDiscoveredHref("/check-in?day=2026-08-08"), true);
@@ -293,6 +315,70 @@ test("签到入口发现拒绝被浏览器解析成同源路径的畸形 href", 
   assert.equal(isSafeDiscoveredHref("/%22"), false);
   assert.equal(isSafeDiscoveredHref("%3Cscript%3E"), false);
   assert.equal(isSafeDiscoveredHref("/%"), false);
+});
+
+test("动态签到入口在有限窗口内重探测，并严格限制来源", async () => {
+  let actionReads = 0;
+  const emptyLocator = {
+    evaluateAll: async () => {
+      actionReads += 1;
+      return actionReads < 2 ? [] : [{
+        index: 0,
+        text: "立即签到",
+        visible: true,
+        disabled: false,
+        tagName: "BUTTON",
+        href: null,
+        formAction: null,
+      }];
+    },
+  };
+  const page = {
+    url: () => "https://bookmark.test/profile",
+    title: async () => "",
+    evaluate: async () => ({
+      bodyText: "",
+      passwordInputs: false,
+      challengeEvidence: [],
+      confirmedCheckinControl: false,
+    }),
+    locator: () => emptyLocator,
+  };
+  const action = await waitForCheckinAction(
+    page,
+    ["https://bookmark.test"],
+    { checkinActionDiscoveryWaitMs: 50, checkinActionDiscoveryPollMs: 5 },
+  );
+  assert.equal(action.text, "立即签到");
+  assert.equal(actionReads, 2);
+  assert.equal(getCheckinActionDiscoveryWaitMs({}), 5000);
+  assert.equal(getCheckinActionDiscoveryWaitMs({ checkinActionDiscoveryWaitMs: 9000 }), 5000);
+});
+
+test("动态签到入口重探测遇到终态时立即结束", async () => {
+  let actionReads = 0;
+  const page = {
+    url: () => "https://bookmark.test/profile",
+    title: async () => "",
+    evaluate: async () => ({
+      bodyText: "今日已签到",
+      passwordInputs: false,
+      challengeEvidence: [],
+      confirmedCheckinControl: true,
+    }),
+    locator: () => ({
+      evaluateAll: async () => {
+        actionReads += 1;
+        return [];
+      },
+    }),
+  };
+  assert.equal(await waitForCheckinAction(
+    page,
+    ["https://bookmark.test"],
+    { checkinActionDiscoveryWaitMs: 100, checkinActionDiscoveryPollMs: 5 },
+  ), null);
+  assert.equal(actionReads, 1);
 });
 
 test("单选题必须包含位于选项之前的真实题干", () => {
@@ -542,6 +628,163 @@ test("pre-check-in navigation requires unique same-origin controls and an exact 
   ), /not unique/);
 });
 
+test("pre-check-in terminal paths stop navigation and are treated as already signed", async () => {
+  const target = {
+    origin: "https://bookmark.test",
+    allowedOrigins: ["https://bookmark.test"],
+  };
+  const config = {
+    preCheckinNavigationRules: {
+      "https://bookmark.test": {
+        steps: [{ selector: "a.check-in" }],
+        expectedPath: "/check-in.php",
+        terminalPaths: ["/finished.php"],
+        waitMs: 1,
+        afterClickWaitMs: 1,
+      },
+    },
+  };
+  assert.deepEqual(getConfiguredPreCheckinNavigationRule(target, target.origin, config), {
+    expectedPath: "/check-in.php",
+    steps: [{ selector: "a.check-in", role: "", name: "" }],
+    terminalPaths: ["/finished.php"],
+    waitMs: 500,
+    afterClickWaitMs: 100,
+  });
+  assert.equal(
+    getConfiguredPreCheckinTerminalPath(
+      "https://bookmark.test/finished.php",
+      target,
+      target.origin,
+      config,
+    ),
+    "/finished.php",
+  );
+
+  let currentUrl = "https://bookmark.test/";
+  const page = {
+    url: () => currentUrl,
+    locator: () => ({
+      count: async () => 1,
+      nth: () => ({
+        isVisible: async () => true,
+        isEnabled: async () => true,
+        getAttribute: async () => "/check-in.php",
+        click: async () => { currentUrl = "https://bookmark.test/finished.php"; },
+      }),
+    }),
+    getByRole: () => ({ count: async () => 0 }),
+    waitForTimeout: async () => {},
+  };
+  const result = await navigateConfiguredPreCheckinPage(page, target, target.origin, config);
+  assert.deepEqual(result, { terminalPath: "/finished.php" });
+
+  let terminalLinkClicks = 0;
+  const terminalLinkPage = {
+    url: () => "https://bookmark.test/",
+    locator: () => ({
+      count: async () => 1,
+      nth: () => ({
+        isVisible: async () => true,
+        isEnabled: async () => true,
+        getAttribute: async () => "/finished.php",
+        click: async () => { terminalLinkClicks += 1; },
+      }),
+    }),
+    getByRole: () => ({ count: async () => 0 }),
+    waitForTimeout: async () => {},
+  };
+  assert.deepEqual(
+    await navigateConfiguredPreCheckinPage(terminalLinkPage, target, target.origin, config),
+    { terminalPath: "/finished.php" },
+  );
+  assert.equal(terminalLinkClicks, 0);
+
+  let gotoCount = 0;
+  const directPage = {
+    url: () => "about:blank",
+    goto: async () => { gotoCount += 1; },
+  };
+  const directResult = await processCandidate(
+    directPage,
+    target,
+    "https://bookmark.test/finished.php",
+    { ...config, navigationTimeoutMs: 1000 },
+    {},
+  );
+  assert.equal(gotoCount, 0);
+  assert.equal(directResult.status, "already_signed");
+  assert.match(directResult.reason, /停止.*重试/);
+
+  let pageCount = 0;
+  const context = {
+    newPage: async () => {
+      pageCount += 1;
+      return {
+        url: () => "about:blank",
+        goto: async () => { gotoCount += 1; },
+        close: async () => {},
+      };
+    },
+  };
+  const targetResult = await processTarget(
+    context,
+    { ...target, candidates: ["https://bookmark.test/finished.php"] },
+    { ...config, navigationTimeoutMs: 1000, targetTimeoutMs: 30_000, retryCount: 2, retryDelayMs: 1 },
+    {},
+    ".",
+  );
+  assert.equal(pageCount, 1);
+  assert.equal(gotoCount, 0);
+  assert.equal(targetResult.status, "already_signed");
+});
+
+test("pre-check-in navigation can explicitly click one hidden menu link", async () => {
+  const target = {
+    origin: "https://bookmark.test",
+    allowedOrigins: ["https://bookmark.test"],
+  };
+  const config = {
+    preCheckinNavigationRules: {
+      "https://bookmark.test": {
+        steps: [{ selector: "#hidden-menu a[href*='check-in']", allowHidden: true }],
+        expectedPath: "/check-in",
+        waitMs: 1,
+        afterClickWaitMs: 1,
+      },
+    },
+  };
+  assert.deepEqual(getConfiguredPreCheckinNavigationRule(target, target.origin, config), {
+    expectedPath: "/check-in",
+    steps: [{
+      selector: "#hidden-menu a[href*='check-in']",
+      role: "",
+      name: "",
+      allowHidden: true,
+    }],
+    waitMs: 500,
+    afterClickWaitMs: 100,
+  });
+
+  let currentUrl = "https://bookmark.test/overview";
+  const hiddenLink = {
+    isVisible: async () => false,
+    isEnabled: async () => true,
+    evaluate: async () => { currentUrl = "https://bookmark.test/check-in"; },
+  };
+  const page = {
+    url: () => currentUrl,
+    locator: () => ({
+      count: async () => 1,
+      nth: () => hiddenLink,
+    }),
+    getByRole: () => ({ count: async () => 0 }),
+    waitForTimeout: async () => {},
+  };
+  assert.equal(await navigateConfiguredPreCheckinPage(page, target, target.origin, config), true);
+  assert.equal(currentUrl, "https://bookmark.test/check-in");
+});
+
 test("候选弱结果不会覆盖登录、挑战或延迟状态", () => {
   for (const status of ["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred"]) {
     const valuable = { status, reason: "actionable" };
@@ -688,6 +931,7 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
     appearanceWaitMs: 0,
     waitMs: 60_000,
     settleMs: 3000,
+    frameStableMs: 4000,
     retryAction: false,
     retryDomClick: false,
     retryActionWaitMs: 0,
@@ -711,6 +955,7 @@ test("验证交互规则严格限制当前书签来源和执行阶段", () => {
     appearanceWaitMs: 15_000,
     waitMs: 30_000,
     settleMs: 3000,
+    frameStableMs: 0,
     retryAction: true,
     retryDomClick: true,
     retryActionWaitMs: 20_000,
@@ -853,6 +1098,23 @@ test("滑块拖动只接受唯一轨道和唯一指针滑块", () => {
   assert.equal(selectSliderDragGeometry([
     { index: 0, x: 0, y: 0, width: 300, height: 40, parentCandidateIndex: -1, hasPointerChild: true },
   ]), null);
+});
+
+test("滑块可以使用唯一的几何手柄而不依赖 cursor 样式", () => {
+  const geometry = selectSliderDragGeometry([
+    {
+      index: 0,
+      x: 10,
+      y: 20,
+      width: 304,
+      height: 37,
+      parentCandidateIndex: -1,
+      hasPointerChild: false,
+      handleLikeChildCount: 1,
+      handleLikeChildren: [{ x: 12, y: 22, width: 40, height: 33 }],
+    },
+  ]);
+  assert.deepEqual(geometry, { startX: 32, startY: 38.5, endX: 292, endY: 38.5 });
 });
 
 function checkinStatePage(bodyTexts) {

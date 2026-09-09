@@ -78,8 +78,43 @@ test("签到功能说明和历史入口不被误判为已完成", () => {
   assert.equal(classifyPageText({ bodyText: "历史记录：昨日已签到" }).status, "ready");
 });
 
+test("明确的签到关闭文案只表示当前未开放", () => {
+  for (const bodyText of [
+    "签到功能已关闭",
+    "每日签到暂时停用",
+    "当前暂停签到",
+    "Daily check-in is temporarily unavailable",
+  ]) {
+    assert.deepEqual(classifyPageText({ bodyText }), {
+      status: "not_available",
+      reason: "页面明确显示当前未开放签到",
+    });
+  }
+  assert.equal(classifyPageText({ bodyText: "关闭签到弹窗后可继续浏览" }).status, "ready");
+  assert.equal(classifyPageText({ bodyText: "签到服务维护完成后将另行通知" }).status, "ready");
+});
+
+test("登录和当前人机验证优先于页面中的签到关闭文案", () => {
+  assert.equal(classifyPageText({
+    bodyText: "签到功能已关闭",
+    hasPassword: true,
+  }).status, "login_required");
+  assert.equal(classifyPageText({
+    bodyText: "签到功能已关闭",
+    challengeSelectors: true,
+  }).status, "interactive_challenge");
+});
+
 test("识别 Linux DO 登录入口", () => {
   assert.equal(classifyPageText({ bodyText: "使用 Linux DO 登录" }).status, "login_required");
+});
+
+test("异地登录和二级验证不能被当作已登录页面", () => {
+  for (const bodyText of ["异地登录安全验证", "请输入二级验证代码", "2FA verification required"]) {
+    const result = classifyPageText({ bodyText });
+    assert.equal(result.status, "login_required");
+    assert.match(result.reason, /2FA/);
+  }
 });
 
 test("可见的 Cloudflare 复选框优先识别为交互挑战", () => {

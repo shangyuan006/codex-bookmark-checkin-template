@@ -6,6 +6,10 @@ import { findBookmarkTarget } from "./bookmarks.mjs";
 import { launchAutomationContext } from "./browser.mjs";
 import { expandSavedPasswordLogin } from "./login-form.mjs";
 import { acceptConfiguredLoginTerms, waitForLoginSubmitEnabled } from "./protected-login-flow.mjs";
+import {
+  credentialVerificationUrl,
+  verifyCredentialSession,
+} from "./credential-session-verification.mjs";
 import { assertBookmarkNavigation, safeLogUrl } from "./security.mjs";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +22,8 @@ const origin = new URL(requestedOrigin).origin;
 const { target } = await findBookmarkTarget(config.bookmarksPath, origin, config);
 const loginUrl = assertBookmarkNavigation(requestedLoginUrl, target.allowedOrigins ?? [origin]);
 if (new URL(loginUrl).origin !== origin) throw new Error("受保护登录地址必须与凭据来源同源");
+const verificationPath = process.argv[4] ?? config.protectedLoginVerificationPaths?.[origin];
+credentialVerificationUrl(origin, verificationPath);
 
 let input = "";
 for await (const chunk of process.stdin) {
@@ -58,6 +64,8 @@ let status = "failed";
 let loginStage = "navigation";
 let page;
 let authCheckStatus = null;
+let dailyCheckin = null;
+let diagnostic = null;
 try {
   page = await context.newPage();
   await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
@@ -138,28 +146,28 @@ try {
   }
   if (status === "logged_in") {
     loginStage = "session_verification";
-    await page.waitForTimeout(1200);
-    await page.reload({ waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs }).catch(() => {});
-    const passwordVisible = await page.locator('input[type="password"]:visible').count() > 0;
-    if (!pageMatchesOrigin(page) || passwordVisible || isLoginUrl(page.url())) status = "failed";
-    else {
-      const verificationPath = config.protectedLoginVerificationPaths?.[origin];
-      const verificationUrl = verificationPath ? new URL(verificationPath, origin) : null;
-      if (verificationUrl && (verificationUrl.protocol !== "https:" || verificationUrl.origin !== origin)) {
-        throw new Error("登录验证端点必须与凭据来源同源");
-      }
-      authCheckStatus = verificationUrl ? await page.evaluate(async (pathValue) => {
-        const token = localStorage.getItem("auth_token");
-        const headers = { Accept: "application/json" };
-        if (token) headers.Authorization = `Bearer ${token}`;
-        const response = await fetch(pathValue, { credentials: "include", headers }).catch(() => null);
-        return response?.status ?? 0;
-      }, verificationUrl.href) : 200;
-      if (authCheckStatus !== 200) status = "failed";
-      else loginStage = "completed";
-    }
+    const verification = await verifyCredentialSession(page, {
+      origin,
+      verificationPath,
+      navigationTimeoutMs: config.navigationTimeoutMs,
+    });
+    authCheckStatus = verification.statusCode;
+    dailyCheckin = verification.dailyCheckin ?? null;
+    status = verification.authenticated
+      ? "logged_in"
+      : (verification.failureCode === "challenge" ? "needs_attention" : "failed");
+    diagnostic = verification.authenticated ? null : { verificationFailure: verification.failureCode };
+    if (status === "logged_in") loginStage = "completed";
   }
-  process.stdout.write(JSON.stringify({ status, loginStage, origin, finalUrl: safeLogUrl(page.url()), authCheckStatus }));
+  process.stdout.write(JSON.stringify({
+    status,
+    loginStage,
+    origin,
+    finalUrl: safeLogUrl(page.url()),
+    authCheckStatus,
+    diagnostic,
+    ...(dailyCheckin ? { dailyCheckin } : {}),
+  }));
   if (status !== "logged_in") process.exitCode = 2;
 } catch (error) {
   status = /Timeout|timed out/i.test(String(error?.message ?? error)) ? "timeout" : "failed";

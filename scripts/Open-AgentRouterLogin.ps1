@@ -4,7 +4,9 @@ param(
     [Alias('AccountId')]
     [string]$AccountKey,
     [switch]$ProviderOnly,
-    [switch]$AgentRouterOnly
+    [switch]$AgentRouterOnly,
+    [switch]$OpenProviderWhenIndeterminate,
+    [switch]$ExperimentalTurnstileFrameClick
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +28,12 @@ if ($provider -eq 'LinuxDO' -and -not $ProviderOnly -and -not $AgentRouterOnly) 
 }
 if ($provider -ne 'LinuxDO' -and ($ProviderOnly -or $AgentRouterOnly)) {
     throw 'ProviderOnly and AgentRouterOnly are only valid for LinuxDO Agent Router accounts.'
+}
+if ($OpenProviderWhenIndeterminate -and ($provider -ne 'LinuxDO' -or -not $ProviderOnly)) {
+    throw 'OpenProviderWhenIndeterminate is only valid with LinuxDO ProviderOnly recovery.'
+}
+if ($ExperimentalTurnstileFrameClick -and ($provider -ne 'LinuxDO' -or -not $AgentRouterOnly)) {
+    throw 'ExperimentalTurnstileFrameClick is only valid with LinuxDO AgentRouterOnly recovery.'
 }
 $profileValue = [string]$account.automationUserDataDir
 if (-not $profileValue) { throw 'The Agent Router account has no automationUserDataDir.' }
@@ -120,6 +128,29 @@ function Write-LinuxDoProviderStage($Probe) {
     )
 }
 
+function Get-AgentRouterTargetCompletionProbe {
+    $probeScript = Join-Path $root 'src\probe-agentrouter-session.mjs'
+    if (-not (Test-Path -LiteralPath $probeScript)) { return $null }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $probeOutput = @(& $node $probeScript 'https://agentrouter.org' $requestedAccountKey 2>$null)
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    for ($index = $probeOutput.Count - 1; $index -ge 0; $index--) {
+        try {
+            $probe = [string]$probeOutput[$index] | ConvertFrom-Json
+            if ([string]$probe.status -in @('already_signed', 'needs_attention')) {
+                return [string]$probe.status
+            }
+        }
+        catch { }
+    }
+    return $null
+}
+
 if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
     $existingProviderProbe = Get-LinuxDoProviderSessionProbe
     Write-LinuxDoProviderProbeLog $existingProviderProbe 'provider'
@@ -128,8 +159,11 @@ if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
         Write-Output "The LinuxDO provider session is already valid after $($existingProviderProbe.Attempts) bounded probe attempt(s); no visible provider page was opened. Continue with -AgentRouterOnly."
         return
     }
-    if ([string]$existingProviderProbe.Status -ne 'invalid') {
+    if ([string]$existingProviderProbe.Status -ne 'invalid' -and -not $OpenProviderWhenIndeterminate) {
         throw "The LinuxDO provider session is indeterminate after $($existingProviderProbe.Attempts) bounded probe attempt(s). No visible provider page was opened; retry later instead of logging in again."
+    }
+    if ([string]$existingProviderProbe.Status -ne 'invalid') {
+        Write-Warning "The LinuxDO provider session is indeterminate after $($existingProviderProbe.Attempts) bounded probe attempt(s). Opening one native no-CDP provider window because OpenProviderWhenIndeterminate was explicitly requested."
     }
 }
 
@@ -175,6 +209,9 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     if ($null -ne $account.oauthWaitMs) {
         $oauthArguments += @('--wait-ms', [string]$account.oauthWaitMs)
     }
+    if ($ExperimentalTurnstileFrameClick) {
+        $oauthArguments += '--experimental-sso-frame-click'
+    }
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         # oauth-login emits private stage markers on stderr; they are progress,
@@ -195,6 +232,17 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
             }
         }
         catch { }
+    }
+    if ($ExperimentalTurnstileFrameClick) {
+        $safeExperimentalOutcomes = @(
+            'not_exercised', 'not_observed', 'observed_auto_resolved',
+            'semantic_clicked', 'frame_clicked', 'observed_not_clickable', 'click_failed'
+        )
+        $experimentalOutcome = if ([string]$automaticResult.experimentalSsoChallengeOutcome -in $safeExperimentalOutcomes) {
+            [string]$automaticResult.experimentalSsoChallengeOutcome
+        }
+        else { 'not_exercised' }
+        Write-Output "Experimental LinuxDO SSO Turnstile outcome: $experimentalOutcome."
     }
     if ([string]$automaticResult.status -eq 'logged_in') {
         if (@(Get-CimInstance Win32_Process | Where-Object {
@@ -217,12 +265,14 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     }
     $safeOAuthStages = @(
         'target_login', 'provider_button', 'login_challenge', 'provider_transition',
-        'linuxdo_session', 'provider_authorization', 'target_callback',
+        'linuxdo_session', 'linuxdo_login_challenge', 'provider_session',
+        'provider_authorization', 'target_callback',
         'session_verification', 'checkin_verification', 'completed'
     )
     $safeAuthorizationOutcomes = @(
         'not_applicable', 'authorization_not_found', 'authorization_not_unique',
-        'authorization_click_failed', 'authorization_clicked', 'authorization_completed'
+        'authorization_click_failed', 'authorization_clicked', 'authorization_completed',
+        'provider_challenge_not_clickable', 'provider_challenge_unresolved'
     )
     $failedStage = if ([string]$automaticResult.oauthStage -in $safeOAuthStages) {
         [string]$automaticResult.oauthStage
@@ -237,6 +287,14 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profile*"
     }).Count -gt 0) {
         throw 'Automatic Agent Router OAuth failed while its isolated browser remained open; refusing to open a second window.'
+    }
+    $targetCompletionProbe = Get-AgentRouterTargetCompletionProbe
+    if ($targetCompletionProbe -eq 'already_signed') {
+        if ($AgentRouterOnly) {
+            Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
+        }
+        Write-Output "Automatic Agent Router OAuth did not complete, but the isolated target session authoritatively confirms today's check-in; no visible manual window was opened."
+        return
     }
     Write-Warning "Agent Router OAuth ended without a confirmed target session (stage=$failedStage, authorization=$failedAuthorization). Opening one native no-CDP Edge window for manual completion."
 }
@@ -260,18 +318,29 @@ $arguments = @(
 )
 $arguments += $loginUrls
 $process = Start-Process -FilePath ([string]$browser.Executable) -ArgumentList $arguments -PassThru
-$processStartedAt = try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null }
-if (-not $processStartedAt) {
-    [void]$process.CloseMainWindow()
-    throw 'Unable to record the Agent Router browser process identity.'
+$stableWindow = Wait-CheckinVisibleBrowserWindow `
+    -Config $config `
+    -ProfilePath $profile `
+    -LaunchMarker $launchMarker
+if (-not $stableWindow) {
+    $markedProcesses = @(Get-CheckinProfileBrowserProcesses -Config $config -ProfilePath $profile | Where-Object {
+        $_.CommandLine -like "*--checkin-launch=$launchMarker*"
+    })
+    foreach ($markedProcess in $markedProcesses) {
+        $candidate = Get-Process -Id ([int]$markedProcess.ProcessId) -ErrorAction SilentlyContinue
+        if ($candidate -and $candidate.MainWindowHandle -ne 0) { [void]$candidate.CloseMainWindow() }
+    }
+    throw 'The Agent Router browser did not expose one stable visible window; no manual login state was recorded.'
 }
+$processId = [int]$stableWindow.ProcessId
+$processStartedAt = [string]$stableWindow.ProcessStartedAt
 
 [System.IO.Directory]::CreateDirectory((Split-Path -Parent $statePath)) | Out-Null
 $state = [ordered]@{
     schemaVersion = 1
     accountKey = $requestedAccountKey
     profile = $profile
-    pid = $process.Id
+    pid = $processId
     startedAt = (Get-Date).ToUniversalTime().ToString('o')
     processStartedAt = $processStartedAt
     launchMarker = $launchMarker
@@ -283,8 +352,8 @@ $state = [ordered]@{
     [System.Text.UTF8Encoding]::new($false)
 )
 if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
-    Write-Output "Opened only the LinuxDO provider login for accountKey '$requestedAccountKey' (PID $($process.Id)). Close this window after LinuxDO login, then run with -AgentRouterOnly."
+    Write-Output "Opened only the LinuxDO provider login for accountKey '$requestedAccountKey' (PID $processId) after confirming and foregrounding one stable window. Close this window after LinuxDO login, then run with -AgentRouterOnly."
 }
 else {
-    Write-Output "Opened the isolated Agent Router login profile for accountKey '$requestedAccountKey' (PID $($process.Id))."
+    Write-Output "Opened the isolated Agent Router login profile for accountKey '$requestedAccountKey' (PID $processId) after confirming and foregrounding one stable window."
 }

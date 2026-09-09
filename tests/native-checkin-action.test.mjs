@@ -4,6 +4,7 @@ import {
   matchesNativeCompletedControlText,
   nativeActionCandidateIsSafe,
   nativeChallengeFrameIsAllowed,
+  nativeChallengeFrameGeometryMatches,
   normalizeNativeCheckinActionRule,
 } from "../src/native-checkin-action.mjs";
 import { pagesForOrigin, selectNewestOriginPage } from "../src/native-page-selection.mjs";
@@ -32,8 +33,24 @@ test("原生签到动作规则限制精确文本、公告数量和等待边界",
     maxDismissals: 5,
     dismissWaitMs: 10_000,
     clickChallenge: true,
+    challengeFrameStableMs: 4000,
   });
   assert.throws(() => normalizeNativeCheckinActionRule({}), /requires actionTexts/);
+});
+
+test("Cloudflare iframe 必须在有限误差内保持稳定", () => {
+  const frame = { x: 100, y: 200, width: 300, height: 70 };
+  assert.equal(nativeChallengeFrameGeometryMatches(frame, { ...frame, x: 101.5, y: 199 }), true);
+  assert.equal(nativeChallengeFrameGeometryMatches(frame, { ...frame, x: 103 }), false);
+  assert.equal(nativeChallengeFrameGeometryMatches(null, frame), false);
+  assert.equal(normalizeNativeCheckinActionRule({
+    actionTexts: ["签到"],
+    challengeFrameStableMs: 1,
+  }).challengeFrameStableMs, 3000);
+  assert.equal(normalizeNativeCheckinActionRule({
+    actionTexts: ["签到"],
+    challengeFrameStableMs: 60_000,
+  }).challengeFrameStableMs, 5000);
 });
 
 test("原生签到只允许 Cloudflare HTTPS challenge frame", () => {
@@ -99,7 +116,7 @@ test("原生签到从实际点击后重新计算完整确认等待窗口", async
   assert.match(source, /actionOutcome = "confirmation_timeout"/);
   assert.match(source, /clickVisibleNativeChallengeControl/);
   assert.match(source, /retryableChallengeOutcomes\.has\(challengeOutcome\)/);
-  assert.match(source, /\["pending", "challenge_not_found", "challenge_click_failed"\]/);
+  assert.match(source, /challenge_frame_not_stable/);
   assert.doesNotMatch(source, /Date\.now\(\) >= deadline/);
 });
 
@@ -116,8 +133,11 @@ test("Cloudflare 隐藏 checkbox 时只回退到与其关联的可见 label", as
   assert.match(source, /frameBox\.height < 40 \|\| frameBox\.height > 180/);
   assert.match(source, /page\.locator\('iframe\[src\]'\)/);
   assert.match(source, /allowedParentFrameCount/);
-  assert.match(source, /allowedFrameCount > 1 \|\| allowedParentFrameCount > 1/);
+  assert.match(source, /details\.allowedFrameCount > 1 \|\| details\.allowedParentFrameCount > 1/);
   assert.match(source, /challenge_frame_not_unique/);
   assert.match(source, /frameClickCandidates\.length === 1/);
+  assert.match(source, /rule\.challengeFrameStableMs/);
+  assert.match(source, /nativeChallengeFrameGeometryMatches/);
+  assert.match(source, /challenge_frame_not_stable/);
   assert.match(source, /challenge_frame_clicked/);
 });

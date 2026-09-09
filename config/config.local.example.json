@@ -1,4 +1,8 @@
 {
+  "upstreamUnavailableLateRetryTime": "21:05",
+  "upstreamFailureGroupMaxDailyAttempts": 3,
+  "upstreamFailureGroups": {},
+  "oauthUpstreamProviders": {},
   "relatedCandidateUrls": {
     "https://example.com": ["https://example.com/account/check-in"]
   },
@@ -146,6 +150,7 @@
       "phase": "before",
       "waitMs": 30000,
       "settleMs": 3000,
+      "frameStableMs": 4000,
       "retryAction": false,
       "retryActionWaitMs": 5000
     }
@@ -201,7 +206,7 @@
     }
   },
   "nativeWafPreflightUrls": [
-    { "url": "https://example.com/account/check-in", "waitSeconds": 45, "passiveOnly": true }
+    { "url": "https://example.com/account/check-in", "waitSeconds": 45, "passiveOnly": true, "trustAsSigned": false, "automationUserDataDir": "data/sites/example/edge-user-data" }
   ],
   "nativeChallengePreflight": [
     {

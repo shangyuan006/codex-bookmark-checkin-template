@@ -326,12 +326,15 @@ test("Run-Checkin 每轮落盘状态并用 RetryOrigins 缩小下一轮参数", 
 test("Run-Checkin persists explicit origin-scoped authoritative verification", async () => {
   const runner = await fs.readFile(runnerPath, "utf8");
   assert.match(runner, /\[string\[\]\]\$Origins = @\(\)/);
+  assert.match(runner, /\[switch\]\$OverrideTodayAbandonment/);
   assert.match(runner, /function Resolve-RequestedCheckinOrigins/);
   assert.match(runner, /定向签到只接受无路径、查询参数或凭据的规范 HTTPS origin/);
   assert.match(runner, /Origins 不能与 Agent Router 的 ReauthAccountKey 同时使用/);
   assert.match(runner, /elseif \(\$requestedOrigins\.Count -gt 0\)[\s\S]*?'--origins', \(\$requestedOrigins -join ','\)/);
   assert.match(runner, /function Test-RequestedOriginsAuthoritativelyComplete/);
   assert.match(runner, /'signed', 'already_signed'/);
+  assert.match(runner, /Get-TodayAbandonedOrigins -Path \$manualAbandonPath/);
+  assert.match(runner, /-OverrideTodayAbandonment/);
   assert.match(runner, /个定向站点已取得权威签到结果/);
 });
 

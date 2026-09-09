@@ -153,7 +153,9 @@ test("手动登录使用无 Playwright 和无远程调试的最小原生浏览�
   assert.match(closer, /\[int\]::TryParse\(\[string\]\$state\.pid/);
   assert.match(closer, /\$_.ProcessId -eq \$trackedPid/);
   assert.match(closer, /\[string\]::Equals\(\$recordedProfile, \$configuredProfile/);
-  assert.match(closer, /\$trackedProcess\.StartTime\.ToUniversalTime\(\)/);
+  assert.match(closer, /Test-CheckinProcessStartIdentity/);
+  assert.match(runtimeResolver, /function Test-CheckinProcessStartIdentity/);
+  assert.match(runtimeResolver, /\$Process\.StartTime\.ToUniversalTime\(\)/);
   assert.match(closer, /保留状态记录/);
   assert.match(closer, /CloseMainWindow\(\)/);
   assert.doesNotMatch(closer, /Stop-Process/);
@@ -395,6 +397,7 @@ test("本机配置、结果和凭据目录被 Git 忽略", async () => {
 test("DPAPI 凭据恢复默认关闭且强制同源验证", async () => {
   const defaults = JSON.parse(await fs.readFile(new URL("../config/defaults.json", import.meta.url), "utf8"));
   const loginSource = await fs.readFile(new URL("../src/credential-login.mjs", import.meta.url), "utf8");
+  const verificationSource = await fs.readFile(new URL("../src/credential-session-verification.mjs", import.meta.url), "utf8");
   const setter = await fs.readFile(new URL("../scripts/Set-ProtectedSiteCredential.ps1", import.meta.url), "utf8");
   const recovery = await fs.readFile(new URL("../scripts/Recover-ProtectedLogin.ps1", import.meta.url), "utf8");
 
@@ -402,7 +405,9 @@ test("DPAPI 凭据恢复默认关闭且强制同源验证", async () => {
   assert.deepEqual(defaults.protectedLoginVerificationPaths, {});
   assert.doesNotMatch(loginSource, /siteStorageBootstrap|Object\.entries\(localStorage\)|Object\.entries\(sessionStorage\)/);
   assert.match(loginSource, /new URL\(loginUrl\)\.origin !== origin/);
-  assert.match(loginSource, /verificationUrl\.origin !== origin/);
+  assert.match(loginSource, /credentialVerificationUrl\(origin, verificationPath\)/);
+  assert.match(verificationSource, /url\.origin !== origin/);
+  assert.match(verificationSource, /受保护登录必须配置权威验证路径/);
   assert.match(recovery, /\$PSVersionTable\.PSVersion\.Major -lt 7/);
   assert.match(recovery, /Get-Command pwsh\.exe/);
   assert.match(recovery, /-Origin \$Origin -LoginUrl \$LoginUrl/);

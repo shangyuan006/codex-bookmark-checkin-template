@@ -61,13 +61,12 @@ if (-not $tracked) {
 }
 
 $process = Get-Process -Id $trackedPid -ErrorAction SilentlyContinue
-$recordedStart = [datetime]::MinValue
-$recordedStartValid = [datetime]::TryParse([string]$state.processStartedAt, [ref]$recordedStart)
-$processIdentityMatches = $process -and $recordedStartValid
-if ($processIdentityMatches -and -not $rebound) {
-    $processIdentityMatches = [Math]::Abs(
-        ($process.StartTime.ToUniversalTime() - $recordedStart.ToUniversalTime()).TotalSeconds
-    ) -le 2
+$processIdentityMatches = $false
+if (-not $rebound) {
+    $processIdentityMatches = Test-CheckinProcessStartIdentity `
+        -Process $process `
+        -RecordedStart $state.processStartedAt `
+        -ToleranceSeconds 2
 }
 if ($rebound) { $processIdentityMatches = [bool]$process }
 if (-not $processIdentityMatches) {

@@ -18,6 +18,15 @@ export function isConfiguredProviderAuthorizationPage(rawUrl, provider) {
   return configuredProviderAuthorizationKind(rawUrl, provider) !== null;
 }
 
+export function configuredProviderAuthorizationOrigin(rawUrl, provider) {
+  if (!configuredProviderAuthorizationKind(rawUrl, provider)) return null;
+  try {
+    return new URL(rawUrl).origin;
+  } catch {
+    return null;
+  }
+}
+
 export function selectLinuxDoAuthorizationControlIndex(labels) {
   if (!Array.isArray(labels) || labels.length === 0 || labels.length > 30) return -1;
   const allowPattern = /\u5141\u8bb8|\u5141\u8a31|authorize|approve|\u540c\u610f|\u6388\u6743|\u6388\u6b0a|\u786e\u8ba4|\u78ba\u8a8d|\u7ee7\u7eed|\u7e7c\u7e8c|continue|\u767b\u5f55|login|\u767b\u5165/i;
@@ -40,6 +49,9 @@ function countLinuxDoAuthorizationControls(labels) {
 
 async function findUniqueLinuxDoAuthorizationControl(page) {
   const candidates = [
+    "\u5141\u8bb8",
+    "\u5141\u8a31",
+    "Allow",
     "\u786e\u8ba4",
     "\u786e\u8ba4\u6388\u6743",
     "\u78ba\u8a8d",

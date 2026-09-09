@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyUpstreamGroupCircuitBreakers,
   advanceAttemptedDeferredRetries,
   advanceDeferredRetry,
   deferUnresolvedLogin,
@@ -47,6 +48,70 @@ test("同站限频使用指数退避并在达到上限后转到次日", () => {
   assert.equal(second.nextEligibleAt, "2026-07-23T14:00:00.000Z");
   assert.equal(third.nextEligibleAt, "2026-07-24T00:05:00.000Z");
   assert.equal(third.retryExhaustedForDay, true);
+});
+
+test("上游站点上午达到探测上限后保留一次晚间恢复机会", () => {
+  const config = {
+    upstreamUnavailableMaxDailyAttempts: 3,
+    upstreamUnavailableLateRetryTime: "21:05",
+    schedule: "08:05",
+  };
+  const morning = new Date("2026-07-23T02:00:00Z");
+  const first = advanceDeferredRetry({ status: "deferred", retryCause: "upstream_unavailable" }, null, config, morning);
+  const second = advanceDeferredRetry({ status: "deferred", retryCause: "upstream_unavailable" }, first, config, morning);
+  const late = advanceDeferredRetry({ status: "deferred", retryCause: "upstream_unavailable" }, second, config, morning);
+  const exhausted = advanceDeferredRetry(
+    { status: "deferred", retryCause: "upstream_unavailable" },
+    late,
+    config,
+    new Date("2026-07-23T13:05:00Z"),
+  );
+  assert.equal(late.retrySequence, 3);
+  assert.equal(late.lateRetryPending, true);
+  assert.equal(late.retryExhaustedForDay, false);
+  assert.equal(late.nextEligibleAt, "2026-07-23T13:05:00.000Z");
+  assert.match(late.reason, /晚间再检查/);
+  assert.equal(exhausted.retrySequence, 4);
+  assert.equal(exhausted.retryExhaustedForDay, true);
+  assert.equal(exhausted.nextEligibleAt, "2026-07-24T00:05:00.000Z");
+});
+
+test("同一 OAuth 上游故障按组熔断且保留晚间机会", () => {
+  const results = ["one", "two", "three"].map((name) => ({
+    origin: `https://${name}.example`,
+    status: "deferred",
+    retryCause: "upstream_unavailable",
+    failureCode: "oauth_upstream_unavailable",
+    provider: "LinuxDO",
+    upstreamProvider: "GitHub",
+    retrySequence: 1,
+  }));
+  const circuit = applyUpstreamGroupCircuitBreakers(results, {
+    upstreamFailureGroupMaxDailyAttempts: 3,
+    upstreamUnavailableLateRetryTime: "21:05",
+    schedule: "08:05",
+  }, new Date("2026-07-23T02:00:00Z"));
+  assert.equal(circuit.every((result) => result.status === "deferred"), true);
+  assert.equal(circuit.every((result) => result.lateRetryPending === true), true);
+  assert.equal(circuit.every((result) => result.retryGroup === "oauth:linuxdo:github"), true);
+  assert.equal(circuit[0].nextEligibleAt, "2026-07-23T13:05:00.000Z");
+});
+
+test("Agent Router 可按账号提供方区分共享 OAuth 上游", () => {
+  const [result] = applyUpstreamGroupCircuitBreakers([{
+    origin: "https://agent.example",
+    accountKey: "linuxdo",
+    status: "deferred",
+    retryCause: "upstream_unavailable",
+    failureCode: "oauth_upstream_unavailable",
+  }], {
+    upstreamFailureGroupMaxDailyAttempts: 3,
+    agentrouterAccounts: [
+      { origin: "https://agent.example", accountKey: "github", provider: "GitHub" },
+      { origin: "https://agent.example", accountKey: "linuxdo", provider: "LinuxDO" },
+    ],
+  });
+  assert.equal(result.retryGroup, "oauth:linuxdo:shared");
 });
 
 test("续跑只推进本轮真正尝试过的站点", () => {

@@ -16,8 +16,15 @@ function quotePowerShell(value) {
 }
 
 function runHealth(fixtureRoot, { mockWindowsState = false } = {}) {
+  const schedulerScript = path.join(root, "scripts", "Start-UserScheduler.ps1");
+  const triggers = Array.from({ length: 16 }, (_, index) => {
+    const minutes = 8 * 60 + 5 + index * 60;
+    const hour = String(Math.floor(minutes / 60)).padStart(2, "0");
+    const minute = String(minutes % 60).padStart(2, "0");
+    return `[pscustomobject]@{ CimClass = [pscustomobject]@{ CimClassName = 'MSFT_TaskDailyTrigger' }; StartBoundary = '2026-01-01T${hour}:${minute}:00' }`;
+  }).join(", ");
   const prelude = mockWindowsState ? [
-    "function Get-ScheduledTask { [CmdletBinding()] param([string]$TaskName) [pscustomobject]@{ State = 'Ready' } }",
+    `function Get-ScheduledTask { [CmdletBinding()] param([string]$TaskName) [pscustomobject]@{ State = 'Ready'; Actions = @([pscustomobject]@{ Arguments = ${quotePowerShell(`-NoProfile -File "${schedulerScript}" -Once`)} }); Triggers = @(${triggers}) } }`,
     "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName) @() }",
     "function Get-ItemProperty { [CmdletBinding()] param([string]$Path) [pscustomobject]@{} }",
   ] : [];

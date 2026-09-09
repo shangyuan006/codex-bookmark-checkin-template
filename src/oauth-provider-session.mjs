@@ -53,22 +53,58 @@ export async function readProviderSession(requestContext, endpoint, navigationTi
     timeout: navigationTimeoutMs,
   }).catch(() => null);
   if (!response) return "unknown";
-  if ([401, 403].includes(response.status())) return "invalid";
+  // Discourse deliberately returns 404 from /session/current.json when the
+  // browser is not authenticated. Treat it as a definitive logged-out state.
+  if ([401, 403, 404].includes(response.status())) return "invalid";
   if (!response.ok()) return "unknown";
   const value = await response.json().catch(() => null);
   return classifyLinuxDoSession(value);
 }
 
 export async function readProviderSessionPage(page, endpoint, navigationTimeoutMs) {
-  const response = await page.goto(endpoint, {
-    waitUntil: "domcontentloaded",
-    timeout: navigationTimeoutMs,
-  }).catch(() => null);
-  if (!response) return "unknown";
-  if ([401, 403].includes(response.status())) return "invalid";
-  if (!response.ok()) return "unknown";
-  const value = await response.json().catch(() => null);
-  return classifyLinuxDoSession(value);
+  let endpointUrl;
+  try {
+    endpointUrl = new URL(endpoint);
+  } catch {
+    return "unknown";
+  }
+  if (endpointUrl.protocol !== "https:") return "unknown";
+
+  let currentOrigin = null;
+  try { currentOrigin = new URL(page.url()).origin; } catch { /* navigate below */ }
+  if (currentOrigin !== endpointUrl.origin) {
+    const landingResponse = await page.goto(new URL("/", endpointUrl).href, {
+      waitUntil: "domcontentloaded",
+      timeout: navigationTimeoutMs,
+    }).catch(() => null);
+    if (!landingResponse) return "unknown";
+  }
+
+  const timeoutMs = Math.max(1_000, Math.min(120_000, Number(navigationTimeoutMs) || 15_000));
+  const status = await page.evaluate(async ({ sessionEndpoint, requestTimeoutMs }) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+    try {
+      const response = await fetch(sessionEndpoint, {
+        cache: "no-store",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      });
+      if ([401, 403, 404].includes(response.status)) return "invalid";
+      if (!response.ok) return "unknown";
+      const value = await response.json().catch(() => null);
+      const currentUser = value?.current_user;
+      return currentUser && typeof currentUser === "object" && !Array.isArray(currentUser)
+        ? "valid"
+        : "invalid";
+    } catch {
+      return "unknown";
+    } finally {
+      clearTimeout(timer);
+    }
+  }, { sessionEndpoint: endpointUrl.href, requestTimeoutMs: timeoutMs }).catch(() => "unknown");
+  return normalizeProbeStatus(status);
 }
 
 export async function probeProviderSessionInContext(
@@ -84,8 +120,9 @@ export async function probeProviderSessionInContext(
   if (requestProbe.status === "valid") return requestProbe;
 
   // A cold persistent Edge profile can expose its encrypted cookies to a
-  // renderer navigation before BrowserContext.request sees them. Confirm the
-  // same fixed endpoint through one background page before opening login UI.
+  // renderer before BrowserContext.request sees them. Warm the provider home
+  // page, then fetch the fixed endpoint in-page so the probe never navigates a
+  // user-visible tab to Discourse's intentional logged-out 404 response.
   const page = await context.newPage();
   let pageProbe = { status: "unknown", attempts: 0 };
   try {

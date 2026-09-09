@@ -14,9 +14,26 @@ import {
   isConfiguredProviderAuthorizationPage,
 } from "./oauth-provider-authorization.mjs";
 import { findUniqueOAuthProviderControl } from "./oauth-provider-control.mjs";
-import { waitForFirstTransition, waitForOriginPage } from "./oauth-transition.mjs";
+import {
+  waitForFirstTransition,
+  waitForOriginPage,
+  waitForUsableHttpsPage,
+} from "./oauth-transition.mjs";
+import {
+  isLinuxDoLoginPage,
+  recoverSavedLinuxDoLogin,
+  shouldRetryLinuxDoLoginRecovery,
+} from "./oauth-linuxdo-login.mjs";
+import {
+  isLinuxDoSsoProviderPage,
+  waitForLinuxDoSsoTransition,
+} from "./oauth-linuxdo-sso.mjs";
 import { clickConfiguredLoginChallengeControl } from "./protected-login-flow.mjs";
 import { verifyConfiguredSavedLoginSession } from "./saved-login-session.mjs";
+import {
+  isGitHubLoginUrl,
+  restoreSavedGitHubLogin,
+} from "./github-saved-login.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -37,6 +54,7 @@ const agentRouterOnly = process.argv.includes("--agent-router-only");
 const providerSessionConfirmed = process.argv.includes("--provider-session-confirmed");
 const checkinAfterLogin = process.argv.includes("--checkin-after-login");
 const interactiveAttention = process.argv.includes("--interactive-attention");
+const experimentalSsoFrameClick = process.argv.includes("--experimental-sso-frame-click");
 if (!requestedOrigin) throw new Error("用法: node src/oauth-login.mjs <origin> [provider]");
 if (providerOnly && agentRouterOnly) throw new Error("--provider-only and --agent-router-only cannot be combined");
 if ((providerOnly || agentRouterOnly) && !/linux\s*do/i.test(provider)) {
@@ -45,7 +63,16 @@ if ((providerOnly || agentRouterOnly) && !/linux\s*do/i.test(provider)) {
 if (agentRouterOnly && !providerSessionConfirmed) {
   throw new Error("--agent-router-only requires a fresh provider session confirmation");
 }
+if (experimentalSsoFrameClick && (!agentRouterOnly || !/linux\s*do/i.test(provider))) {
+  throw new Error("--experimental-sso-frame-click requires LinuxDO --agent-router-only");
+}
 const origin = new URL(requestedOrigin).origin;
+const configuredLinuxDoSsoFrameClick = /linux\s*do/i.test(provider)
+  && Array.isArray(config.autoClickTurnstileOrigins)
+  && config.autoClickTurnstileOrigins.some((value) => {
+    try { return new URL(value).origin === origin; } catch { return false; }
+  });
+const allowLinuxDoSsoFrameClick = experimentalSsoFrameClick || configuredLinuxDoSsoFrameClick;
 const bookmarkTarget = providerOnly
   ? null
   : (await findBookmarkTarget(config.bookmarksPath, origin, config)).target;
@@ -142,6 +169,7 @@ const providerWaitMs = Math.max(
 const interactiveAttentionWaitMs = 10 * 60_000;
 let oauthStage = "target_login";
 let authorizationOutcome = null;
+let experimentalSsoChallengeOutcome = experimentalSsoFrameClick ? "not_exercised" : null;
 
 function setOAuthStage(value) {
   oauthStage = value;
@@ -154,17 +182,9 @@ function printResult(status, details = {}) {
     status,
     oauthStage,
     ...(authorizationOutcome ? { authorizationOutcome } : {}),
+    ...(experimentalSsoChallengeOutcome ? { experimentalSsoChallengeOutcome } : {}),
     ...details,
   }, null, privateResult ? 0 : 2));
-}
-
-function isLinuxDoLoginPage(page) {
-  try {
-    const location = new URL(page.url());
-    return location.hostname === "linux.do" && /^\/login(?:[/?#]|$)/i.test(location.pathname);
-  } catch {
-    return false;
-  }
 }
 
 function isTargetLoginPage(page) {
@@ -237,63 +257,6 @@ async function waitForTargetCallback(preferredPage) {
   });
 }
 
-async function trySavedLinuxDoLogin(page, waitMs = providerWaitMs) {
-  if (!isLinuxDoLoginPage(page)) return false;
-
-  const username = page.locator('input#login-account-name:visible, input[name="login"]:visible');
-  const password = page.locator('input#login-account-password:visible, input[type="password"]:visible');
-  if (await username.count() !== 1 || await password.count() !== 1) return false;
-  await page.waitForTimeout(Math.min(2_000, waitMs));
-
-  let filled = await page.evaluate(() => {
-    const user = document.querySelector('input#login-account-name, input[name="login"]');
-    const secret = document.querySelector('input#login-account-password, input[type="password"]');
-    return Boolean(user?.value && secret?.value);
-  });
-  if (!filled) {
-    // A real focus/keyboard gesture asks the browser password manager to apply the
-    // encrypted credential copied into this dedicated profile.  Values are
-    // never read or logged by the automation.
-    await username.click();
-    await username.press("ArrowDown").catch(() => {});
-    await username.press("Enter").catch(() => {});
-    await page.waitForTimeout(Math.min(2_000, waitMs));
-    filled = await page.evaluate(() => {
-      const user = document.querySelector('input#login-account-name, input[name="login"]');
-      const secret = document.querySelector('input#login-account-password, input[type="password"]');
-      return Boolean(user?.value && secret?.value);
-    });
-  }
-  if (!filled) {
-    // LinuxDO also exposes a Google login button.  Once the dedicated browser
-    // has a valid Google session this is the simplest unattended recovery
-    // path and does not require handling a password or Windows Hello prompt.
-    const googleButton = page.getByRole("button", { name: "使用 Google 登录", exact: true });
-    if (await googleButton.count() === 1) {
-      await googleButton.click();
-      await page.waitForURL((url) => {
-        const loginPath = /^\/login(?:[/?#]|$)/i.test(url.pathname);
-        return url.hostname === "connect.linux.do" || (url.hostname === "linux.do" && !loginPath);
-      }, { timeout: Math.min(60_000, waitMs) }).catch(() => {});
-      await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
-      const afterGoogle = new URL(page.url());
-      const loginPath = /^\/login(?:[/?#]|$)/i.test(afterGoogle.pathname);
-      return afterGoogle.hostname === "connect.linux.do" || (afterGoogle.hostname === "linux.do" && !loginPath);
-    }
-    return false;
-  }
-
-  const loginButton = page.getByRole("button", { name: "登录", exact: true });
-  if (await loginButton.count() !== 1) return false;
-  await loginButton.click();
-  await page.waitForURL((url) => url.hostname !== "linux.do" || !/^\/login(?:[/?#]|$)/i.test(url.pathname), {
-    timeout: Math.min(60_000, waitMs),
-  }).catch(() => {});
-  await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
-  const finalLocation = new URL(page.url());
-  return finalLocation.hostname !== "linux.do" || !/^\/login(?:[/?#]|$)/i.test(finalLocation.pathname);
-}
-
 async function probeLinuxDoSession(context, attempts = 3) {
   const boundedAttempts = Math.max(1, Math.min(3, Number(attempts) || 1));
   const retryDelaysMs = Array.from(
@@ -329,8 +292,11 @@ async function runProviderOnlyFlow() {
     });
     await providerPage.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
     if (isLinuxDoLoginPage(providerPage)) {
-      const recovered = await trySavedLinuxDoLogin(providerPage, providerWaitMs);
-      if (!recovered || isLinuxDoLoginPage(providerPage)) return false;
+      const recovery = await recoverSavedLinuxDoLogin(providerPage, providerWaitMs);
+      if (recovery.challengeObserved && !recovery.recovered) {
+        setOAuthStage("linuxdo_login_challenge");
+      }
+      if (!recovery.recovered || isLinuxDoLoginPage(providerPage)) return false;
     }
     // A restored LinuxDO page can look logged in before its session endpoint
     // is ready after a cold browser start. Let the page settle, then retry the
@@ -404,7 +370,6 @@ if (providerOnly) {
   async function findProviderButton(currentPage) {
     setOAuthStage("provider_button");
     const providerDeadline = Date.now() + providerWaitMs;
-    let challengeClicked = false;
     while (Date.now() < providerDeadline) {
       const agreementCheckbox = currentPage.locator('input[type="checkbox"]:visible');
       if (await agreementCheckbox.count() === 1 && !await agreementCheckbox.isChecked()) {
@@ -420,10 +385,8 @@ if (providerOnly) {
       }
       const semanticFallback = await findUniqueOAuthProviderControl(currentPage, provider);
       if (semanticFallback) return semanticFallback;
-      if (!challengeClicked) {
-        challengeClicked = await clickConfiguredLoginChallengeControl(currentPage, origin, config);
-        if (challengeClicked) setOAuthStage("login_challenge");
-      }
+      const challengeClicked = await clickConfiguredLoginChallengeControl(currentPage, origin, config);
+      if (challengeClicked) setOAuthStage("login_challenge");
       await currentPage.waitForTimeout(500);
     }
     throw new Error("configured OAuth provider control was not found");
@@ -434,14 +397,25 @@ if (providerOnly) {
     setOAuthStage("provider_transition");
     const previousUrl = currentPage.url();
     const transitionTimeout = Math.min(20_000, providerWaitMs);
+    const existingPages = new Set(context.pages());
     const popupPromise = currentPage.waitForEvent("popup", { timeout: transitionTimeout })
-      .then((popup) => popup)
+      .then((popup) => waitForUsableHttpsPage(popup, { timeoutMs: transitionTimeout }))
+      .catch(() => null);
+    const contextPagePromise = context.waitForEvent("page", {
+      predicate: (candidate) => !existingPages.has(candidate),
+      timeout: transitionTimeout,
+    })
+      .then((candidate) => waitForUsableHttpsPage(candidate, { timeoutMs: transitionTimeout }))
       .catch(() => null);
     const navigationPromise = currentPage.waitForURL((url) => url.href !== previousUrl, { timeout: transitionTimeout })
-      .then(() => currentPage)
+      .then(() => waitForUsableHttpsPage(currentPage, { timeoutMs: transitionTimeout }))
       .catch(() => null);
     await providerButton.click();
-    const destinationPage = await waitForFirstTransition([popupPromise, navigationPromise]);
+    const destinationPage = await waitForFirstTransition([
+      popupPromise,
+      contextPagePromise,
+      navigationPromise,
+    ]);
     if (!destinationPage) throw new Error("OAuth provider navigation did not start");
     if (destinationPage !== currentPage) await currentPage.close({ runBeforeUnload: false }).catch(() => {});
     oauthFlowPages.add(destinationPage);
@@ -450,13 +424,55 @@ if (providerOnly) {
   }
 
   const providerHomeRecoveryAttempts = 3;
+  const githubSavedLoginState = { attempted: false };
   for (let flowAttempt = 0; flowAttempt < providerHomeRecoveryAttempts; flowAttempt += 1) {
     page = await startProviderOAuth(page);
-    await page.waitForTimeout(Math.min(1_500, providerWaitMs));
+    if (/linux\s*do/i.test(provider) && isLinuxDoSsoProviderPage(page.url())) {
+      const ssoChallengeRule = config.challengeInteractionRules?.[origin] ?? {};
+      const ssoTransition = await waitForLinuxDoSsoTransition(page, {
+        timeoutMs: providerWaitMs,
+        onChallengeObserved: () => setOAuthStage("linuxdo_login_challenge"),
+        allowFrameCoordinateFallback: allowLinuxDoSsoFrameClick,
+        frameStableMs: ssoChallengeRule.frameStableMs,
+      });
+      if (experimentalSsoFrameClick) {
+        experimentalSsoChallengeOutcome = ssoTransition.challengeOutcome;
+      }
+      if (!ssoTransition.transitioned) {
+        if (ssoTransition.challengeObserved) setOAuthStage("linuxdo_login_challenge");
+        throw new Error("LinuxDO SSO provider transition did not complete");
+      }
+      setOAuthStage("provider_transition");
+      await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+    } else {
+      await page.waitForTimeout(Math.min(1_500, providerWaitMs));
+    }
+    if (isGitHubLoginUrl(page.url())) {
+      setOAuthStage("provider_session");
+      const recovered = await restoreSavedGitHubLogin(page, githubSavedLoginState);
+      if (!recovered || isGitHubLoginUrl(page.url())) {
+        throw new Error("GitHub saved login recovery did not complete");
+      }
+    }
+    const providerLocation = new URL(page.url());
+    if (providerLocation.hostname === "github.com"
+      && !isConfiguredProviderAuthorizationPage(page.url(), provider)) {
+      if (flowAttempt + 1 >= providerHomeRecoveryAttempts) {
+        throw new Error("GitHub OAuth repeatedly resumed outside authorization");
+      }
+      setOAuthStage("provider_transition");
+      await page.goto(loginUrl.href, { waitUntil: "commit", timeout: config.navigationTimeoutMs });
+      await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+      continue;
+    }
     for (let attempt = 0; attempt < 2 && isLinuxDoLoginPage(page); attempt += 1) {
       setOAuthStage("linuxdo_session");
-      const recovered = await trySavedLinuxDoLogin(page, providerWaitMs);
-      if (recovered || !isLinuxDoLoginPage(page)) break;
+      const recovery = await recoverSavedLinuxDoLogin(page, providerWaitMs);
+      if (recovery.challengeObserved && !recovery.recovered) {
+        setOAuthStage("linuxdo_login_challenge");
+      }
+      if (recovery.recovered || !isLinuxDoLoginPage(page)) break;
+      if (!shouldRetryLinuxDoLoginRecovery(recovery)) break;
       await page.waitForTimeout(Math.min(3_000, providerWaitMs));
     }
     if (isLinuxDoLoginPage(page)) throw new Error("LinuxDO session recovery did not complete");
@@ -488,6 +504,7 @@ if (providerOnly) {
     const authorizationDeadline = Date.now() + providerWaitMs;
     let authorization = null;
     let authorizationSubmitted = false;
+    let providerChallengeObserved = false;
     let providerChallengeClicked = false;
     let authorizationSurfaceReported = false;
     while (Date.now() < authorizationDeadline
@@ -495,11 +512,12 @@ if (providerOnly) {
       if (!authorizationSubmitted) {
         authorization = await authorizeConfiguredOAuthProvider(page, provider);
         authorizationOutcome = authorization.outcome;
-        if (privateResult
-          && !authorizationSurfaceReported
-          && authorization.outcome === "authorization_not_found") {
+        if (authorization.outcome === "authorization_not_found") {
           const authorizationSurface = await describeConfiguredAuthorizationSurface(page, provider);
-          if (authorizationSurface) {
+          if ((authorizationSurface?.challengeFrameCount ?? 0) > 0) {
+            providerChallengeObserved = true;
+          }
+          if (privateResult && !authorizationSurfaceReported && authorizationSurface) {
             process.stderr.write(`${JSON.stringify({ oauthStage, authorizationSurface })}\n`);
             authorizationSurfaceReported = true;
           }
@@ -524,6 +542,11 @@ if (providerOnly) {
       await page.waitForTimeout(500);
     }
     if (isConfiguredProviderAuthorizationPage(page.url(), provider)) {
+      if (providerChallengeObserved) {
+        authorizationOutcome = providerChallengeClicked
+          ? "provider_challenge_unresolved"
+          : "provider_challenge_not_clickable";
+      }
       throw new Error("configured OAuth provider authorization did not complete");
     }
     authorizationOutcome = "authorization_completed";

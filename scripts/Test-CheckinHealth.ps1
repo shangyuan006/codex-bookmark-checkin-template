@@ -323,24 +323,106 @@ foreach ($group in $currentAccountGroups) {
 }
 $latestMatchesCurrentPlan = $latestTopLevelMatchesCurrentPlan -and $latestAccountsMatchCurrentPlan
 
+$scheduleValid = [string]$config.schedule -match '^([01]\d|2[0-3]):[0-5]\d$'
+$probeInterval = if ($null -ne $config.schedulerProbeIntervalMinutes) { [int]$config.schedulerProbeIntervalMinutes } else { 60 }
+$probeInterval = [Math]::Max(30, [Math]::Min(180, $probeInterval))
+$expectedTriggerMinutes = @()
+if ($scheduleValid) {
+    $scheduleParts = [string]$config.schedule -split ':'
+    $scheduleStartMinutes = ([int]$scheduleParts[0] * 60) + [int]$scheduleParts[1]
+    $expectedTriggerMinutes = @(
+        for ($minute = $scheduleStartMinutes; $minute -lt 24 * 60; $minute += $probeInterval) { $minute }
+    )
+}
+$actualTriggerMinutes = @(
+    if ($scheduledTask) {
+        @($scheduledTask.Triggers | Where-Object {
+            [string]$_.CimClass.CimClassName -eq 'MSFT_TaskDailyTrigger'
+        } | ForEach-Object {
+            try {
+                $start = [datetimeoffset]$_.StartBoundary
+                ($start.Hour * 60) + $start.Minute
+            } catch { }
+        } | Sort-Object -Unique)
+    }
+)
+$scheduledTaskTriggerFrequencyValid = $scheduledTaskEnabled `
+    -and $expectedTriggerMinutes.Count -gt 0 `
+    -and $expectedTriggerMinutes.Count -eq $actualTriggerMinutes.Count `
+    -and @(Compare-Object -ReferenceObject $expectedTriggerMinutes -DifferenceObject $actualTriggerMinutes).Count -eq 0
+$scheduledTaskActionValid = if ($scheduledTask) {
+    $actions = @($scheduledTask.Actions)
+    if ($actions.Count -ne 1) { $false }
+    else {
+        $arguments = [string]$actions[0].Arguments
+        $arguments.IndexOf($schedulerScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+            -and $arguments -match '(?:^|\s)-Once(?:\s|$)'
+    }
+} else { $false }
+$scheduledTaskReady = $scheduledTaskEnabled -and $scheduledTaskActionValid -and $scheduledTaskTriggerFrequencyValid
 $userSchedulerReady = [bool]$runValue -and $schedulerCount -eq 1 -and $watchdogCount -eq 1 -and [bool]$heartbeatFresh
+$useUserScheduler = [bool]$runValue -and -not $scheduledTaskReady
+$effectiveSchedulerReady = if ($useUserScheduler) { $userSchedulerReady } else { $scheduledTaskReady }
 $notificationMode = [string]$config.notification.mode
 $notificationReady = $notificationMode -in @('', 'none') -or (
     $notificationMode -eq 'command' -and
     ((Test-HealthPath ([string]$config.notification.executable)) -or (Get-Command ([string]$config.notification.executable) -ErrorAction SilentlyContinue))
 )
 $automationUserDataDir = [string]$config.automationUserDataDir
+$dataRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'data'))
+$dataPrefix = $dataRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+$nativeWafProfiles = @(
+    @($config.nativeWafPreflightUrls) + @($config.nativeChallengePreflight) | Where-Object {
+        $_ -isnot [string] -and -not [string]::IsNullOrWhiteSpace([string]$_.automationUserDataDir)
+    } | ForEach-Object {
+        $candidate = try {
+            if ([System.IO.Path]::IsPathRooted([string]$_.automationUserDataDir)) {
+                [System.IO.Path]::GetFullPath([string]$_.automationUserDataDir)
+            } else {
+                [System.IO.Path]::GetFullPath((Join-Path $root ([string]$_.automationUserDataDir)))
+            }
+        } catch { $null }
+        $entryOrigin = try { ([uri][string]$_.url).GetLeftPart([System.UriPartial]::Authority) } catch { $null }
+        [pscustomobject]@{
+            origin = $entryOrigin
+            path = $candidate
+            valid = $candidate -and $candidate.StartsWith($dataPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+            present = $candidate -and (Test-HealthPath (Join-Path $candidate 'Local State'))
+        }
+    }
+)
+$reservedProfilePaths = @(
+    $automationUserDataDir
+    @($config.agentrouterAccounts | ForEach-Object { [string]$_.automationUserDataDir })
+) | Where-Object { $_ } | ForEach-Object {
+    try {
+        if ([System.IO.Path]::IsPathRooted($_)) { [System.IO.Path]::GetFullPath($_) }
+        else { [System.IO.Path]::GetFullPath((Join-Path $root $_)) }
+    } catch { }
+}
+$allProfileEntries = @(
+    @($reservedProfilePaths | ForEach-Object { [pscustomobject]@{ path = $_; origin = 'reserved' } })
+    @($nativeWafProfiles | Where-Object { $_.valid } | ForEach-Object { [pscustomobject]@{ path = $_.path; origin = $_.origin } })
+)
+$duplicateProfileGroups = @($allProfileEntries | Group-Object { $_.path.ToLowerInvariant() } | Where-Object {
+    @($_.Group.origin | Sort-Object -Unique).Count -gt 1
+})
 $checks = [ordered]@{
     configPresent = $true
     bookmarksReadable = Test-HealthBookmarkSources $config
     currentPlanReadable = [bool]$currentPlanReadable
     browserExecutablePresent = Test-HealthPath $browserExecutable
     automationProfilePresent = [bool]$automationUserDataDir -and (Test-HealthPath (Join-Path $automationUserDataDir 'Local State'))
+    nativeWafProfilesValid = @($nativeWafProfiles | Where-Object { -not $_.valid }).Count -eq 0
+    nativeWafProfilesPresent = @($nativeWafProfiles | Where-Object { -not $_.present }).Count -eq 0
+    automationProfilesUnique = $duplicateProfileGroups.Count -eq 0
     notificationReady = [bool]$notificationReady
     notificationOutboxClean = $notificationQuarantinedCount -eq 0
-    schedulerReady = [bool]$scheduledTaskEnabled -or [bool]$userSchedulerReady
-    schedulerUnique = if ($scheduledTaskEnabled) { $true } elseif ($runValue) { $schedulerCount -eq 1 -and $watchdogCount -eq 1 } else { $false }
-    schedulerHeartbeatFresh = [bool]$heartbeatFresh
+    schedulerReady = [bool]$effectiveSchedulerReady
+    schedulerUnique = if ($useUserScheduler) { $schedulerCount -eq 1 -and $watchdogCount -eq 1 } elseif ($scheduledTaskReady) { $true } else { $false }
+    schedulerTaskActionValid = if ($useUserScheduler) { $true } else { [bool]$scheduledTaskActionValid }
+    schedulerTaskTriggerFrequencyValid = if ($useUserScheduler) { $true } else { [bool]$scheduledTaskTriggerFrequencyValid }
+    schedulerHeartbeatFresh = if ($useUserScheduler) { [bool]$heartbeatFresh } elseif ($scheduledTaskReady) { $true } else { $false }
     latestResultPresent = [bool]$latest
     latestRunToday = [bool]$latestRunToday
     latestResultComplete = [bool]$latestResultComplete
@@ -360,7 +442,12 @@ $healthy = $failedChecks.Count -eq 0
     schedule = [string]$config.schedule
     browser = [string]$config.browser
     browserProcessName = [string]$config.browserProcessName
-    schedulerMode = if ($scheduledTaskEnabled) { 'windows_task' } elseif ($runValue) { 'user_scheduler' } elseif ($scheduledTask) { 'windows_task_disabled' } else { 'none' }
+    schedulerMode = if ($useUserScheduler) { 'user_scheduler' } elseif ($scheduledTask) { if ($scheduledTaskEnabled) { 'windows_task' } else { 'windows_task_disabled' } } else { 'none' }
+    schedulerExpectedProbeIntervalMinutes = $probeInterval
+    schedulerActualDailyTriggerMinutes = @($actualTriggerMinutes)
+    schedulerTaskActionValid = [bool]$scheduledTaskActionValid
+    schedulerTaskTriggerFrequencyValid = [bool]$scheduledTaskTriggerFrequencyValid
+    nativeWafProfileCount = $nativeWafProfiles.Count
     scheduledTaskEnabled = [bool]$scheduledTaskEnabled
     schedulerStatus = if ($scheduledTaskEnabled -or $userSchedulerReady) { 'active' } elseif ($scheduledTask -or $runValue) { 'paused' } else { 'not_installed' }
     schedulerProcessCount = $schedulerCount

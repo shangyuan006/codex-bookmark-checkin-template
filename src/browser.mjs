@@ -13,11 +13,13 @@ import { tryBearerCheckin } from "./bearer-checkin.mjs";
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
 import {
   getConfiguredPreCheckinNavigationRule,
+  getConfiguredPreCheckinTerminalPath,
   navigateConfiguredPreCheckinPage,
 } from "./pre-checkin-navigation.mjs";
 
 export {
   getConfiguredPreCheckinNavigationRule,
+  getConfiguredPreCheckinTerminalPath,
   navigateConfiguredPreCheckinPage,
 } from "./pre-checkin-navigation.mjs";
 
@@ -53,6 +55,7 @@ function sleep(ms) {
 
 const MIN_TARGET_TIMEOUT_MS = 30_000;
 const MAX_TARGET_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_CHECKIN_ACTION_DISCOVERY_WAIT_MS = 5_000;
 
 export function getTargetTimeoutMs(config) {
   return Math.max(
@@ -161,6 +164,28 @@ function currentAllowedLocation(page, allowedOrigins) {
   return { activeUrl, activeOrigin: new URL(activeUrl).origin };
 }
 
+function configuredPreCheckinTerminalResult(page, target, config) {
+  let activeUrl;
+  try {
+    activeUrl = assertBookmarkNavigation(page.url(), target.allowedOrigins ?? [target.origin]);
+  } catch {
+    return null;
+  }
+  const activeOrigin = new URL(activeUrl).origin;
+  const terminalPath = getConfiguredPreCheckinTerminalPath(
+    activeUrl,
+    target,
+    activeOrigin,
+    config,
+  );
+  if (!terminalPath) return null;
+  return {
+    status: "already_signed",
+    reason: `站点进入终止页面 ${terminalPath}，停止后续签到重试`,
+    url: safeLogUrl(activeUrl),
+  };
+}
+
 export function targetNeedsManualChallenge(target, activeOrigin, config) {
   return targetUsesConfiguredActiveOrigin(target, activeOrigin, config?.manualChallengeOrigins);
 }
@@ -196,6 +221,9 @@ export function getConfiguredChallengeInteractionRule(target, activeOrigin, conf
       : 0,
     waitMs: Math.max(1000, Math.min(60_000, Number(raw.waitMs) || 30_000)),
     settleMs: Math.max(500, Math.min(10_000, Number(raw.settleMs) || 3000)),
+    frameStableMs: type === "click"
+      ? Math.max(3000, Math.min(5000, Number(raw.frameStableMs) || 4000))
+      : 0,
     retryAction: raw.retryAction === true,
     retryDomClick: raw.retryAction === true && raw.retryDomClick === true,
     retryActionWaitMs: raw.retryAction === true
@@ -397,14 +425,22 @@ export function selectSliderDragGeometry(candidates) {
   const values = Array.isArray(candidates) ? candidates : [];
   const tracks = values.filter((candidate) => candidate.parentCandidateIndex === -1
     && candidate.width >= 180 && candidate.height >= 20 && candidate.height <= 100
-    && candidate.hasPointerChild);
+    && (candidate.hasPointerChild || Number(candidate.handleLikeChildCount) === 1));
   if (tracks.length !== 1) return null;
   const track = tracks[0];
   const handles = values.filter((candidate) => candidate.parentCandidateIndex === track.index
-    && candidate.pointerCursor && candidate.width >= 20 && candidate.width <= 100
+    && (candidate.pointerCursor || candidate.handleLike)
+    && candidate.width >= 20 && candidate.width <= 100
     && candidate.height >= 20 && candidate.height <= track.height + 4);
-  if (handles.length !== 1) return null;
-  const handle = handles[0];
+  const nestedHandles = Array.isArray(track.handleLikeChildren)
+    ? track.handleLikeChildren.filter((candidate) => candidate.width >= 20
+      && candidate.width <= 100
+      && candidate.height >= 20
+      && candidate.height <= track.height + 4)
+    : [];
+  const selectedHandles = handles.length > 0 ? handles : nestedHandles;
+  if (selectedHandles.length !== 1) return null;
+  const handle = selectedHandles[0];
   return {
     startX: handle.x + handle.width / 2,
     startY: handle.y + handle.height / 2,
@@ -823,6 +859,7 @@ export async function clickConfiguredChallengeControl(page, rule, expectedOrigin
     const frameResult = await clickVisibleNativeChallengeControl(page, expectedOrigin, {
       actionTexts: ["签到"],
       clickChallenge: true,
+      challengeFrameStableMs: rule.frameStableMs,
     });
     if (frameResult.clicked) return null;
     if (frameResult.outcome === "challenge_not_unique") {
@@ -850,6 +887,30 @@ async function inspectConfiguredSlider(page) {
     return elements.map((element, index) => {
       const rect = element.getBoundingClientRect();
       const cursor = getComputedStyle(element).cursor;
+      const handleLikeChildren = [...element.querySelectorAll("*")].filter((candidate) => {
+        if (!visible(candidate)) return false;
+        const childRect = candidate.getBoundingClientRect();
+        const childStyle = getComputedStyle(candidate);
+        const childCursor = childStyle.cursor;
+        const handleLike = childCursor === "pointer"
+          || childCursor === "grab"
+          || childStyle.position === "absolute"
+          || candidate.getAttribute("role") === "slider"
+          || candidate.tagName === "BUTTON";
+        return handleLike
+          && childRect.width >= 20
+          && childRect.width <= 100
+          && childRect.height >= 20
+          && childRect.height <= rect.height + 4;
+      }).map((candidate) => {
+        const childRect = candidate.getBoundingClientRect();
+        return {
+          x: childRect.x,
+          y: childRect.y,
+          width: childRect.width,
+          height: childRect.height,
+        };
+      });
       return {
         index,
         x: rect.x,
@@ -861,6 +922,8 @@ async function inspectConfiguredSlider(page) {
           const childCursor = getComputedStyle(candidate).cursor;
           return visible(candidate) && (childCursor === "pointer" || childCursor === "grab");
         }),
+        handleLikeChildCount: handleLikeChildren.length,
+        handleLikeChildren,
         parentCandidateIndex: elements.findIndex((candidate) => candidate !== element && candidate.contains(element)),
       };
     });
@@ -1358,6 +1421,47 @@ async function findCheckinAction(page, allowedOrigins, excludedAction = null) {
       && candidate.href === excludedAction.href
     ))
     .sort((a, b) => b.score - a.score)[0] ?? null;
+}
+
+export function getCheckinActionDiscoveryWaitMs(config = {}) {
+  const configured = Number(config.checkinActionDiscoveryWaitMs);
+  return Math.max(
+    0,
+    Math.min(
+      DEFAULT_CHECKIN_ACTION_DISCOVERY_WAIT_MS,
+      Number.isFinite(configured) ? configured : DEFAULT_CHECKIN_ACTION_DISCOVERY_WAIT_MS,
+    ),
+  );
+}
+
+export async function waitForCheckinAction(page, allowedOrigins, config = {}, excludedAction = null) {
+  let action = await findCheckinAction(page, allowedOrigins, excludedAction);
+  if (action) return action;
+
+  const waitMs = getCheckinActionDiscoveryWaitMs(config);
+  if (waitMs <= 0) return null;
+  const pollMs = Math.max(5, Math.min(1_000, Number(config.checkinActionDiscoveryPollMs) || 500));
+  const deadline = Date.now() + waitMs;
+  const terminalStatuses = new Set([
+    "signed",
+    "already_signed",
+    "login_required",
+    "interactive_challenge",
+    "managed_challenge",
+    "managed_challenge_timeout",
+    "deferred",
+    "needs_attention",
+    "not_available",
+  ]);
+  while (Date.now() < deadline) {
+    assertBookmarkNavigation(page.url(), allowedOrigins);
+    const state = await snapshotState(page);
+    if (terminalStatuses.has(state.status)) return null;
+    await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+    action = await findCheckinAction(page, allowedOrigins, excludedAction);
+    if (action) return action;
+  }
+  return null;
 }
 
 async function clickCandidate(page, candidate, { domClick = false } = {}) {
@@ -2213,12 +2317,28 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   const useNewApiCheckin = targetUsesConfiguredOrigins(target, config.newApiCheckinOrigins);
   const useExtendedDiscovery = targetUsesConfiguredOrigins(target, config.extendedDiscoveryOrigins);
   const destination = assertBookmarkNavigation(candidateUrl, allowedOrigins);
+  const destinationOrigin = new URL(destination).origin;
+  const destinationTerminalPath = getConfiguredPreCheckinTerminalPath(
+    destination,
+    target,
+    destinationOrigin,
+    config,
+  );
+  if (destinationTerminalPath) {
+    return {
+      status: "already_signed",
+      reason: `拒绝直接打开终止页面 ${destinationTerminalPath}，按站点规则停止重试`,
+      url: safeLogUrl(destination),
+    };
+  }
   await page.goto(destination, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
   if (useExtendedDiscovery) {
     await waitForExtendedDiscoveryContent(page, config);
   }
   let activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
   let activeOrigin = new URL(activeUrl).origin;
+  const initialTerminalResult = configuredPreCheckinTerminalResult(page, target, config);
+  if (initialTerminalResult) return initialTerminalResult;
   if (activeOrigin === "https://hdsky.me") {
     await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
     await sleep(500);
@@ -2250,7 +2370,16 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
     config,
     { hasCheckinAction: Boolean(directCheckinAction) },
   );
+  if (preCheckinNavigated?.terminalPath) {
+    return {
+      status: "already_signed",
+      reason: `站点进入终止页面 ${preCheckinNavigated.terminalPath}，停止后续签到重试`,
+      url: safeLogUrl(page.url()),
+    };
+  }
   ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+  const navigatedTerminalResult = configuredPreCheckinTerminalResult(page, target, config);
+  if (navigatedTerminalResult) return navigatedTerminalResult;
   if (preCheckinNavigated) {
     await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
     ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
@@ -2274,17 +2403,16 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   let pendingNewApiRetry = false;
   if (useNewApiCheckin) {
     initialApiResult = await tryNewApiCheckin(page);
-    if (initialApiResult && initialApiResult.status !== "not_available") {
+    if (initialApiResult?.status === "not_available") {
+      return { ...initialApiResult, reason: "站点签到接口确认未启用", url: safeLogUrl(page.url()) };
+    }
+    if (initialApiResult) {
       const challengeRule = getConfiguredChallengeInteractionRule(target, activeOrigin, config, "after");
       if (shouldUseConfiguredNewApiPageRetry(initialApiResult, challengeRule)) {
         pendingNewApiRetry = true;
       } else {
         return { ...initialApiResult, url: safeLogUrl(page.url()) };
       }
-    }
-    if (initialApiResult?.status === "not_available"
-      && (config.knownNoCheckinFeatureOrigins ?? []).includes(activeOrigin)) {
-      return { ...initialApiResult, reason: "站点签到接口确认未启用", url: safeLogUrl(page.url()) };
     }
   }
   let state = await runConfiguredChallengePhase(page, target, activeOrigin, config, "before")
@@ -2332,15 +2460,30 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   const qaResult = await tryQaFlow(page, qaRules, activeOrigin, config);
   if (qaResult) return { ...qaResult, url: safeLogUrl(page.url()) };
 
-  let action = await findCheckinAction(page, allowedOrigins);
+  let action = await waitForCheckinAction(page, allowedOrigins, config);
   if (!action && useExtendedDiscovery) {
     const discoveryUrls = await findCheckinDiscoveryUrls(page, activeOrigin);
     for (const discoveryUrl of discoveryUrls) {
       if (discoveryUrl === page.url()) continue;
+      const discoveryTerminalPath = getConfiguredPreCheckinTerminalPath(
+        discoveryUrl,
+        target,
+        new URL(discoveryUrl).origin,
+        config,
+      );
+      if (discoveryTerminalPath) {
+        return {
+          status: "already_signed",
+          reason: `拒绝直接打开终止页面 ${discoveryTerminalPath}，按站点规则停止重试`,
+          url: safeLogUrl(discoveryUrl),
+        };
+      }
       await page.goto(assertBookmarkNavigation(discoveryUrl, allowedOrigins), { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
       await waitForExtendedDiscoveryContent(page, config);
       activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
       activeOrigin = new URL(activeUrl).origin;
+      const discoveredTerminalResult = configuredPreCheckinTerminalResult(page, target, config);
+      if (discoveredTerminalResult) return discoveredTerminalResult;
       await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
       ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
       state = await waitForManagedChallenge(page, config);
@@ -2351,8 +2494,24 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
       if (state.status !== "ready") return { ...state, url: safeLogUrl(page.url()) };
       const discoveredCalendarResult = await tryCalendarDayCheckin(page, target, activeUrl, config);
       if (discoveredCalendarResult) return { ...discoveredCalendarResult, url: safeLogUrl(page.url()) };
-      action = await findCheckinAction(page, allowedOrigins);
+      action = await waitForCheckinAction(page, allowedOrigins, config);
       if (action) break;
+    }
+  }
+  if (!action) {
+    const settledState = await snapshotState(page);
+    if ([
+      "signed",
+      "already_signed",
+      "login_required",
+      "interactive_challenge",
+      "managed_challenge",
+      "managed_challenge_timeout",
+      "deferred",
+      "needs_attention",
+      "not_available",
+    ].includes(settledState.status)) {
+      return { ...settledState, url: safeLogUrl(page.url()) };
     }
   }
   if (action && shouldBlockManualChallengeAction(target, activeOrigin, config, state)) {
@@ -2372,9 +2531,26 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   }
   if (action) {
     const captchaDialogRule = getConfiguredCheckinCaptchaDialogRule(target, activeOrigin, config);
+    if (captchaDialogRule) {
+      const preActionCaptchaDialogResult = await tryConfiguredCheckinCaptchaDialog(
+        page,
+        target,
+        activeOrigin,
+        config,
+      );
+      if (preActionCaptchaDialogResult) {
+        return {
+          ...preActionCaptchaDialogResult,
+          action: action.text,
+          url: safeLogUrl(page.url()),
+        };
+      }
+    }
     await clickCandidate(page, action, { domClick: Boolean(captchaDialogRule) });
     activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
     activeOrigin = new URL(activeUrl).origin;
+    const actionTerminalResult = configuredPreCheckinTerminalResult(page, target, config);
+    if (actionTerminalResult) return { ...actionTerminalResult, action: action.text };
     const captchaDialogResult = await tryConfiguredCheckinCaptchaDialog(page, target, activeOrigin, config);
     if (captchaDialogResult) return { ...captchaDialogResult, action: action.text, url: safeLogUrl(page.url()) };
     const configuredAfterRule = getConfiguredChallengeInteractionRule(target, activeOrigin, config, "after");
@@ -2424,6 +2600,13 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
         retryActionText = retryAction.text;
         activeUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
         activeOrigin = new URL(activeUrl).origin;
+        const retryTerminalResult = configuredPreCheckinTerminalResult(page, target, config);
+        if (retryTerminalResult) {
+          return {
+            ...retryTerminalResult,
+            action: retryActionText,
+          };
+        }
         state = await runConfiguredChallengePhase(page, target, activeOrigin, config, "after");
         if (!state) {
           await sleep(config.actionWaitMs);

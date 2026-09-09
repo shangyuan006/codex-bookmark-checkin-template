@@ -381,6 +381,8 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
     login_challenge: "安全验证完成后仍未找到提供方按钮",
     provider_transition: "登录提供方跳转未完成",
     linuxdo_session: "LinuxDO 会话恢复未完成",
+    linuxdo_login_challenge: "LinuxDO 登录页 CF 真人验证未完成",
+    provider_session: "登录提供方保存会话恢复未完成",
     ["provider_authorization"]: "登录提供方授权未完成",
     target_callback: "登录回调未返回目标站",
     session_verification: "目标站权威会话验证未通过",
@@ -391,6 +393,10 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
   return detail
     ? `${normalized} 重新登录未完成（${detail}），需要人工处理`
     : `${normalized} 重新登录未完成，需要人工处理`;
+}
+
+export function shouldRetryOAuthFailureStage(oauthStage) {
+  return oauthStage !== "linuxdo_login_challenge";
 }
 
 function normalizeProviderLabel(value) {
@@ -729,6 +735,7 @@ async function retryOAuthOperation(rule, config, account, operation) {
       succeeded: false,
       oauthStage: preferOAuthFailureStage(latest.oauthStage, current.oauthStage),
     };
+    if (!shouldRetryOAuthFailureStage(current.oauthStage)) return current;
     if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
   }
   return latest;
@@ -742,6 +749,7 @@ async function runProviderOnlyWithRetry(rule, config, account) {
     () => runOAuthHelper(rule, config, account, ["--provider-only"]),
   );
   if (providerResult.succeeded) return providerResult;
+  if (!shouldRetryOAuthFailureStage(providerResult.oauthStage)) return providerResult;
   if (!await runNativeProviderSessionRefresh(config, account)) return providerResult;
   const refreshedResult = await runOAuthHelper(rule, config, account, ["--provider-only"]);
   return refreshedResult.succeeded ? refreshedResult : {
@@ -840,6 +848,34 @@ async function inspectCurrentLogin(config, rule) {
   }
 }
 
+export function classifyReauthSessionAfterOAuthFailure(currentLogin) {
+  if (currentLogin?.valid && currentLogin?.explicitLoginSuccess) {
+    return {
+      status: "already_signed",
+      reason: "OAuth 未完成，但同一隔离会话已确认目标站今日状态",
+    };
+  }
+  return null;
+}
+
+export async function inspectConfiguredReauthLogin(config, rule) {
+  return inspectCurrentLogin(config, rule);
+}
+
+async function confirmReauthSessionAfterOAuthFailure(config, rule, statePath, stateKey, date) {
+  let currentLogin;
+  try {
+    currentLogin = await inspectCurrentLogin(config, rule);
+  } catch {
+    return null;
+  }
+  const result = classifyReauthSessionAfterOAuthFailure(currentLogin);
+  if (!result) return null;
+  const refreshed = await readState(statePath);
+  await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));
+  return result;
+}
+
 export async function runConfiguredReauthCheckinForAccount(target, config, account, options = {}) {
   const rule = account;
   if (!rule) return null;
@@ -890,6 +926,14 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
         ? await runAgentRouterOnlyWithRetry(rule, accountConfig, rule)
         : await runPrivateOAuthWithRetry(rule, accountConfig, rule);
       if (!oauthResult.succeeded) {
+        const confirmed = await confirmReauthSessionAfterOAuthFailure(
+          accountConfig,
+          rule,
+          statePath,
+          stateKey,
+          date,
+        );
+        if (confirmed) return confirmed;
         return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider, oauthResult.oauthStage) };
       }
       currentLogin = await inspectCurrentLogin(accountConfig, rule);
@@ -970,6 +1014,14 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     ? await runAgentRouterOnlyWithRetry(rule, accountConfig, rule)
     : await runPrivateOAuthWithRetry(rule, accountConfig, rule);
   if (!oauthResult.succeeded) {
+    const confirmed = await confirmReauthSessionAfterOAuthFailure(
+      accountConfig,
+      rule,
+      statePath,
+      stateKey,
+      date,
+    );
+    if (confirmed) return confirmed;
     return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider, oauthResult.oauthStage) };
   }
 

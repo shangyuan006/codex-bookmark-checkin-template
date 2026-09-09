@@ -20,6 +20,10 @@ test("登录助手必须明确返回 logged_in 才算成功", () => {
     "linuxdo_session",
   );
   assert.equal(
+    loginHelperOutcome('{"status":"needs_attention","oauthStage":"linuxdo_login_challenge"}').oauthStage,
+    "linuxdo_login_challenge",
+  );
+  assert.equal(
     loginHelperOutcome('{"status":"needs_attention","oauthStage":"login_challenge"}').oauthStage,
     "login_challenge",
   );
@@ -149,8 +153,18 @@ test("恢复调度只复用清理后的登录 URL 并解析助手状态", async 
 test("OAuth helper exposes only fixed diagnostic stages", async () => {
   const source = await fs.readFile(new URL("../src/oauth-login.mjs", import.meta.url), "utf8");
   assert.match(source, /setOAuthStage\("provider_transition"\)/);
+  assert.match(source, /context\.waitForEvent\("page"/);
+  assert.match(source, /waitForUsableHttpsPage/);
+  assert.match(source, /isLinuxDoSsoProviderPage/);
+  assert.match(source, /waitForLinuxDoSsoTransition/);
+  assert.match(source, /--experimental-sso-frame-click/);
+  assert.match(source, /allowFrameCoordinateFallback: allowLinuxDoSsoFrameClick/);
+  assert.match(source, /frameStableMs: ssoChallengeRule\.frameStableMs/);
+  assert.match(source, /experimentalSsoChallengeOutcome/);
   assert.match(source, /setOAuthStage\("login_challenge"\)/);
   assert.match(source, /setOAuthStage\("linuxdo_session"\)/);
+  assert.match(source, /setOAuthStage\("linuxdo_login_challenge"\)/);
+  assert.match(source, /shouldRetryLinuxDoLoginRecovery\(recovery\)/);
   assert.match(source, /probeProviderSessionInContext\(\s*context,[\s\S]*?session\/current\.json/);
   assert.match(source, /if \(initialSession !== "invalid"\) return false/);
   assert.doesNotMatch(source, /page\.goto\("https:\/\/linux\.do\/session\/current\.json"/);

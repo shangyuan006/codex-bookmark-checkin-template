@@ -24,6 +24,32 @@ export async function waitForFirstTransition(candidates) {
   });
 }
 
+export async function waitForUsableHttpsPage(page, {
+  timeoutMs = 20_000,
+  pollMs = 100,
+} = {}) {
+  if (!page || typeof page.url !== "function") return null;
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  const interval = Math.max(10, Number(pollMs) || 100);
+
+  do {
+    if (page.isClosed?.()) return null;
+    try {
+      const location = new URL(page.url());
+      if (location.protocol === "https:") return page;
+    } catch {
+      // A newly-created page can temporarily have no parseable URL.
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(
+      resolve,
+      Math.min(interval, Math.max(0, deadline - Date.now())),
+    ));
+  } while (true);
+
+  return null;
+}
+
 function pageOrigin(page) {
   try {
     return new URL(page.url()).origin;

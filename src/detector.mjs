@@ -1,5 +1,5 @@
 const CHECKIN_EXACT = new Set([
-  "签到", "簽到", "立即签到", "立即簽到", "每日签到", "每日簽到",
+  "签到", "簽到", "立即签到", "立即簽到", "每日签到", "每日簽到", "提交签到", "提交簽到",
   "今日签到", "今日簽到", "去签到", "去簽到", "打卡", "立即打卡",
   "福利站", "check in", "check-in", "daily check in", "daily check-in", "attendance",
   "开始转动", "開始轉動", "转动转盘", "轉動轉盤",
@@ -61,6 +61,9 @@ export function classifyPageText({
   if (/(?:使用|用)\s*linux\s*do\s*(?:账号|帳號)?\s*(?:登录|登入)|use\s+linux\s*do\s+to\s+(?:log|sign)\s*in/i.test(text)) {
     return { status: "login_required", reason: "页面要求通过 Linux DO 登录" };
   }
+  if (/(?:异地登录安全验证|異地登錄安全驗證|忘记二级验证|忘記二級驗證|二级验证代码|二級驗證碼|\b2fa\b)/i.test(text)) {
+    return { status: "login_required", reason: "站点要求完成异地登录 2FA 验证" };
+  }
 
   if (/(操作过于频繁|操作過於頻繁|请求过于频繁|請求過於頻繁|too many requests|rate limit|try again later|请稍后再试|請稍後再試)/i.test(text)) {
     return { status: "deferred", retryCause: "rate_limit", reason: "站点触发频率限制，请稍后重试" };
@@ -81,6 +84,10 @@ export function classifyPageText({
   }
   if (/(?:正在|仍在|请稍候)?\s*(?:加载|加載)\s*(?:每日)?\s*(?:签到|簽到)(?:状态|狀態)?|(?:签到|簽到)(?:状态|狀態)?\s*(?:正在)?\s*(?:加载|加載)(?:中)?/i.test(text)) {
     return { status: "unconfirmed", reason: "签到状态仍在加载" };
+  }
+  const unavailableCheckinPattern = /(?:签到|簽到)(?:功能|服务|服務)?\s*(?:当前|當前|暂时|暫時|临时|臨時)?\s*(?:已)?\s*(?:关闭|關閉|暂停|暫停|停用|下线|下線|未开放|未開放|未开启|未開啟)|(?:已|当前|當前|暂时|暫時|临时|臨時)?\s*(?:关闭|關閉|暂停|暫停|停用)\s*(?:每日)?\s*(?:签到|簽到)(?:功能|服务|服務)?(?!弹窗|彈窗|窗口|页面|頁面|公告|提示)|(?:daily\s+)?check[ -]?in\s+(?:is\s+)?(?:temporarily\s+)?(?:disabled|unavailable|closed)/i;
+  if (unavailableCheckinPattern.test(text)) {
+    return { status: "not_available", reason: "页面明确显示当前未开放签到" };
   }
   if (explicitlyUnsigned) {
     return { status: "ready", reason: "页面明确显示尚未签到" };

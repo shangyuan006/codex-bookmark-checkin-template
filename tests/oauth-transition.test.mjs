@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { waitForFirstTransition, waitForOriginPage } from "../src/oauth-transition.mjs";
+import {
+  waitForFirstTransition,
+  waitForOriginPage,
+  waitForUsableHttpsPage,
+} from "../src/oauth-transition.mjs";
 
 function deferred() {
   let resolve;
@@ -41,6 +45,28 @@ test("OAuth transition returns null only after every candidate fails", async () 
     Promise.reject(new Error("navigation timeout")),
   ]), null);
   assert.equal(await waitForFirstTransition([]), null);
+});
+
+test("OAuth transition waits for a newly-created about:blank page to become HTTPS", async () => {
+  let url = "about:blank";
+  const page = {
+    url: () => url,
+    isClosed: () => false,
+  };
+  setTimeout(() => { url = "https://linux.do/session/sso_provider"; }, 10);
+
+  assert.equal(await waitForUsableHttpsPage(page, { timeoutMs: 200, pollMs: 5 }), page);
+});
+
+test("OAuth transition rejects closed or non-HTTPS pages", async () => {
+  assert.equal(await waitForUsableHttpsPage({
+    url: () => "about:blank",
+    isClosed: () => true,
+  }), null);
+  assert.equal(await waitForUsableHttpsPage({
+    url: () => "http://linux.do/session/sso_provider",
+    isClosed: () => false,
+  }, { timeoutMs: 10, pollMs: 5 }), null);
 });
 
 test("OAuth callback can return in another page while the provider popup remains open", async () => {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   chooseAlphanumericCaptchaRecognition,
   correctCaptchaConfusions,
+  isReliableOpenCdCaptchaRecognition,
   isReliableSegmentedCaptchaRecognition,
   mergeFragmentedGlyphs,
   selectSegmentedGlyphRecognition,
@@ -41,6 +42,13 @@ test("修正 HDSky 块状字体的 B/E 与 D/0 混淆", () => {
 test("不修改普通六位验证码", () => {
   const glyphs = Array.from({ length: 6 }, () => glyph(8, 10, 0.8));
   assert.equal(correctCaptchaConfusions("PH16FG", glyphs), "PH16FG");
+});
+
+test("OpenCD 六位验证码低置信度时拒绝提交", () => {
+  assert.equal(isReliableOpenCdCaptchaRecognition("ABC123", 55), true);
+  assert.equal(isReliableOpenCdCaptchaRecognition("ABC123", 54.99), false);
+  assert.equal(isReliableOpenCdCaptchaRecognition("ABC12", 99), false);
+  assert.equal(isReliableOpenCdCaptchaRecognition(null, 99), false);
 });
 
 test("通用验证码只选择长度合规且置信度最高的字母数字结果", () => {

@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   buildReauthStateEntry,
   classifyQuotaIncrease,
+  classifyReauthSessionAfterOAuthFailure,
   configuredProviderIsExplicitlyUnavailable,
   aggregateReauthResults,
   getConfiguredReauthAccounts,
@@ -17,6 +18,7 @@ import {
   reauthLoginFailureReason,
   runConfiguredReauthCheckin,
   selectConfiguredReauthAccount,
+  shouldRetryOAuthFailureStage,
   shouldReuseCompletedReauthState,
   valueAtFieldPath,
   withReauthAccountMetadata,
@@ -41,6 +43,7 @@ test("forced reauth CLI remains restricted to one explicit Agent Router account"
   assert.match(runner, /\[switch\]\$ForceReauth/);
   assert.match(runner, /\$ForceReauth -and -not \$ReauthAccountKey/);
   assert.match(runner, /if \(\$ForceReauth\) \{ \$arguments \+= '--force-reauth' \}/);
+  assert.match(entrypoint, /reauthAccountKey\s*\? "1 selected account"/);
 });
 
 const target = {
@@ -131,6 +134,10 @@ test("重认证保留配置的 OAuth 提供方并在失败时据实说明", () =
     reauthLoginFailureReason(githubRule.provider, "login_challenge"),
     "GitHub 重新登录未完成（安全验证完成后仍未找到提供方按钮），需要人工处理",
   );
+  assert.equal(
+    reauthLoginFailureReason("LinuxDO", "linuxdo_login_challenge"),
+    "LinuxDO 重新登录未完成（LinuxDO 登录页 CF 真人验证未完成），需要人工处理",
+  );
   assert.doesNotMatch(reauthLoginFailureReason(githubRule.provider, "private-page-text"), /private-page-text/);
 });
 
@@ -138,6 +145,31 @@ test("OAuth retries retain a specific stage over a later generic helper failure"
   assert.equal(preferOAuthFailureStage("linuxdo_session", "helper_failed"), "linuxdo_session");
   assert.equal(preferOAuthFailureStage("provider_button", "target_callback"), "target_callback");
   assert.equal(preferOAuthFailureStage(null, "helper_failed"), "helper_failed");
+});
+
+test("OAuth failure short-circuits only when the isolated target session has explicit completion evidence", () => {
+  assert.deepEqual(classifyReauthSessionAfterOAuthFailure({ valid: true, explicitLoginSuccess: true }), {
+    status: "already_signed",
+    reason: "OAuth 未完成，但同一隔离会话已确认目标站今日状态",
+  });
+  assert.equal(classifyReauthSessionAfterOAuthFailure({ valid: true, explicitLoginSuccess: false }), null);
+  assert.equal(classifyReauthSessionAfterOAuthFailure({ valid: false, explicitLoginSuccess: true }), null);
+});
+
+test("LinuxDO login-page CF stops account-level OAuth retries", async () => {
+  assert.equal(shouldRetryOAuthFailureStage("linuxdo_login_challenge"), false);
+  assert.equal(shouldRetryOAuthFailureStage("linuxdo_session"), true);
+
+  const source = await fs.readFile(new URL("../src/reauth-checkin.mjs", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /if \(!shouldRetryOAuthFailureStage\(current\.oauthStage\)\) return current/,
+  );
+  assert.match(
+    source,
+    /if \(!shouldRetryOAuthFailureStage\(providerResult\.oauthStage\)\) return providerResult;[\s\S]*?runNativeProviderSessionRefresh/,
+  );
+  assert.match(source, /if \(!oauthResult\.succeeded\) \{[\s\S]*?confirmReauthSessionAfterOAuthFailure/);
 });
 
 test("退出前只在登录页明确展示冲突提供方时阻止重认证", () => {

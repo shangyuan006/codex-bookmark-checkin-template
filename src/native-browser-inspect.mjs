@@ -25,7 +25,12 @@ const encodedActionRule = process.argv[6] || "";
 const actionRule = executeCheckin
   ? normalizeNativeCheckinActionRule(JSON.parse(Buffer.from(encodedActionRule, "base64").toString("utf8")))
   : null;
-const retryableChallengeOutcomes = new Set(["pending", "challenge_not_found", "challenge_click_failed"]);
+const retryableChallengeOutcomes = new Set([
+  "pending",
+  "challenge_not_found",
+  "challenge_click_failed",
+  "challenge_frame_not_stable",
+]);
 if (!Number.isInteger(port) || port <= 0) {
   throw new Error("usage: node src/native-browser-inspect.mjs <port> <origin> [max-wait-seconds] [mode] [action-rule-base64]");
 }

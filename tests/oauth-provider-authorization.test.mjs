@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   authorizeConfiguredOAuthProvider,
+  configuredProviderAuthorizationOrigin,
   describeConfiguredAuthorizationSurface,
   isConfiguredProviderAuthorizationPage,
   selectLinuxDoAuthorizationControlIndex,
@@ -76,6 +77,18 @@ test("LinuxDO authorization is restricted to its exact HTTPS Connect page", () =
     "http://connect.linux.do/oauth2/authorize",
     "LinuxDO",
   ), false);
+  assert.equal(configuredProviderAuthorizationOrigin(
+    "https://connect.linux.do/oauth2/authorize?client_id=public",
+    "LinuxDO",
+  ), "https://connect.linux.do");
+  assert.equal(configuredProviderAuthorizationOrigin(
+    "https://connect.linux.do/oauth2/token",
+    "LinuxDO",
+  ), null);
+  assert.equal(configuredProviderAuthorizationOrigin(
+    "https://connect.linux.do/oauth2/authorize",
+    "GitHub",
+  ), null);
 });
 
 test("LinuxDO OAuth selects one allow action and rejects deny or ambiguity", async () => {
@@ -122,6 +135,19 @@ test("LinuxDO OAuth selects one allow action and rejects deny or ambiguity", asy
     outcome: "authorization_clicked",
   });
   assert.equal(exactConfirm.clicks(), 1);
+
+  const exactAllow = page(
+    "https://connect.linux.do/oauth2/authorize?client_id=public",
+    0,
+    [],
+    { "允许": 1 },
+  );
+  assert.deepEqual(await authorizeConfiguredOAuthProvider(exactAllow, "LinuxDO"), {
+    applicable: true,
+    clicked: true,
+    outcome: "authorization_clicked",
+  });
+  assert.equal(exactAllow.clicks(), 1);
 
   const exactTraditionalConfirm = page(
     "https://connect.linux.do/oauth2/authorize?client_id=public",

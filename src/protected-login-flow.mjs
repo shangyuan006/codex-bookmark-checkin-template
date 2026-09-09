@@ -1,6 +1,6 @@
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
 
-const challengeClickedPages = new WeakSet();
+const challengeClickState = new WeakMap();
 
 function normalizedHttpsOrigin(value) {
   try {
@@ -33,7 +33,16 @@ async function visibleUnique(locator) {
     && await locator.isVisible().catch(() => false);
 }
 
-async function clickKnownChallengeControl(page, timeout, expectedOrigin) {
+function loginChallengeRule(config, expectedOrigin) {
+  const raw = config?.challengeInteractionRules?.[expectedOrigin] ?? {};
+  return {
+    frameStableMs: boundedMilliseconds(raw.frameStableMs, 4000, 3000, 5000),
+    maxClicks: Math.trunc(boundedMilliseconds(raw.loginMaxClicks, 1, 1, 2)),
+    retryDelayMs: boundedMilliseconds(raw.loginRetryDelayMs, 5000, 3000, 15000),
+  };
+}
+
+async function clickKnownChallengeControl(page, timeout, expectedOrigin, rule) {
   const capButton = page.getByRole("button", { name: /确认.*真人|真人.*确认/ });
   if (await visibleUnique(capButton)) {
     return capButton.click({ timeout }).then(() => true).catch(() => false);
@@ -47,6 +56,7 @@ async function clickKnownChallengeControl(page, timeout, expectedOrigin) {
   const challenge = await clickVisibleNativeChallengeControl(page, expectedOrigin, {
     actionTexts: ["__login_challenge_only__"],
     clickChallenge: true,
+    challengeFrameStableMs: rule.frameStableMs,
   }).catch(() => ({ clicked: false }));
   return challenge.clicked === true;
 }
@@ -60,9 +70,17 @@ export async function clickConfiguredLoginChallengeControl(page, origin, config 
   const clickTimeoutMs = Number.isFinite(Number(timeoutMs))
     ? Math.max(1, Math.min(configuredTimeoutMs, Number(timeoutMs)))
     : configuredTimeoutMs;
-  if (challengeClickedPages.has(page)) return false;
-  const clicked = await clickKnownChallengeControl(page, clickTimeoutMs, expectedOrigin);
-  if (clicked) challengeClickedPages.add(page);
+  const rule = loginChallengeRule(config, expectedOrigin);
+  const previous = challengeClickState.get(page) ?? { clicks: 0, clickedAt: 0 };
+  if (previous.clicks >= rule.maxClicks
+    || (previous.clickedAt > 0 && Date.now() - previous.clickedAt < rule.retryDelayMs)) return false;
+  const clicked = await clickKnownChallengeControl(page, clickTimeoutMs, expectedOrigin, rule);
+  if (clicked) {
+    challengeClickState.set(page, {
+      clicks: previous.clicks + 1,
+      clickedAt: Date.now(),
+    });
+  }
   return clicked;
 }
 

@@ -22,7 +22,10 @@ if ([string]$account.provider -eq 'LinuxDO' -and [string]$state.stage -ne 'agent
 $powershell = Resolve-AgentRouterPowerShellExecutable
 $runScript = Join-Path $PSScriptRoot 'Run-Checkin.ps1'
 & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runScript `
-    -ReauthAccountKey $requestedAccountKey -SuppressReport
+    -ReauthAccountKey $requestedAccountKey `
+    -PostOAuthVerify `
+    -Attempts 1 `
+    -SuppressReport
 $checkinExitCode = $LASTEXITCODE
 if ($checkinExitCode -eq 2) {
     Write-Warning "The account login was closed safely, but today's complete report still has unresolved results."

@@ -91,6 +91,10 @@ export function correctCaptchaConfusions(rawCode, glyphs) {
   return characters.join("");
 }
 
+export function isReliableOpenCdCaptchaRecognition(code, confidence) {
+  return /^[A-Z0-9]{6}$/.test(String(code ?? "")) && Number(confidence) >= 55;
+}
+
 async function prepareOpenCdCaptcha(input) {
   const source = sharp(input).removeAlpha();
   const metadata = await source.metadata();
@@ -666,7 +670,7 @@ export async function recognizeOpenCdCaptcha(input) {
     const glyphs = prepared.components
       .filter((component) => component.height >= prepared.height * 0.22 && component.width >= 2)
       .sort((left, right) => left.minX - right.minX);
-    if (wholeCode.length === 6) {
+    if (isReliableOpenCdCaptchaRecognition(wholeCode, result.data.confidence)) {
       return {
         code: correctCaptchaConfusions(wholeCode, glyphs),
         rawCode: wholeCode,
@@ -691,7 +695,8 @@ export async function recognizeOpenCdCaptcha(input) {
           .map((item) => ({ item, overlap: Math.max(0, Math.min(right, item.right) - Math.max(left, item.left)) }))
           .sort((a, b) => b.overlap - a.overlap)[0];
       });
-      if (boxMapped.every((mapping) => mapping?.overlap >= 3)) {
+      if (isReliableOpenCdCaptchaRecognition(boxMapped.map((mapping) => mapping?.item?.character ?? "").join(""), result.data.confidence)
+        && boxMapped.every((mapping) => mapping?.overlap >= 3)) {
         const mappedCode = boxMapped.map((mapping) => mapping.item.character).join("");
         return {
           code: correctCaptchaConfusions(mappedCode, glyphs),
@@ -719,18 +724,22 @@ export async function recognizeOpenCdCaptcha(input) {
         }).extend({ top: 24, bottom: 24, left: 24, right: 24, background: "white" }).png().toBuffer();
         const characterResult = await worker.recognize(characterImage);
         const character = String(characterResult.data.text || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-        if (character.length !== 1) return { code: wholeCode, confidence: result.data.confidence, processed };
+        if (character.length !== 1) return { code: null, rawCode: wholeCode, confidence: result.data.confidence, processed };
         characters.push(character);
         confidences.push(characterResult.data.confidence);
       }
       const characterCode = characters.join("");
+      const confidence = confidences.reduce((sum, value) => sum + value, 0) / confidences.length;
       return {
-        code: correctCaptchaConfusions(characterCode, glyphs),
-        confidence: confidences.reduce((sum, value) => sum + value, 0) / confidences.length,
+        code: isReliableOpenCdCaptchaRecognition(characterCode, confidence)
+          ? correctCaptchaConfusions(characterCode, glyphs)
+          : null,
+        rawCode: characterCode,
+        confidence,
         processed,
       };
     }
-    return { code: wholeCode, confidence: result.data.confidence, processed };
+    return { code: null, rawCode: wholeCode, confidence: result.data.confidence, processed };
   } finally {
     await worker.terminate();
   }

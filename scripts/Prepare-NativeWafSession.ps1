@@ -9,7 +9,22 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
-$profilePath = [string]$config.automationUserDataDir
+$defaultProfilePath = [System.IO.Path]::GetFullPath([string]$config.automationUserDataDir)
+$allowedDataRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'data'))
+$allowedDataPrefix = $allowedDataRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+function Resolve-NativeProfilePath([string]$ConfiguredPath) {
+    $candidate = if ([string]::IsNullOrWhiteSpace($ConfiguredPath)) {
+        $defaultProfilePath
+    } elseif ([System.IO.Path]::IsPathRooted($ConfiguredPath)) {
+        [System.IO.Path]::GetFullPath($ConfiguredPath)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $root $ConfiguredPath))
+    }
+    if (-not $candidate.StartsWith($allowedDataPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "原生 WAF profile 必须位于项目 data 目录。"
+    }
+    return $candidate
+}
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 $node = Resolve-CheckinNode $config
 $browser = Resolve-CheckinBrowser $config
@@ -19,15 +34,19 @@ $items = @($config.nativeWafPreflightUrls | ForEach-Object {
     $uri = [uri]$rawUrl
     $waitSeconds = if ($_ -is [string] -or $null -eq $_.waitSeconds) { 30 } else { [int]$_.waitSeconds }
     $passiveOnly = $_ -isnot [string] -and [bool]$_.passiveOnly
+    $trustAsSigned = $_ -isnot [string] -and $null -ne $_.trustAsSigned -and [bool]$_.trustAsSigned
+    $profileConfigured = $_ -isnot [string] -and -not [string]::IsNullOrWhiteSpace([string]$_.automationUserDataDir)
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "原生 WAF 预热地址无效：$rawUrl" }
     if ($waitSeconds -lt 5 -or $waitSeconds -gt 120) { throw "原生 WAF 等待时间必须为 5 到 120 秒：$rawUrl" }
     [pscustomobject]@{
         url = $uri.AbsoluteUri
         waitSeconds = $waitSeconds
-        trustAsSigned = $true
+        trustAsSigned = $trustAsSigned
         passiveOnly = $passiveOnly
         action = $null
         newApiCheckin = $false
+        profilePath = Resolve-NativeProfilePath $(if ($profileConfigured) { [string]$_.automationUserDataDir } else { '' })
+        profileConfigured = $profileConfigured
     }
 })
 $items += @($config.nativeChallengePreflight | ForEach-Object {
@@ -63,6 +82,8 @@ $items += @($config.nativeChallengePreflight | ForEach-Object {
         passiveOnly = $passiveOnly
         action = $action
         newApiCheckin = $newApiCheckin
+        profilePath = Resolve-NativeProfilePath ([string]$_.automationUserDataDir)
+        profileConfigured = -not [string]::IsNullOrWhiteSpace([string]$_.automationUserDataDir)
     }
 })
 
@@ -78,18 +99,40 @@ $items = @($items | Where-Object { $originSet.ContainsKey(([uri]$_.url).GetLeftP
 
 if ($items.Count -eq 0) { return }
 
-function Get-AutomationBrowserProcesses {
-    @(Get-CheckinAutomationBrowserProcesses $config)
+$reservedProfilePaths = @($config.agentrouterAccounts | ForEach-Object {
+    if (-not [string]::IsNullOrWhiteSpace([string]$_.automationUserDataDir)) {
+        Resolve-NativeProfilePath ([string]$_.automationUserDataDir)
+    }
+})
+$profileOwners = @{}
+foreach ($item in @($items | Where-Object { [bool]$_.profileConfigured })) {
+    $profilePath = [string]$item.profilePath
+    $itemOrigin = ([uri][string]$item.url).GetLeftPart([System.UriPartial]::Authority)
+    if ($profilePath.Equals($defaultProfilePath, [System.StringComparison]::OrdinalIgnoreCase) `
+        -or @($reservedProfilePaths | Where-Object { $_.Equals($profilePath, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
+        throw "原生 WAF 独立 profile 与全局或 Agent Router profile 冲突：$itemOrigin"
+    }
+    $profileKey = $profilePath.ToLowerInvariant()
+    if ($profileOwners.ContainsKey($profileKey) -and [string]$profileOwners[$profileKey] -ne $itemOrigin) {
+        throw "不同站点不能共享同一个原生 WAF 独立 profile：$itemOrigin"
+    }
+    $profileOwners[$profileKey] = $itemOrigin
 }
 
-if ((Get-AutomationBrowserProcesses).Count -gt 0) {
-    throw "机器人专用 $($browser.DisplayName) 配置正被占用，无法执行原生 WAF 预热。"
+function Get-AutomationBrowserProcesses([string]$ProfilePath) {
+    @(Get-CheckinProfileBrowserProcesses -Config $config -ProfilePath $ProfilePath)
+}
+
+foreach ($configuredProfile in @($items.profilePath | Select-Object -Unique)) {
+    if ((Get-AutomationBrowserProcesses ([string]$configuredProfile)).Count -gt 0) {
+        throw "机器人专用 $($browser.DisplayName) 配置正被占用，无法执行原生 WAF 预热。"
+    }
 }
 
 $preflightResults = @()
 
-function Close-AutomationBrowser {
-    $targets = @(Get-AutomationBrowserProcesses)
+function Close-AutomationBrowser([string]$ProfilePath) {
+    $targets = @(Get-AutomationBrowserProcesses $ProfilePath)
     $targetIds = @($targets.ProcessId)
     $roots = @($targets | Where-Object { $targetIds -notcontains $_.ParentProcessId })
     foreach ($processInfo in $roots) {
@@ -100,7 +143,7 @@ function Close-AutomationBrowser {
     $closeDeadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 500
-        $remaining = @(Get-AutomationBrowserProcesses)
+        $remaining = @(Get-AutomationBrowserProcesses $ProfilePath)
     } while ($remaining.Count -gt 0 -and (Get-Date) -lt $closeDeadline)
     if ($remaining.Count -gt 0) { throw '原生 WAF 预热窗口未能正常退出。' }
 }
@@ -108,6 +151,7 @@ function Close-AutomationBrowser {
 # Chromium 浏览器会节流离屏的非活动标签页，因此逐站打开并正常关闭，确保每个
 # 雷池通行 Cookie 都在独立配置中完成落盘。
 foreach ($item in $items) {
+    $profilePath = [string]$item.profilePath
     $url = [string]$item.url
     $origin = ([uri]$url).GetLeftPart([System.UriPartial]::Authority)
     $hostName = ([uri]$url).Host
@@ -117,18 +161,18 @@ foreach ($item in $items) {
         try {
             # 被动模式只启动真实有头浏览器，不开放调试端口，也不连接 CDP。
             # 等待本身不是签到成功证据，因此这里只能报告 prepared/unconfirmed。
-            & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -NativeMinimal -Urls @($url)
+            & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -NativeMinimal -UserDataDirOverride $profilePath -Urls @($url)
             Start-Sleep -Seconds 2
-            if ((Get-AutomationBrowserProcesses).Count -gt 0) {
+            if ((Get-AutomationBrowserProcesses $profilePath).Count -gt 0) {
                 Start-Sleep -Seconds ([int]$item.waitSeconds)
-                $passivePrepared = (Get-AutomationBrowserProcesses).Count -gt 0
+                $passivePrepared = (Get-AutomationBrowserProcesses $profilePath).Count -gt 0
             }
         }
         catch {
             $passivePrepared = $false
         }
         finally {
-            if ((Get-AutomationBrowserProcesses).Count -gt 0) { Close-AutomationBrowser }
+            if ((Get-AutomationBrowserProcesses $profilePath).Count -gt 0) { Close-AutomationBrowser $profilePath }
         }
 
         if (-not $passivePrepared) {
@@ -160,7 +204,7 @@ foreach ($item in $items) {
     else { '' }
     for ($inspectionAttempt = 1; $inspectionAttempt -le 2 -and $null -eq $inspection; $inspectionAttempt++) {
         $debugPort = Get-Random -Minimum 12000 -Maximum 32000
-        & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -RemoteDebuggingPort $debugPort -Urls @($url)
+        & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -RemoteDebuggingPort $debugPort -UserDataDirOverride $profilePath -Urls @($url)
         Start-Sleep -Seconds 2
         try {
             $inspectionText = & $node $inspector $debugPort $origin ([int]$item.waitSeconds) $inspectionMode $actionConfigBase64 2>$null
@@ -177,7 +221,7 @@ foreach ($item in $items) {
             }
         }
         catch { $inspection = $null }
-        Close-AutomationBrowser
+        Close-AutomationBrowser $profilePath
         if ($null -eq $inspection -and $inspectionAttempt -lt 2) { Start-Sleep -Seconds 1 }
     }
     $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed') `
@@ -215,6 +259,8 @@ foreach ($item in $items) {
             '原生签到发现多个 Cloudflare 验证控件，已拒绝点击'
         } elseif ($hasAction -and [string]$reportedInspection.challengeOutcome -eq 'challenge_click_failed') {
             '原生签到未能点击唯一的 Cloudflare 验证控件'
+        } elseif ($hasAction -and [string]$reportedInspection.challengeOutcome -eq 'challenge_frame_not_stable') {
+            '原生签到等待 Cloudflare 验证框稳定后仍无法安全点击'
         } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'confirmation_timeout') {
             '原生签到点击后在有限等待内未确认成功'
         } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'not_attempted') {

@@ -15,6 +15,8 @@ const OAUTH_DIAGNOSTIC_STAGES = new Set([
   "login_challenge",
   "provider_transition",
   "linuxdo_session",
+  "linuxdo_login_challenge",
+  "provider_session",
   "provider_authorization",
   "target_callback",
   "session_verification",

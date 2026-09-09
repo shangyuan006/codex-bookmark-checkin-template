@@ -256,7 +256,10 @@ try {
     for (let index = 0; index < configuredReauthTargets.length; index += 1) {
       const target = configuredReauthTargets[index];
       const accountCount = getConfiguredReauthAccounts(target, config).length;
-      console.log(`[reauth ${index + 1}/${configuredReauthTargets.length}] ${target.origin} (${accountCount} isolated accounts)`);
+      const accountScope = reauthAccountKey
+        ? "1 selected account"
+        : `${accountCount} isolated accounts`;
+      console.log(`[reauth ${index + 1}/${configuredReauthTargets.length}] ${target.origin} (${accountScope})`);
       try {
         const startedAt = Date.now();
         const runOptions = reauthAccountKey

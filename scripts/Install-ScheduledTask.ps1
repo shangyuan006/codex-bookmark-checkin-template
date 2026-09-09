@@ -51,10 +51,19 @@ try {
     if ($null -eq $registeredTask) { throw '计划任务注册后无法读取。' }
 }
 catch {
+    $registrationError = $_.Exception.Message
     if (-not $AllowUserSchedulerFallback) {
-        throw "当前权限无法注册 Windows 计划任务。用户明确接受回退方案后，使用 -AllowUserSchedulerFallback 重试。原因：$($_.Exception.Message)"
+        throw "当前权限无法注册 Windows 计划任务。用户明确接受回退方案后，使用 -AllowUserSchedulerFallback 重试。原因：$registrationError"
     }
-    Write-Warning "当前权限无法注册 Windows 计划任务，回退到已获用户同意的隐藏调度器：$($_.Exception.Message)"
+    try {
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            Disable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
+        }
+    }
+    catch {
+        Write-Warning "无法停用旧的 Windows 计划任务，将由运行锁阻止重复签到：$($_.Exception.Message)"
+    }
+    Write-Warning "当前权限无法注册 Windows 计划任务，回退到已获用户同意的隐藏调度器：$registrationError"
     & (Join-Path $PSScriptRoot 'Install-UserScheduler.ps1')
     return
 }
@@ -63,8 +72,36 @@ catch {
 # only one owner of the daily run so no duplicate browser/profile access occurs.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runKeyName = if ($config.schedulerRunKeyName) { [string]$config.schedulerRunKeyName } else { 'CodexBookmarkDailyCheckin' }
-Remove-ItemProperty -Path $runKey -Name $runKeyName -ErrorAction SilentlyContinue
-$schedulerScripts = @($schedulerScript, (Join-Path $PSScriptRoot 'Ensure-UserScheduler.ps1'))
+$watchdogScript = Join-Path $PSScriptRoot 'Ensure-UserScheduler.ps1'
+$schedulerScripts = @($schedulerScript, $watchdogScript)
+$legacyRunNames = @($runKeyName, 'CodexBookmarkDailyCheckin', 'ChromeDailyCheckin') | Sort-Object -Unique
+$shortcutShell = try { New-Object -ComObject WScript.Shell } catch { $null }
+foreach ($legacyName in $legacyRunNames) {
+    $legacyRunValue = $null
+    try {
+        $runProperties = Get-ItemProperty -Path $runKey -ErrorAction Stop
+        $property = $runProperties.PSObject.Properties[$legacyName]
+        if ($property) { $legacyRunValue = [string]$property.Value }
+    } catch { $legacyRunValue = $null }
+    $ownsRunValue = $legacyRunValue -and @($schedulerScripts | Where-Object {
+        $legacyRunValue.IndexOf($_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    }).Count -gt 0
+    if ($ownsRunValue) {
+        Remove-ItemProperty -Path $runKey -Name $legacyName -ErrorAction SilentlyContinue
+    }
+
+    $shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) "$legacyName.lnk"
+    if ($shortcutShell -and (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
+        $shortcut = $shortcutShell.CreateShortcut($shortcutPath)
+        $shortcutCommand = "$([string]$shortcut.TargetPath) $([string]$shortcut.Arguments)"
+        $ownsShortcut = @($schedulerScripts | Where-Object {
+            $shortcutCommand.IndexOf($_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        }).Count -gt 0
+        if ($ownsShortcut) {
+            Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 Get-CimInstance Win32_Process | Where-Object {
     $commandLine = [string]$_.CommandLine
     $_.Name -in @('pwsh.exe', 'powershell.exe') -and @($schedulerScripts | Where-Object { $commandLine -like "*-File*$_*" }).Count -gt 0

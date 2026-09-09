@@ -42,8 +42,8 @@
     "https://anyrouter.top": { "after": "08:00" }
   },
   "nativeWafPreflightUrls": [
-    { "url": "https://piggo.me/attendance.php", "waitSeconds": 35 },
-    { "url": "https://www.hdkyl.in/attendance.php", "waitSeconds": 15 }
+    { "url": "https://piggo.me/attendance.php", "waitSeconds": 35, "trustAsSigned": false },
+    { "url": "https://www.hdkyl.in/attendance.php", "waitSeconds": 15, "trustAsSigned": true }
   ],
   "nativeChallengePreflight": [
     { "url": "https://audiences.me/attendance.php", "waitSeconds": 20 },

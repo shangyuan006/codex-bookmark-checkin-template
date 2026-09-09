@@ -51,32 +51,41 @@ test("provider session reads cookies through the browser context request API", a
   }]);
 });
 
-test("provider session maps unauthorized and failed requests without page state", async () => {
-  const unauthorized = {
+test("provider session maps logged-out and failed requests without page state", async () => {
+  const responseWithStatus = (status) => ({
     async get() {
       return {
-        status: () => 401,
+        status: () => status,
         ok: () => false,
         json: async () => null,
       };
     },
-  };
+  });
   const failed = { async get() { throw new Error("context closed"); } };
 
-  assert.equal(await readProviderSession(unauthorized, "https://linux.do/session/current.json", 1_000), "invalid");
+  for (const status of [401, 403, 404]) {
+    assert.equal(await readProviderSession(
+      responseWithStatus(status),
+      "https://linux.do/session/current.json",
+      1_000,
+    ), "invalid");
+  }
   assert.equal(await readProviderSession(failed, "https://linux.do/session/current.json", 1_000), "unknown");
 });
 
-test("provider page probe uses browser navigation as a cold-profile fallback", async () => {
+test("provider page probe warms the provider home and fetches session state in-page", async () => {
   const calls = [];
+  let currentUrl = "about:blank";
   const page = {
-    async goto(endpoint, options) {
-      calls.push({ endpoint, options });
-      return {
-        status: () => 200,
-        ok: () => true,
-        json: async () => ({ current_user: { id: 123 } }),
-      };
+    url() { return currentUrl; },
+    async goto(url, options) {
+      calls.push({ type: "goto", url, options });
+      currentUrl = url;
+      return { status: () => 200, ok: () => true };
+    },
+    async evaluate(_callback, argument) {
+      calls.push({ type: "evaluate", argument });
+      return "valid";
     },
   };
 
@@ -85,10 +94,20 @@ test("provider page probe uses browser navigation as a cold-profile fallback", a
     "https://linux.do/session/current.json",
     12_000,
   ), "valid");
-  assert.deepEqual(calls, [{
-    endpoint: "https://linux.do/session/current.json",
-    options: { waitUntil: "domcontentloaded", timeout: 12_000 },
-  }]);
+  assert.deepEqual(calls, [
+    {
+      type: "goto",
+      url: "https://linux.do/",
+      options: { waitUntil: "domcontentloaded", timeout: 12_000 },
+    },
+    {
+      type: "evaluate",
+      argument: {
+        sessionEndpoint: "https://linux.do/session/current.json",
+        requestTimeoutMs: 12_000,
+      },
+    },
+  ]);
 });
 
 test("provider session probe corrects request-context false negatives before login UI", async () => {
@@ -107,14 +126,11 @@ test("provider session probe corrects request-context false negatives before log
       },
     },
     async newPage() {
+      let currentUrl = "about:blank";
       return {
-        async goto() {
-          return {
-            status: () => 200,
-            ok: () => true,
-            json: async () => ({ current_user: { id: 123 } }),
-          };
-        },
+        url() { return currentUrl; },
+        async goto(url) { currentUrl = url; return {}; },
+        async evaluate() { return "valid"; },
         async close() { pageClosed = true; },
       };
     },
@@ -145,14 +161,11 @@ test("automatic provider-only probe uses the page fallback without closing its c
       },
     },
     async newPage() {
+      let currentUrl = "about:blank";
       return {
-        async goto() {
-          return {
-            status: () => 200,
-            ok: () => true,
-            json: async () => ({ current_user: {} }),
-          };
-        },
+        url() { return currentUrl; },
+        async goto(url) { currentUrl = url; return {}; },
+        async evaluate() { return "valid"; },
         async close() { pageClosed = true; },
       };
     },
@@ -174,6 +187,7 @@ test("automatic provider-only probe fails closed when either signal is indetermi
     request: { async get() { throw new Error("request unavailable"); } },
     async newPage() {
       return {
+        url() { return "about:blank"; },
         async goto() { return null; },
         async close() {},
       };
@@ -189,10 +203,7 @@ test("automatic provider-only probe fails closed when either signal is indetermi
 });
 
 test("provider page fallback tolerates a cold renderer before Agent Router opens", async () => {
-  const pageStatuses = [
-    { current_user: null },
-    { current_user: {} },
-  ];
+  const pageStatuses = ["invalid", "valid"];
   const waits = [];
   const context = {
     request: {
@@ -205,15 +216,11 @@ test("provider page fallback tolerates a cold renderer before Agent Router opens
       },
     },
     async newPage() {
+      let currentUrl = "about:blank";
       return {
-        async goto() {
-          const value = pageStatuses.shift();
-          return {
-            status: () => 200,
-            ok: () => true,
-            json: async () => value,
-          };
-        },
+        url() { return currentUrl; },
+        async goto(url) { currentUrl = url; return {}; },
+        async evaluate() { return pageStatuses.shift(); },
         async close() {},
       };
     },

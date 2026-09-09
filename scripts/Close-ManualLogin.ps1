@@ -47,27 +47,7 @@ function Clear-ManualContinuationState {
 }
 
 function Write-ManualAbandonment($Targets) {
-    $now = Get-Date
-    $originSet = Get-TodayAbandonedOrigins -Path $abandonPath -Now $now
-    foreach ($target in @($Targets)) {
-        $origin = ConvertTo-ManualAbandonmentOrigin $target.origin
-        if (-not $origin) { throw '今日放弃目标必须是规范的 HTTPS origin。' }
-        $originSet[$origin] = $true
-    }
-    $document = [ordered]@{
-        schemaVersion = 1
-        date = $now.ToString('yyyyMMdd')
-        createdAt = $now.ToUniversalTime().ToString('o')
-        origins = @($originSet.Keys | Sort-Object)
-    }
-    [System.IO.Directory]::CreateDirectory((Split-Path -Parent $abandonPath)) | Out-Null
-    $temporaryPath = "$abandonPath.$PID.tmp"
-    [System.IO.File]::WriteAllText(
-        $temporaryPath,
-        ($document | ConvertTo-Json -Depth 4),
-        [System.Text.UTF8Encoding]::new($false)
-    )
-    Move-Item -LiteralPath $temporaryPath -Destination $abandonPath -Force
+    [void](Write-TodayManualAbandonment -Path $abandonPath -Targets @($Targets))
 }
 
 function Resolve-ManualAbandonmentSelection($Targets) {
@@ -199,22 +179,22 @@ if ($state -and [string]$state.mode -eq 'native') {
     }
     else { $null }
 
-    $recordedStartText = if ($state.processStartedAt) { [string]$state.processStartedAt } else { [string]$state.startedAt }
+    $recordedStartValue = if ($state.processStartedAt) { $state.processStartedAt } else { $state.startedAt }
     $startToleranceSeconds = if ($state.processStartedAt) { 2 } else { 30 }
-    $recordedStart = [datetime]::MinValue
+    $recordedStart = ConvertTo-CheckinUtcDateTime $recordedStartValue
     $profileMatches = try {
         $recordedProfile = [System.IO.Path]::GetFullPath([string]$state.profile)
         $configuredProfile = [System.IO.Path]::GetFullPath([string]$config.automationUserDataDir)
         [string]::Equals($recordedProfile, $configuredProfile, [System.StringComparison]::OrdinalIgnoreCase)
     }
     catch { $false }
-    $recordMatches = $profileMatches -and $recordedStartText `
-        -and [datetime]::TryParse($recordedStartText, [ref]$recordedStart)
+    $recordMatches = $profileMatches -and $null -ne $recordedStart
     $identityMatches = $recordMatches -and $trackedProcess
     if ($identityMatches -and -not $rebound) {
-        $actualStart = $trackedProcess.StartTime.ToUniversalTime()
-        $expectedStart = $recordedStart.ToUniversalTime()
-        $identityMatches = [Math]::Abs(($actualStart - $expectedStart).TotalSeconds) -le $startToleranceSeconds
+        $identityMatches = Test-CheckinProcessStartIdentity `
+            -Process $trackedProcess `
+            -RecordedStart $recordedStart `
+            -ToleranceSeconds $startToleranceSeconds
     }
     if ($rebound) { $identityMatches = [bool]$trackedProcess }
 

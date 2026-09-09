@@ -6,12 +6,26 @@ param(
     [switch]$Offscreen,
     [int]$RemoteDebuggingPort = 0,
     [switch]$NativeMinimal,
-    [switch]$TrackManualSession
+    [switch]$TrackManualSession,
+    [string]$UserDataDirOverride
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+$allowedDataRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'data'))
+$allowedDataPrefix = $allowedDataRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+if ($UserDataDirOverride) {
+    $profilePath = if ([System.IO.Path]::IsPathRooted($UserDataDirOverride)) {
+        [System.IO.Path]::GetFullPath($UserDataDirOverride)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $root $UserDataDirOverride))
+    }
+    if (-not $profilePath.StartsWith($allowedDataPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "原生浏览器 profile 必须位于项目 data 目录。"
+    }
+    $config.automationUserDataDir = $profilePath
+}
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 $node = Resolve-CheckinNode $config
 $browser = Resolve-CheckinBrowser $config

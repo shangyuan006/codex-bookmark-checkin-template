@@ -65,7 +65,11 @@ test("browser lifecycle scripts use configured process discovery", async () => {
   ];
   for (const script of scripts) {
     const source = await fs.readFile(new URL(`../scripts/${script}`, import.meta.url), "utf8");
-    assert.match(source, /Get-CheckinAutomationBrowserProcesses/);
+    if (script === "Prepare-NativeWafSession.ps1") {
+      assert.match(source, /Get-CheckinProfileBrowserProcesses/);
+    } else {
+      assert.match(source, /Get-CheckinAutomationBrowserProcesses/);
+    }
     assert.doesNotMatch(source, /Name='chrome\.exe'|Name -eq 'chrome\.exe'/);
   }
 

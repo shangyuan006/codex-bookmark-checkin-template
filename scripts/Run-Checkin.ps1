@@ -6,7 +6,8 @@ param(
     [string[]]$Origins = @(),
     [string]$ReauthAccountKey,
     [switch]$ForceReauth,
-    [switch]$PostOAuthVerify
+    [switch]$PostOAuthVerify,
+    [switch]$OverrideTodayAbandonment
 )
 
 $ErrorActionPreference = 'Stop'
@@ -248,6 +249,18 @@ try {
     }
     if ($PostOAuthVerify -and -not $ReauthAccountKey) {
         throw 'PostOAuthVerify 只能与明确的 ReauthAccountKey 同时使用。'
+    }
+    if ($OverrideTodayAbandonment -and $requestedOrigins.Count -eq 0) {
+        throw 'OverrideTodayAbandonment 只能与明确的 Origins 同时使用。'
+    }
+    if (-not $DryRun -and $requestedOrigins.Count -gt 0 -and -not $OverrideTodayAbandonment) {
+        $todayAbandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now (Get-Date)
+        $requestedAbandonedCount = @($requestedOrigins | Where-Object {
+            $todayAbandonedOrigins.ContainsKey([string]$_)
+        }).Count
+        if ($requestedAbandonedCount -gt 0) {
+            throw "定向签到包含 $requestedAbandonedCount 个今天已放弃的站点；如确需重新访问，请显式增加 -OverrideTodayAbandonment。"
+        }
     }
     $nativeFallbackOnlyOrigins = @(Get-NativeFallbackOnlyOrigins $config | Where-Object {
         $requestedOrigins.Count -eq 0 -or $requestedOrigins -contains [string]$_

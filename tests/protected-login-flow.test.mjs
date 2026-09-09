@@ -187,6 +187,43 @@ test("OAuth login challenge uses one configured same-origin Cloudflare frame and
   assert.equal(clicked, 1);
 });
 
+test("OAuth login challenge permits one delayed retry only when explicitly configured", async () => {
+  let clicked = 0;
+  const capButton = {
+    count: async () => 1,
+    isVisible: async () => true,
+    click: async () => { clicked += 1; },
+  };
+  const page = {
+    url: () => "https://protected.example/sign-in",
+    getByRole: () => capButton,
+    locator: () => emptyChallengeLocator(),
+  };
+  const config = {
+    autoClickTurnstileOrigins: ["https://protected.example"],
+    challengeInteractionRules: {
+      "https://protected.example": {
+        loginMaxClicks: 2,
+        loginRetryDelayMs: 3000,
+      },
+    },
+  };
+  const originalNow = Date.now;
+  let now = 10_000;
+  Date.now = () => now;
+  try {
+    assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", config), true);
+    assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", config), false);
+    now += 3000;
+    assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", config), true);
+    now += 3000;
+    assert.equal(await clickConfiguredLoginChallengeControl(page, "https://protected.example", config), false);
+  } finally {
+    Date.now = originalNow;
+  }
+  assert.equal(clicked, 2);
+});
+
 test("OAuth login challenge fails closed when multiple Cloudflare frames are visible", async () => {
   let clicked = 0;
   const frameUrl = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2";

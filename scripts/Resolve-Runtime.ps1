@@ -77,6 +77,101 @@ function Get-CheckinProfileBrowserProcesses {
     })
 }
 
+function Wait-CheckinVisibleBrowserWindow {
+    param(
+        $Config,
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilePath,
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[a-f0-9]{32}$')]
+        [string]$LaunchMarker,
+        [ValidateRange(2, 30)]
+        [int]$TimeoutSeconds = 15,
+        [ValidateRange(250, 5000)]
+        [int]$StableMilliseconds = 1500
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $stablePid = 0
+    $stableSince = $null
+    do {
+        $marked = @(Get-CheckinProfileBrowserProcesses -Config $Config -ProfilePath $ProfilePath | Where-Object {
+            $_.CommandLine -like "*--checkin-launch=$LaunchMarker*"
+        })
+        $visible = @($marked | ForEach-Object {
+            Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue
+        } | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Responding })
+
+        if ($visible.Count -eq 1) {
+            $candidate = $visible[0]
+            if ($stablePid -ne [int]$candidate.Id) {
+                $stablePid = [int]$candidate.Id
+                $stableSince = Get-Date
+            }
+            elseif (((Get-Date) - $stableSince).TotalMilliseconds -ge $StableMilliseconds) {
+                try { [void]$candidate.WaitForInputIdle(1000) } catch { }
+                try {
+                    $shell = New-Object -ComObject WScript.Shell
+                    [void]$shell.AppActivate([int]$candidate.Id)
+                }
+                catch { }
+                Start-Sleep -Milliseconds 250
+                $candidate.Refresh()
+                if ($candidate.MainWindowHandle -ne 0 -and $candidate.Responding) {
+                    return [pscustomobject]@{
+                        ProcessId = [int]$candidate.Id
+                        ProcessStartedAt = $candidate.StartTime.ToUniversalTime().ToString('o')
+                    }
+                }
+            }
+        }
+        else {
+            $stablePid = 0
+            $stableSince = $null
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
+function ConvertTo-CheckinUtcDateTime {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) {
+            return [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Local).ToUniversalTime()
+        }
+        return $Value.ToUniversalTime()
+    }
+
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse(
+        [string]$Value,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AllowWhiteSpaces,
+        [ref]$parsed
+    )) {
+        return $null
+    }
+    return $parsed.UtcDateTime
+}
+
+function Test-CheckinProcessStartIdentity {
+    param(
+        $Process,
+        [object]$RecordedStart,
+        [double]$ToleranceSeconds = 2
+    )
+
+    if (-not $Process) { return $false }
+    $expectedStart = ConvertTo-CheckinUtcDateTime $RecordedStart
+    if ($null -eq $expectedStart) { return $false }
+    $actualStart = try { $Process.StartTime.ToUniversalTime() } catch { return $false }
+    return [Math]::Abs(($actualStart - $expectedStart).TotalSeconds) -le $ToleranceSeconds
+}
+
 function Get-CheckinAutomationBrowserProcesses {
     param($Config)
 
@@ -103,16 +198,14 @@ function Get-CheckinManualSessionBrowserProcesses {
         if ($marked.Count -gt 0) { return $marked }
     }
 
-    $recordedStart = [datetime]::MinValue
-    $recordedStartText = if ($State.processStartedAt) {
-        [string]$State.processStartedAt
+    $recordedStartValue = if ($State.processStartedAt) {
+        $State.processStartedAt
     }
     else {
-        [string]$State.startedAt
+        $State.startedAt
     }
-    if (-not $recordedStartText -or -not [datetime]::TryParse($recordedStartText, [ref]$recordedStart)) {
-        return @()
-    }
+    $recordedStart = ConvertTo-CheckinUtcDateTime $recordedStartValue
+    if ($null -eq $recordedStart) { return @() }
     $toleranceSeconds = if ($State.processStartedAt) { 5 } else { 30 }
     return @($profileProcesses | Where-Object {
         $candidate = Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue
@@ -121,7 +214,7 @@ function Get-CheckinManualSessionBrowserProcesses {
         }
         else {
             try {
-                $candidate.StartTime.ToUniversalTime() -ge $recordedStart.ToUniversalTime().AddSeconds(-$toleranceSeconds)
+                $candidate.StartTime.ToUniversalTime() -ge $recordedStart.AddSeconds(-$toleranceSeconds)
             }
             catch { $false }
         }
