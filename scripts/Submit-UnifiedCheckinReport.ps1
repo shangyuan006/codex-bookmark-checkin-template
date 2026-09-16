@@ -23,6 +23,7 @@ function Get-Sha256Hex([byte[]]$Bytes) {
 }
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
+. (Join-Path $PSScriptRoot 'ResultContract.ps1')
 $localConfigPath = Join-Path $root 'config\config.json'
 $defaultsPath = Join-Path $root 'config\defaults.json'
 $effectiveConfigPath = if ($ConfigPath) { $ConfigPath } elseif (Test-Path -LiteralPath $localConfigPath) { $localConfigPath } else { $defaultsPath }
@@ -171,13 +172,14 @@ function Test-ResultHasNestedAccountConflict([object]$Result) {
 }
 
 function Test-ResultIsAbandoned([object]$Result) {
+    if (Test-ConfirmedNotAvailable $Result) { return $false }
     $origin = ConvertTo-ManualAbandonmentOrigin $Result.origin
     return [bool]$origin -and $abandonedOrigins.ContainsKey($origin)
 }
 
 function Get-ProjectedResultStatus([object]$Result) {
     if (Test-ResultIsAbandoned $Result) { return 'abandoned' }
-    return [string]$Result.status
+    return Get-NormalizedCheckinResultStatus $Result
 }
 
 if ($ReportPath) {
@@ -218,7 +220,7 @@ $selectedNotAvailable = @($selectedStatuses | Where-Object { $_ -eq 'not_availab
 $selectedAbandonedCount = @($selectedStatuses | Where-Object { $_ -eq 'abandoned' }).Count
 $selectedProblems = @($selectedResults | Where-Object {
     -not (Test-ResultIsAbandoned $_) `
-        -and ($_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_))
+        -and (-not (Test-CheckinResultTerminal $_) -or (Test-ResultHasNestedAccountConflict $_))
 })
 $isTargetedReport = $hasSelectedScope -and $plannedTotal -gt 0 -and $selectedTotal -lt $plannedTotal
 $isCompleteFinalReport = $null -ne $report `
@@ -239,11 +241,11 @@ $done = @($results | Where-Object {
 $notAvailable = @($statuses | Where-Object { $_ -eq 'not_available' }).Count
 $abandonedCount = @($statuses | Where-Object { $_ -eq 'abandoned' }).Count
 $parentProblems = @($results | Where-Object {
-    -not (Test-ResultIsAbandoned $_) -and $_.status -notin @('signed', 'already_signed', 'not_available')
+    -not (Test-ResultIsAbandoned $_) -and -not (Test-CheckinResultTerminal $_)
 })
 $problems = @($results | Where-Object {
     -not (Test-ResultIsAbandoned $_) `
-        -and ($_.status -notin @('signed', 'already_signed', 'not_available') -or (Test-ResultHasNestedAccountConflict $_))
+        -and (-not (Test-CheckinResultTerminal $_) -or (Test-ResultHasNestedAccountConflict $_))
 })
 $attentionCount = @($parentProblems | Where-Object { $_.status -in @('interactive_challenge', 'login_required', 'needs_attention') }).Count + $nestedConflictResults.Count
 $timeoutCount = @($parentProblems | Where-Object { $_.status -eq 'managed_challenge_timeout' }).Count

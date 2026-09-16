@@ -25,11 +25,13 @@ import {
 } from "../src/reauth-checkin.mjs";
 
 test("forced account reauth bypasses only today's completed state", () => {
-  const completed = { date: "20260829", status: "completed" };
-  assert.equal(shouldReuseCompletedReauthState(completed, "20260829"), true);
-  assert.equal(shouldReuseCompletedReauthState(completed, "20260829", true), false);
-  assert.equal(shouldReuseCompletedReauthState(completed, "20260830"), false);
-  assert.equal(shouldReuseCompletedReauthState({ date: "20260829", status: "logged_out" }, "20260829"), false);
+  const now = new Date("2026-08-29T04:00:00Z");
+  const completed = { date: "20260829", status: "completed", updatedAt: now.toISOString() };
+  assert.equal(shouldReuseCompletedReauthState(completed, "20260829", false, now), true);
+  assert.equal(shouldReuseCompletedReauthState(completed, "20260829", true, now), false);
+  assert.equal(shouldReuseCompletedReauthState(completed, "20260830", false, now), false);
+  assert.equal(shouldReuseCompletedReauthState({ ...completed, status: "logged_out" }, "20260829", false, now), false);
+  assert.equal(shouldReuseCompletedReauthState({ ...completed, updatedAt: "2026-08-29T05:00:00Z" }, "20260829", false, now), false);
 });
 
 test("forced reauth CLI remains restricted to one explicit Agent Router account", async () => {
@@ -148,12 +150,15 @@ test("OAuth retries retain a specific stage over a later generic helper failure"
 });
 
 test("OAuth failure short-circuits only when the isolated target session has explicit completion evidence", () => {
-  assert.deepEqual(classifyReauthSessionAfterOAuthFailure({ valid: true, explicitLoginSuccess: true }), {
+  const now = new Date("2026-09-16T04:00:00Z");
+  const previous = { ...buildReauthStateEntry("20260916", "logged_out", now), loginEvidenceReset: true };
+  assert.deepEqual(classifyReauthSessionAfterOAuthFailure({ valid: true, explicitLoginSuccess: true }, previous, now), {
     status: "already_signed",
     reason: "OAuth 未完成，但同一隔离会话已确认目标站今日状态",
   });
-  assert.equal(classifyReauthSessionAfterOAuthFailure({ valid: true, explicitLoginSuccess: false }), null);
-  assert.equal(classifyReauthSessionAfterOAuthFailure({ valid: false, explicitLoginSuccess: true }), null);
+  assert.equal(classifyReauthSessionAfterOAuthFailure({ valid: true, explicitLoginSuccess: false }, previous, now), null);
+  assert.equal(classifyReauthSessionAfterOAuthFailure({ valid: false, explicitLoginSuccess: true }, previous, now), null);
+  assert.equal(classifyReauthSessionAfterOAuthFailure({ valid: true, explicitLoginSuccess: true }), null);
 });
 
 test("LinuxDO login-page CF stops account-level OAuth retries", async () => {
@@ -513,7 +518,7 @@ test("LinuxDO automatic OAuth recovery runs provider and Agent Router phases seq
   const postLogoutPhase = source.indexOf("const oauthResult = normalizeReauthProvider(rule.provider", loggedOutState);
   assert.ok(postLogoutPhase > loggedOutState);
   assert.match(source, /runAgentRouterOnlyWithRetry\(rule, accountConfig, rule\)/);
-  assert.match(source, /previous\?\.date === date && previous\.status === "logged_out"[\s\S]*?runAgentRouterOnlyWithRetry/);
+  assert.match(source, /reauthRecoveryAction\(previous, now\) === "resume"[\s\S]*?runAgentRouterOnlyWithRetry/);
   assert.match(source, /same encrypted browser profile/);
 
   const oauth = await fs.readFile(new URL("../src/oauth-login.mjs", import.meta.url), "utf8");
@@ -553,11 +558,11 @@ test("LinuxDO automatic OAuth recovery runs provider and Agent Router phases seq
 test("manual Agent Router completion verifies the existing OAuth result without starting another OAuth", async () => {
   const source = await fs.readFile(new URL("../src/reauth-checkin.mjs", import.meta.url), "utf8");
   const postOAuthBranch = source.indexOf("if (options.postOAuthVerify)");
-  const normalLoggedOutBranch = source.indexOf('if (previous?.date === date && previous.status === "logged_out")');
+  const normalLoggedOutBranch = source.indexOf('if (reauthRecoveryAction(previous, now) === "resume")');
   assert.ok(postOAuthBranch >= 0 && postOAuthBranch < normalLoggedOutBranch);
   const verificationOnlySource = source.slice(postOAuthBranch, normalLoggedOutBranch);
   assert.match(verificationOnlySource, /inspectCurrentLogin\(accountConfig, rule\)/);
-  assert.match(verificationOnlySource, /explicitLoginSuccess/);
+  assert.match(verificationOnlySource, /hasCurrentReauthEvidence/);
   assert.doesNotMatch(verificationOnlySource, /runAgentRouterOnlyWithRetry|runPrivateOAuthWithRetry/);
 
   const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");

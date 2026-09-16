@@ -13,6 +13,7 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmpRoot = path.join(root, "tmp");
 const reporter = path.join(root, "scripts", "Submit-UnifiedCheckinReport.ps1");
 const abandonmentHelper = path.join(root, "scripts", "ManualAbandonment.ps1");
+const resultContractHelper = path.join(root, "scripts", "ResultContract.ps1");
 const worker = path.join(root, "scripts", "Invoke-CheckinNotificationOutbox.ps1");
 
 async function runPowerShell(script, args = []) {
@@ -46,6 +47,7 @@ async function enqueue(outboxPath, configPath, report, preview = false) {
     await Promise.all([
       fs.copyFile(reporter, fixtureReporter),
       fs.copyFile(abandonmentHelper, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
+      fs.copyFile(resultContractHelper, path.join(scriptsDirectory, "ResultContract.ps1")),
     ]);
     await fs.writeFile(reportPath, JSON.stringify(report), "utf8");
     return JSON.parse(await runPowerShell(fixtureReporter, [

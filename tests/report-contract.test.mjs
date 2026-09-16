@@ -12,6 +12,7 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmpRoot = path.join(root, "tmp");
 const reporter = path.join(root, "scripts", "Submit-UnifiedCheckinReport.ps1");
 const abandonmentHelper = path.join(root, "scripts", "ManualAbandonment.ps1");
+const resultContractHelper = path.join(root, "scripts", "ResultContract.ps1");
 
 async function previewReport(report, runnerStatus = "completed", abandonedOrigins = []) {
   await fs.mkdir(tmpRoot, { recursive: true });
@@ -28,6 +29,7 @@ async function previewReport(report, runnerStatus = "completed", abandonedOrigin
     await Promise.all([
       fs.copyFile(reporter, fixtureReporter),
       fs.copyFile(abandonmentHelper, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
+      fs.copyFile(resultContractHelper, path.join(scriptsDirectory, "ResultContract.ps1")),
     ]);
     await fs.writeFile(path.join(configDirectory, "defaults.json"), JSON.stringify({ notification: { mode: "none" } }), "utf8");
     if (abandonedOrigins.length > 0) {

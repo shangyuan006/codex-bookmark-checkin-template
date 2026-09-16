@@ -85,6 +85,29 @@ export function matchesNativeCompletedControlText(value) {
   return /^(?:(?:今日|今天|当日|當日)\s*)?已\s*(?:签到|簽到)$/.test(normalizeText(value));
 }
 
+export async function waitForNativeCheckinAction(page, expectedOrigin, rule, {
+  readState, timeoutMs, now = Date.now,
+  click = clickUniqueNativeCheckinAction,
+  prepare = dismissNativeCheckinOverlays,
+}) {
+  const deadline = now() + Math.max(0, Math.min(120000, Number(timeoutMs) || 0));
+  let prepared = false;
+  let last = { clicked: false, outcome: 'not_attempted' };
+  do {
+    assertBookmarkNavigation(page.url(), [expectedOrigin]);
+    const state = await readState(page);
+    if (['signed', 'already_signed'].includes(state.status)) return { clicked: false, outcome: 'already_completed' };
+    if (['login_required', 'interactive_challenge', 'needs_attention', 'deferred'].includes(state.status)) return last;
+    if (state.status === 'ready') {
+      if (!prepared) { await prepare(page, expectedOrigin, rule); prepared = true; }
+      last = await click(page, expectedOrigin, rule);
+      if (last.clicked || last.outcome !== 'action_not_found') return last;
+    }
+    if (now() >= deadline) return last;
+    await page.waitForTimeout(250);
+  } while (true);
+}
+
 async function visibleLocators(locators) {
   const visible = [];
   for (const locator of locators) {
@@ -102,6 +125,42 @@ async function visibleChallengeFrame(frameElement, box) {
   if (typeof frameElement.isVisible === "function"
     && !await frameElement.isVisible().catch(() => false)) return false;
   return !box || (box.width > 0 && box.height > 0);
+}
+
+// Chromium can expose a Turnstile iframe through a closed Shadow DOM before
+// Playwright has attached the corresponding Frame object. Use CDP only to
+// inspect the DOM geometry; the click remains a normal page.mouse click and
+// is still guarded by the same origin, size, uniqueness, and stability checks.
+async function inspectClosedShadowChallengeFrames(page, expectedOrigin, addFrameClickCandidate) {
+  let client;
+  try {
+    if (typeof page.context()?.newCDPSession !== "function") return 0;
+    client = await page.context().newCDPSession(page);
+    const { root } = await client.send("DOM.getDocument", { depth: -1, pierce: true });
+    const matches = [];
+    const walk = (node) => {
+      const attributes = node.attributes || [];
+      const sourceIndex = attributes.indexOf("src");
+      const source = sourceIndex >= 0 ? attributes[sourceIndex + 1] : "";
+      if (node.nodeName === "IFRAME"
+        && nativeChallengeFrameIsAllowed(source, expectedOrigin)) matches.push(node.backendNodeId);
+      for (const child of node.children || []) walk(child);
+      for (const shadowRoot of node.shadowRoots || []) walk(shadowRoot);
+      if (node.contentDocument) walk(node.contentDocument);
+    };
+    walk(root);
+    if (matches.length === 0) return 0;
+    for (const backendNodeId of matches) {
+      const { model } = await client.send("DOM.getBoxModel", { backendNodeId });
+      const [x, y] = model.content;
+      addFrameClickCandidate({ x, y, width: model.width, height: model.height });
+    }
+    return matches.length;
+  } catch {
+    return 0;
+  } finally {
+    await client?.detach().catch(() => {});
+  }
 }
 
 async function waitForDismissCandidate(page, rule) {
@@ -226,10 +285,17 @@ async function inspectNativeChallengeControls(page, expectedOrigin) {
     addFrameClickCandidate(await candidate.boundingBox().catch(() => null));
   }
 
+  const closedShadowFrameCount = await inspectClosedShadowChallengeFrames(
+    page,
+    expectedOrigin,
+    addFrameClickCandidate,
+  );
+
   const candidates = directCandidates.length > 0 ? directCandidates : labelCandidates;
   const details = {
     allowedFrameCount,
     allowedParentFrameCount,
+    closedShadowFrameCount,
     directCandidateCount: directCandidates.length,
     labelCandidateCount: labelCandidates.length,
     frameClickCandidateCount: frameClickCandidates.length,

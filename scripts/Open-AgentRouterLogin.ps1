@@ -151,6 +151,31 @@ function Get-AgentRouterTargetCompletionProbe {
     return $null
 }
 
+function Get-AgentRouterRecoveryAction {
+    $probeScript = Join-Path $root 'src\probe-agentrouter-session.mjs'
+    $probeOutput = @(& $node $probeScript 'https://agentrouter.org' $requestedAccountKey '--recovery-state' 2>$null)
+    for ($index = $probeOutput.Count - 1; $index -ge 0; $index--) {
+        try {
+            $probe = [string]$probeOutput[$index] | ConvertFrom-Json
+            if ([string]$probe.action -in @('restart', 'resume', 'complete')) { return [string]$probe.action }
+        }
+        catch { }
+    }
+    throw 'Unable to read the account recovery stage; no OAuth or manual window was started.'
+}
+
+function Invoke-AgentRouterAccountCheckin([switch]$VerifyOnly) {
+    $powershell = Resolve-AgentRouterPowerShellExecutable
+    $runArguments = @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', (Join-Path $PSScriptRoot 'Run-Checkin.ps1'),
+        '-ReauthAccountKey', $requestedAccountKey, '-Attempts', '1', '-SuppressReport'
+    )
+    if ($VerifyOnly) { $runArguments += '-PostOAuthVerify' }
+    & $powershell @runArguments | Out-Host
+    return $LASTEXITCODE
+}
+
 if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
     $existingProviderProbe = Get-LinuxDoProviderSessionProbe
     Write-LinuxDoProviderProbeLog $existingProviderProbe 'provider'
@@ -168,6 +193,16 @@ if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
 }
 
 if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
+    $recoveryAction = Get-AgentRouterRecoveryAction
+    if ($recoveryAction -eq 'complete') {
+        # Reconcile the daily report even when only the per-account checkpoint
+        # survived. No browser or provider probe is needed for a completed day.
+        $checkinExitCode = Invoke-AgentRouterAccountCheckin
+        if ($checkinExitCode -ne 0) { exit $checkinExitCode }
+        Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
+        Write-Output "Today's completed account result was reconciled without another OAuth or manual window."
+        return
+    }
     if (-not (Test-Path -LiteralPath $providerStagePath)) {
         throw 'No completed LinuxDO provider stage is recorded. Run with -ProviderOnly, finish login, and close that window first.'
     }
@@ -192,46 +227,65 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         throw "The LinuxDO provider session is invalid after $($providerSessionProbe.Attempts) bounded probe attempt(s). Run -ProviderOnly again and complete LinuxDO login first."
     }
 
-    $oauthArguments = @(
-        (Join-Path $root 'src\oauth-login.mjs'),
-        'https://agentrouter.org',
-        $provider,
-        '--login-url',
-        'https://agentrouter.org/login',
-        '--automation-user-data-dir',
-        $profile,
-        '--account-id',
-        $requestedAccountKey,
-        '--agent-router-only',
-        '--provider-session-confirmed',
-        '--private-result'
-    )
-    if ($null -ne $account.oauthWaitMs) {
-        $oauthArguments += @('--wait-ms', [string]$account.oauthWaitMs)
-    }
-    if ($ExperimentalTurnstileFrameClick) {
-        $oauthArguments += '--experimental-sso-frame-click'
-    }
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        # oauth-login emits private stage markers on stderr; they are progress,
-        # not PowerShell failures. The final JSON status remains authoritative.
-        $ErrorActionPreference = 'Continue'
-        $automaticOutput = @(& $node @oauthArguments 2>$null)
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    $automaticResult = $null
-    for ($index = $automaticOutput.Count - 1; $index -ge 0; $index--) {
-        try {
-            $candidate = [string]$automaticOutput[$index] | ConvertFrom-Json
-            if ([string]$candidate.status -in @('logged_in', 'needs_attention')) {
-                $automaticResult = $candidate
-                break
-            }
+    $ranFullCheckin = $false
+    if ($recoveryAction -eq 'restart') {
+        # The automatic run may have stopped BEFORE target logout. Let the
+        # daily state machine establish that boundary before any login-only helper.
+        $ranFullCheckin = $true
+        $checkinExitCode = Invoke-AgentRouterAccountCheckin
+        if ($checkinExitCode -eq 0) {
+            Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
+            Write-Output "Resumed the full daily account flow and reconciled its authoritative result."
+            return
         }
-        catch { }
+        $recoveryAction = Get-AgentRouterRecoveryAction
+        if ($recoveryAction -ne 'resume') {
+            throw 'The daily account flow stopped before a verified logout; its pending result was retained. No login-only OAuth or misleading target window was opened.'
+        }
+    }
+
+    $automaticResult = $null
+    if (-not $ranFullCheckin) {
+        $oauthArguments = @(
+            (Join-Path $root 'src\oauth-login.mjs'),
+            'https://agentrouter.org',
+            $provider,
+            '--login-url',
+            'https://agentrouter.org/login',
+            '--automation-user-data-dir',
+            $profile,
+            '--account-id',
+            $requestedAccountKey,
+            '--agent-router-only',
+            '--provider-session-confirmed',
+            '--private-result'
+        )
+        if ($null -ne $account.oauthWaitMs) {
+            $oauthArguments += @('--wait-ms', [string]$account.oauthWaitMs)
+        }
+        if ($ExperimentalTurnstileFrameClick) {
+            $oauthArguments += '--experimental-sso-frame-click'
+        }
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            # oauth-login emits private stage markers on stderr; they are progress,
+            # not PowerShell failures. The final JSON status remains authoritative.
+            $ErrorActionPreference = 'Continue'
+            $automaticOutput = @(& $node @oauthArguments 2>$null)
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        for ($index = $automaticOutput.Count - 1; $index -ge 0; $index--) {
+            try {
+                $candidate = [string]$automaticOutput[$index] | ConvertFrom-Json
+                if ([string]$candidate.status -in @('logged_in', 'needs_attention')) {
+                    $automaticResult = $candidate
+                    break
+                }
+            }
+            catch { }
+        }
     }
     if ($ExperimentalTurnstileFrameClick) {
         $safeExperimentalOutcomes = @(
@@ -250,14 +304,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         }).Count -gt 0) {
             throw 'Automatic Agent Router OAuth completed but its isolated browser did not close.'
         }
-        $powershell = Resolve-AgentRouterPowerShellExecutable
-        & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-            -File (Join-Path $PSScriptRoot 'Run-Checkin.ps1') `
-            -ReauthAccountKey $requestedAccountKey `
-            -PostOAuthVerify `
-            -Attempts 1 `
-            -SuppressReport
-        $checkinExitCode = $LASTEXITCODE
+        $checkinExitCode = Invoke-AgentRouterAccountCheckin -VerifyOnly
         if ($checkinExitCode -ne 0) { exit $checkinExitCode }
         Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
         Write-Output "Executed one Agent Router OAuth for accountKey '$requestedAccountKey' and confirmed the authoritative account result without a second OAuth attempt."
@@ -290,6 +337,10 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     }
     $targetCompletionProbe = Get-AgentRouterTargetCompletionProbe
     if ($targetCompletionProbe -eq 'already_signed') {
+        # A probe is read-only. Persist the account checkpoint and merged daily
+        # result through the same verifier used after successful OAuth.
+        $checkinExitCode = Invoke-AgentRouterAccountCheckin -VerifyOnly
+        if ($checkinExitCode -ne 0) { exit $checkinExitCode }
         if ($AgentRouterOnly) {
             Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
         }

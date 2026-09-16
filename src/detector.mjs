@@ -42,6 +42,10 @@ export function classifyPageText({
   const explicitlyUnsigned = unsignedPattern.test(text);
   const lowerUrl = String(url).toLowerCase();
 
+  if (/雷池|safeline/i.test(text) && /客户端异常.*确认.*合法用户/.test(text)) {
+    return { status: 'interactive_challenge', reason: '雷池 WAF 要求合法用户确认', failureCode: 'safeline_client_challenge' };
+  }
+
   // A login form can legitimately contain an image CAPTCHA.  Treating every
   // CAPTCHA marker as a standalone browser challenge hides the real action
   // required (refreshing the site's login session).

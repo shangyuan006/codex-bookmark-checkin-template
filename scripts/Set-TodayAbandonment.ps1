@@ -80,7 +80,7 @@ if ($null -ne $pendingVerification) {
         -not $origin -or -not $requested.ContainsKey($origin)
     })
     $remainingPendingCount = @($remainingTargets | Where-Object {
-        -not (Test-ManualVerificationTerminalStatus $_.verificationStatus)
+        -not (Test-ManualVerificationTargetTerminal $_)
     }).Count
     if ($remainingPendingCount -eq 0) {
         Remove-Item -LiteralPath $verificationPath -Force

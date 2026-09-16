@@ -154,9 +154,9 @@ test("LinuxDO manual recovery uses explicit provider and Agent Router stages", a
   assert.match(open, /provider_challenge_unresolved/);
   assert.match(open, /'linuxdo_login_challenge'/);
   assert.match(open, /stage=\$failedStage, authorization=\$failedAuthorization/);
-  assert.match(open, /-ReauthAccountKey \$requestedAccountKey/);
+  assert.match(open, /'-ReauthAccountKey', \$requestedAccountKey/);
   assert.match(open, /-PostOAuthVerify/);
-  assert.match(open, /-Attempts 1/);
+  assert.match(open, /'-Attempts', '1'/);
   assert.match(open, /Opening one native no-CDP Edge window for manual completion/);
   assert.match(open, /refusing to open a second window/);
   assert.match(close, /agentrouter-linuxdo-provider-state\.json/);
@@ -228,6 +228,7 @@ test("LinuxDO Agent Router stage tolerates private OAuth progress on stderr", as
         "exit 0",
       ].join("\r\n"), "utf8"),
       fs.writeFile(path.join(sourceDirectory, "prepare-native-browser-profile.mjs"), "process.exitCode = 0;\n", "utf8"),
+      fs.writeFile(path.join(sourceDirectory, "probe-agentrouter-session.mjs"), "console.log(JSON.stringify({ action: 'resume' }));\n", "utf8"),
       fs.writeFile(path.join(sourceDirectory, "oauth-provider-session.mjs"), [
         "process.stdout.write(JSON.stringify({ status: 'valid' }) + '\\n');",
       ].join("\n"), "utf8"),
@@ -300,8 +301,14 @@ test("Agent Router OAuth failure rechecks the isolated target before opening a m
         "process.exitCode = 2;",
       ].join("\n"), "utf8"),
       fs.writeFile(path.join(sourceDirectory, "probe-agentrouter-session.mjs"), [
-        "process.stdout.write(JSON.stringify({ status: 'already_signed' }) + '\\n');",
+        "console.log(JSON.stringify(process.argv.includes('--recovery-state') ? { action: 'resume' } : { status: 'already_signed' }));",
       ].join("\n"), "utf8"),
+      fs.writeFile(path.join(scriptsDirectory, "Run-Checkin.ps1"), [
+        "param([string]$ReauthAccountKey, [switch]$PostOAuthVerify, [int]$Attempts, [switch]$SuppressReport)",
+        "if ($ReauthAccountKey -ne 'linuxdo' -or -not $PostOAuthVerify -or -not $SuppressReport) { exit 9 }",
+        "[System.IO.File]::WriteAllText(" + quotePowerShell(path.join(tmpDirectory, "verified.txt")) + ", 'reconciled')",
+        "exit 0",
+      ].join("\r\n"), "utf8"),
       fs.writeFile(path.join(configDirectory, "config.json"), JSON.stringify({
         agentrouterAccounts: [{
           origin: "https://agentrouter.org",
@@ -324,6 +331,7 @@ test("Agent Router OAuth failure rechecks the isolated target before opening a m
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /authoritatively confirms today's check-in/);
+    assert.equal(await fs.readFile(path.join(tmpDirectory, "verified.txt"), "utf8"), "reconciled");
     await assert.rejects(
       fs.access(path.join(tmpDirectory, "agentrouter-manual-state.json")),
       { code: "ENOENT" },

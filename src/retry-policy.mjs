@@ -3,7 +3,20 @@ export const RECOVERABLE_STATUSES = new Set([
   "visited", "clicked", "no_action", "unconfirmed", "deferred",
 ]);
 
-export const TERMINAL_STATUSES = new Set(["signed", "already_signed", "not_available"]);
+import { isTerminalResult } from "./result-contract.mjs";
+import { compatiblePriorResult, resultIdentity } from "./result-identity.mjs";
+
+export const TERMINAL_STATUSES = new Set(["signed", "already_signed"]);
+
+export function recoveryEntriesForResults(results, targets, now = new Date()) {
+  const byOrigin = new Map(targets.map(target => [target.origin, target]));
+  return results.flatMap((result, resultIndex) => {
+    if (!isRetryEligible(result, now)) return [];
+    const target = byOrigin.get(result.origin);
+    if (!target) throw new Error("Recovery result has no matching selected target");
+    return [{ resultIndex, target }];
+  });
+}
 
 function shanghaiParts(date) {
   return new Intl.DateTimeFormat("en-CA", {
@@ -214,6 +227,42 @@ export function advanceDeferredRetry(result, previous, config = {}, now = new Da
     }
     return { ...result, retrySequence, retrySequenceDate: currentDate, retryExhaustedForDay: false };
   }
+  if (result.retryCause === "login_required") {
+    const maxDailyAttempts = Math.max(1, Math.min(4,
+      Number(config.loginRetryMaxDailyAttempts) || 2));
+    if (retrySequence >= maxDailyAttempts) {
+      const { nextEligibleAt: _nextEligibleAt, ...preserved } = result;
+      return {
+        ...preserved,
+        status: "needs_attention",
+        reason: String(result.reason || "自动登录恢复未成功")
+          .replace(/；?已安排低频重试$/, "")
+          .concat("；本日自动恢复已达到上限，不再盲目重试"),
+        retrySequence,
+        retrySequenceDate: currentDate,
+        retryExhaustedForDay: true,
+      };
+    }
+    return { ...result, retrySequence, retrySequenceDate: currentDate, retryExhaustedForDay: false };
+  }
+  if (result.retryCause === "managed_challenge_timeout") {
+    const maxDailyAttempts = Math.max(1, Math.min(4,
+      Number(config.challengeRetryMaxDailyAttempts) || 2));
+    if (retrySequence >= maxDailyAttempts) {
+      const { nextEligibleAt: _nextEligibleAt, ...preserved } = result;
+      return {
+        ...preserved,
+        status: "needs_attention",
+        reason: String(result.reason || "安全验证未自动通过")
+          .replace(/；?已安排低频重试$/, "")
+          .concat("；本日安全验证复测已达到上限，不再重复打开站点"),
+        retrySequence,
+        retrySequenceDate: currentDate,
+        retryExhaustedForDay: true,
+      };
+    }
+    return { ...result, retrySequence, retrySequenceDate: currentDate, retryExhaustedForDay: false };
+  }
   if (result.retryCause !== "rate_limit") return { ...result, retrySequence, retrySequenceDate: currentDate };
 
   const baseDelay = Math.max(60_000, Number(config.rateLimitRetryDelayMs) || 60 * 60 * 1000);
@@ -243,10 +292,16 @@ export function advanceDeferredRetry(result, previous, config = {}, now = new Da
 
 export function advanceAttemptedDeferredRetries(results, attemptedOrigins, previousResults, config = {}, now = new Date()) {
   const attempted = attemptedOrigins instanceof Set ? attemptedOrigins : new Set(attemptedOrigins ?? []);
-  const previousByOrigin = new Map((previousResults ?? []).map((result) => [result.origin, result]));
-  const advanced = (results ?? []).map((result) => attempted.has(result.origin)
-    ? advanceDeferredRetry(result, previousByOrigin.get(result.origin), config, now)
-    : result);
+  const advanced = (results ?? []).map((result) => {
+    let identity;
+    try { identity = resultIdentity(result); } catch { identity = null; }
+    const legacyOrigin = result?.accountKey == null ? String(result?.origin ?? "") : null;
+    const wasAttempted = (identity && attempted.has(identity))
+      || (legacyOrigin && attempted.has(legacyOrigin));
+    return wasAttempted
+      ? advanceDeferredRetry(result, compatiblePriorResult(result, previousResults ?? []), config, now)
+      : result;
+  });
   return applyUpstreamGroupCircuitBreakers(advanced, config, now);
 }
 
@@ -262,7 +317,7 @@ export function deferUnresolvedLogin(result, config = {}, now = new Date()) {
     ...result,
     status: "deferred",
     retryCause,
-    reason: "自动登录恢复未成功，等待后续符合条件的运行重试",
+    reason: `${String(result.reason || "自动登录恢复未成功").replace(/；?已安排低频重试$/, "")}；已安排低频重试`,
   }, {
     deferredRetryDelayMs: retryCause === "login_required"
       ? config.loginRetryDelayMs ?? config.deferredRetryDelayMs
@@ -272,6 +327,8 @@ export function deferUnresolvedLogin(result, config = {}, now = new Date()) {
 }
 
 export function isRetryEligible(result, now = new Date()) {
+  if (result?.retryable === false || result?.submissionAttempted === true) return false;
+  if (result?.status === "not_available" && !isTerminalResult(result)) return true;
   if (!RECOVERABLE_STATUSES.has(result?.status)) return false;
   if (result.status !== "deferred") return true;
   const next = Date.parse(result.nextEligibleAt ?? "");

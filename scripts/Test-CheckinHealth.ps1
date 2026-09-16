@@ -20,6 +20,7 @@ $root = if ($Root) { [System.IO.Path]::GetFullPath($Root) } else { Split-Path -P
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 . (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
+. (Join-Path $PSScriptRoot 'ResultContract.ps1')
 
 function Test-HealthPath([string]$Path) {
     return [bool]$Path -and (Test-Path -LiteralPath $Path)
@@ -191,12 +192,12 @@ $latestRunToday = $latest -and [string]$latest.runId -like "$(Get-Date -Format '
 $abandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now (Get-Date)
 $latestAbandonedCount = if ($latestRunToday) { @($latest.results | Where-Object {
     $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
-    $origin -and $abandonedOrigins.ContainsKey($origin)
+    $origin -and $abandonedOrigins.ContainsKey($origin) -and -not (Test-ConfirmedNotAvailable $_)
 }).Count } else { 0 }
 $problemCount = if ($latest) { @($latest.results | Where-Object {
     $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
     $isAbandoned = $latestRunToday -and $origin -and $abandonedOrigins.ContainsKey($origin)
-    $_.status -notin @('signed', 'already_signed', 'not_available') -and -not $isAbandoned
+    -not (Test-CheckinResultTerminal $_) -and -not $isAbandoned
 }).Count } else { $null }
 $latestResultComplete = $latest `
     -and $latestRunToday `
@@ -207,6 +208,17 @@ $latestResultComplete = $latest `
     -and @($latest.results).Count -eq $latestPlannedTotal
 
 $currentPlanIdentities = if ($currentPlanReadable) { @($currentPlan.identities | ForEach-Object { [string]$_ } | Sort-Object -Unique) } else { @() }
+$currentPlanFingerprint = if ($currentPlanReadable) { [string]$currentPlan.planFingerprint } else { '' }
+$latestPlanFingerprint = ''
+if ($latest) {
+    $latestPlanFingerprint = [string]$latest.planFingerprint
+    if (-not $latestPlanFingerprint -and $latest.bookmarkSummary) {
+        $latestPlanFingerprint = [string]$latest.bookmarkSummary.planFingerprint
+    }
+}
+$latestPlanFingerprintPresent = -not [string]::IsNullOrWhiteSpace($latestPlanFingerprint)
+$latestPlanFingerprintMatches = -not $latestPlanFingerprintPresent `
+    -or ($currentPlanReadable -and $currentPlanFingerprint -eq $latestPlanFingerprint)
 $latestPlanIdentities = if ($latest) { @(
     @($latest.results) | ForEach-Object { Get-HealthResultIdentity $_ } | Where-Object { $_ } | Sort-Object -Unique
 ) } else { @() }
@@ -218,7 +230,8 @@ $latestPlanIdentityReady = $latest `
 $latestTopLevelMatchesCurrentPlan = $currentPlanIdentityReady `
     -and $latestPlanIdentityReady `
     -and $currentPlannedTotal -eq $latestPlannedTotal `
-    -and @(Compare-Object -ReferenceObject $currentPlanIdentities -DifferenceObject $latestPlanIdentities).Count -eq 0
+    -and @(Compare-Object -ReferenceObject $currentPlanIdentities -DifferenceObject $latestPlanIdentities).Count -eq 0 `
+    -and $latestPlanFingerprintMatches
 
 $currentAccountGroups = @(if ($currentPlanReadable) { @($currentPlan.accountGroups) } else { @() })
 $currentAccountIdentityCount = @($currentAccountGroups | ForEach-Object { @($_.identities) }).Count
@@ -322,6 +335,26 @@ foreach ($group in $currentAccountGroups) {
     }
 }
 $latestMatchesCurrentPlan = $latestTopLevelMatchesCurrentPlan -and $latestAccountsMatchCurrentPlan
+$latestExecutionComplete = [bool]$latestResultComplete
+$latestBusinessComplete = [bool]$latestExecutionComplete `
+    -and [bool]$latestMatchesCurrentPlan `
+    -and $null -ne $problemCount `
+    -and $problemCount -eq 0 `
+    -and $latestAccountProblemCount -eq 0
+$reportStatus = if (-not $latest) { 'missing' }
+    elseif (-not $latestExecutionComplete) { 'incomplete' }
+    elseif ($latestBusinessComplete) { 'complete' }
+    else { 'needs_attention' }
+$pendingExternalCount = if ($latest) { @($latest.results | Where-Object {
+    [string]$_.status -eq 'deferred' `
+        -or [string]$_.status -in @('login_required', 'interactive_challenge', 'managed_challenge', 'managed_challenge_timeout')
+}).Count } else { 0 }
+$runDueNow = $false
+try {
+    $scheduledToday = [datetime]::ParseExact("$((Get-Date).ToString('yyyy-MM-dd')) $([string]$config.schedule)", 'yyyy-MM-dd HH:mm', $null)
+    $runDueNow = (Get-Date) -ge $scheduledToday -and -not $latestBusinessComplete
+}
+catch { $runDueNow = $false }
 
 $scheduleValid = [string]$config.schedule -match '^([01]\d|2[0-3]):[0-5]\d$'
 $probeInterval = if ($null -ne $config.schedulerProbeIntervalMinutes) { [int]$config.schedulerProbeIntervalMinutes } else { 60 }
@@ -426,7 +459,10 @@ $checks = [ordered]@{
     latestResultPresent = [bool]$latest
     latestRunToday = [bool]$latestRunToday
     latestResultComplete = [bool]$latestResultComplete
+    latestExecutionComplete = [bool]$latestExecutionComplete
+    latestBusinessComplete = [bool]$latestBusinessComplete
     latestMatchesCurrentPlan = [bool]$latestMatchesCurrentPlan
+    latestPlanFingerprintMatches = [bool]$latestPlanFingerprintMatches
     latestAccountResultsConfirmed = [bool]$latestAccountsMatchCurrentPlan -and $latestAccountProblemCount -eq 0
     latestResultConfirmed = [bool]$latestResultComplete -and [bool]$latestMatchesCurrentPlan -and $null -ne $problemCount -and $problemCount -eq 0 -and $latestAccountProblemCount -eq 0
     siteStatePresent = Test-Path -LiteralPath $statePath
@@ -457,6 +493,14 @@ $healthy = $failedChecks.Count -eq 0
     currentPlannedTotal = $currentPlannedTotal
     latestPlannedTotal = if ($latest -and $null -ne $latest.plannedTotal) { [int]$latest.plannedTotal } else { $null }
     currentPlanMatchesLatest = [bool]$latestMatchesCurrentPlan
+    currentPlanFingerprint = if ($currentPlanFingerprint) { $currentPlanFingerprint } else { $null }
+    latestPlanFingerprint = if ($latestPlanFingerprintPresent) { $latestPlanFingerprint } else { $null }
+    latestPlanFingerprintMatches = [bool]$latestPlanFingerprintMatches
+    reportStatus = $reportStatus
+    latestExecutionComplete = [bool]$latestExecutionComplete
+    latestBusinessComplete = [bool]$latestBusinessComplete
+    runDueNow = [bool]$runDueNow
+    pendingExternalCount = [int]$pendingExternalCount
     currentPlanIdentityCount = $currentPlanIdentities.Count
     latestPlanIdentityCount = $latestPlanIdentities.Count
     currentAccountIdentityCount = $currentAccountIdentityCount

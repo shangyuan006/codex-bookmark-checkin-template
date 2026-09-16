@@ -145,7 +145,8 @@ test("恢复调度只复用清理后的登录 URL 并解析助手状态", async 
   assert.match(source, /if \(current\.status === "login_required"\) \{[\s\S]*?method: "saved_password"/);
   assert.match(source, /authoritativeCheckinStatus/);
   assert.match(source, /\["signed", "already_signed"\]\.includes\(sameSessionStatus\)/);
-  assert.match(source, /const needsRecoveryBrowser = recoveryIndexes\.some/);
+  assert.match(source, /const needsRecoveryBrowser = recoveryEntries\.some/);
+  assert.doesNotMatch(source, /selectedTargets\[resultIndex\]/);
   assert.match(source, /needsRecoveryBrowser \? await launchAutomationContext\(config\) : null/);
   assert.match(source, /await recoveryContext\?\.close\(\)/);
 });

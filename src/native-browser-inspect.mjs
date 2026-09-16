@@ -4,10 +4,9 @@ import { classifyPageText } from "./detector.mjs";
 import { connectOverCdpWithRetry, evaluateOverRawCdp } from "./native-cdp.mjs";
 import {
   clickVisibleNativeChallengeControl,
-  clickUniqueNativeCheckinAction,
-  dismissNativeCheckinOverlays,
   matchesNativeCompletedControlText,
   normalizeNativeCheckinActionRule,
+  waitForNativeCheckinAction,
 } from "./native-checkin-action.mjs";
 import { pagesForOrigin, selectNewestOriginPage } from "./native-page-selection.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
@@ -136,14 +135,13 @@ async function inspectWithPlaywright() {
   let confirmationDeadline = pageDeadline;
   let current = await readPageState(page);
   if (executeCheckin && !["signed", "already_signed"].includes(current.state.status)) {
-    await dismissNativeCheckinOverlays(page, expectedOrigin, actionRule);
-    current = await readPageState(page);
-    if (current.state.status === "ready") {
-      const action = await clickUniqueNativeCheckinAction(page, expectedOrigin, actionRule);
-      actionAttempted = action.clicked;
-      actionOutcome = action.outcome;
-      if (actionAttempted) confirmationDeadline = Date.now() + maxWaitSeconds * 1000;
-    }
+    const action = await waitForNativeCheckinAction(page, expectedOrigin, actionRule, {
+      readState: async activePage => (await readPageState(activePage)).state,
+      timeoutMs: maxWaitSeconds * 1000,
+    });
+    actionAttempted = action.clicked;
+    actionOutcome = action.outcome;
+    if (actionAttempted) confirmationDeadline = Date.now() + maxWaitSeconds * 1000;
   }
 
   let output = null;
@@ -161,6 +159,7 @@ async function inspectWithPlaywright() {
       current = await readPageState(page);
       output = {
         status: current.state.status,
+        failureCode: current.state.failureCode,
         siteBodyLoaded: current.siteBodyLoaded,
         attendanceEndpoint: current.attendanceEndpoint,
         actionAttempted,

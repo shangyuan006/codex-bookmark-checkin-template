@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { readEffectiveBookmarkPlan } from "./effective-bookmark-plan.mjs";
 import {
@@ -24,6 +25,35 @@ function enabledReauthRule(config, origin) {
     throw new TypeError("reauthCheckinRules entry must be an object");
   }
   return raw;
+}
+
+function sortedStrings(values) {
+  return [...new Set((values ?? []).map((value) => String(value ?? "").trim()).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+}
+
+export function planFingerprintInput(plan, accountGroups = []) {
+  const targets = (plan?.targets ?? []).map((target) => ({
+    origin: String(target.origin),
+    candidates: sortedStrings(target.candidates),
+    allowedOrigins: sortedStrings(target.allowedOrigins),
+    folderNames: sortedStrings(target.folderNames),
+  })).sort((left, right) => left.origin.localeCompare(right.origin));
+  const accounts = accountGroups.map((group) => ({
+    origin: String(group.origin),
+    identities: sortedStrings(group.identities),
+    accounts: (group.accounts ?? []).map((account) => ({
+      identity: String(account.identity),
+      provider: String(account.provider),
+    })).sort((left, right) => left.identity.localeCompare(right.identity)),
+  })).sort((left, right) => left.origin.localeCompare(right.origin));
+  return { version: 1, targets, accountGroups: accounts };
+}
+
+export function computePlanFingerprint(plan, accountGroups = []) {
+  return createHash("sha256")
+    .update(JSON.stringify(planFingerprintInput(plan, accountGroups)))
+    .digest("hex");
 }
 
 export function buildCurrentPlan(plan, config = {}) {
@@ -57,13 +87,15 @@ export function buildCurrentPlan(plan, config = {}) {
     }];
   });
 
-  return {
+  const result = {
     targetCount: targets.length,
     identities,
     accountGroupCount: accountGroups.length,
     accountIdentityCount: accountGroups.reduce((count, group) => count + group.identities.length, 0),
     accountGroups,
   };
+  result.planFingerprint = computePlanFingerprint(plan, accountGroups);
+  return result;
 }
 
 export async function loadCurrentPlan(rootDirectory = defaultRootDirectory) {

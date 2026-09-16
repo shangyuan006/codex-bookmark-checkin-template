@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { atomicWriteJson, redactPrivateResultText } from "./security.mjs";
+import { isConfirmedNotAvailable, isTerminalResult } from "./result-contract.mjs";
 
-const CONFIRMED = new Set(["signed", "already_signed", "not_available"]);
 const SUCCESSFUL = new Set(["signed", "already_signed"]);
 
 export async function loadSiteState(filePath) {
@@ -50,9 +50,16 @@ export function reuseRecentNotAvailable(target, state, config = {}, now = new Da
 
   return {
     status: "not_available",
+    availabilityKind: "feature_disabled",
     reason: `近期已确认未开放签到，按 ${recheckHours} 小时周期复核`,
     cached: true,
     attempt: 0,
+    evidence: prior.lastConfirmedEvidence ?? {
+      source: "configuration",
+      outcome: "known_no_checkin_feature",
+      authoritative: true,
+      confirmedAt: prior.lastConfirmedAt,
+    },
   };
 }
 
@@ -81,7 +88,7 @@ export function updateSiteState(previous, results, finishedAt = new Date()) {
     const durationMs = Math.max(0, Number(result.durationMs) || 0);
     const priorAverage = Math.max(0, Number(prior.averageDurationMs) || 0);
     const averageDurationMs = Math.round(((priorAverage * (runCount - 1)) + durationMs) / runCount);
-    const confirmed = CONFIRMED.has(result.status);
+    const confirmed = isTerminalResult(result);
     const successful = SUCCESSFUL.has(result.status);
     const preferredUrl = reusablePreferredUrl(result) ?? prior.preferredUrl ?? null;
     sites[result.origin] = {
@@ -94,6 +101,9 @@ export function updateSiteState(previous, results, finishedAt = new Date()) {
       lastConfirmedReason: confirmed
         ? redactPrivateResultText(result.reason).slice(0, 240)
         : (prior.lastConfirmedReason ?? null),
+      lastConfirmedEvidence: confirmed && isConfirmedNotAvailable(result)
+        ? result.evidence
+        : (prior.lastConfirmedEvidence ?? null),
       lastSuccessAt: successful ? timestamp : (prior.lastSuccessAt ?? null),
       failureStreak: confirmed ? 0 : Number(prior.failureStreak ?? 0) + 1,
       runCount,

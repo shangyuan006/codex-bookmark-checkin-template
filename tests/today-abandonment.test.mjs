@@ -11,6 +11,7 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const scriptPath = path.join(root, "scripts", "Set-TodayAbandonment.ps1");
 const helperPath = path.join(root, "scripts", "ManualAbandonment.ps1");
 const verificationHelperPath = path.join(root, "scripts", "ManualVerification.ps1");
+const resultContractHelperPath = path.join(root, "scripts", "ResultContract.ps1");
 const runtimePath = path.join(root, "scripts", "Resolve-Runtime.ps1");
 
 function localDateKey() {
@@ -51,6 +52,7 @@ async function createFixture({ activeSession = false, pendingVerificationOrigins
     fs.copyFile(scriptPath, path.join(scriptsDirectory, "Set-TodayAbandonment.ps1")),
     fs.copyFile(helperPath, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
     fs.copyFile(verificationHelperPath, path.join(scriptsDirectory, "ManualVerification.ps1")),
+    fs.copyFile(resultContractHelperPath, path.join(scriptsDirectory, "ResultContract.ps1")),
     fs.copyFile(runtimePath, path.join(scriptsDirectory, "Resolve-Runtime.ps1")),
     fs.writeFile(path.join(configDirectory, "config.json"), JSON.stringify({
       nodeExecutable: process.execPath,

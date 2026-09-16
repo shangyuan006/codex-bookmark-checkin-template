@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 
 const workflowUrl = new URL("../.github/workflows/ci.yml", import.meta.url);
 const gitleaksConfigUrl = new URL("../.gitleaks.toml", import.meta.url);
+const auditScriptUrl = new URL("../scripts/Invoke-NpmAuditWithRetry.ps1", import.meta.url);
 
 test("CI pins third-party actions and grants read-only repository access", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
@@ -28,17 +29,28 @@ test("CI verifies Gitleaks before scanning the complete Git history", async () =
   assert.match(workflow, /gitleaks git --config \.gitleaks\.toml --redact --no-banner --exit-code 1 \./);
 });
 
-test("CI retains dependency, test, public-safety, and audit gates", async () => {
+test("CI retains dependency, test, public-safety, and bounded audit gates", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
 
   for (const command of [
     "npm ci",
     "npm test",
     "./scripts/Scan-PublicSafety.ps1",
-    "npm audit --omit=dev",
+    "./scripts/Invoke-NpmAuditWithRetry.ps1",
   ]) {
     assert.ok(workflow.includes(command), `missing CI gate: ${command}`);
   }
+});
+
+test("npm audit retries only bounded transient registry failures", async () => {
+  const script = await readFile(auditScriptUrl, "utf8");
+
+  assert.match(script, /ValidateRange\(1, 5\)/);
+  assert.match(script, /fetch-timeout=30000/);
+  assert.match(script, /fetch-retries=0/);
+  assert.match(script, /HTTP\\s\*\(\?:503\|429\)/);
+  assert.match(script, /Vulnerability findings and unknown npm failures/);
+  assert.match(script, /exit \$exitCode/);
 });
 
 test("Gitleaks keeps default rules and narrowly allows the public OCR alphabet", async () => {

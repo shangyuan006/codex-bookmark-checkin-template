@@ -1,9 +1,10 @@
-$script:ManualVerificationTerminalStatuses = @('signed', 'already_signed', 'not_available')
+$script:ManualVerificationTerminalStatuses = @('signed', 'already_signed')
 $script:ManualVerificationImmediateStatuses = @(
     'error', 'login_required', 'interactive_challenge', 'managed_challenge',
     'managed_challenge_timeout', 'needs_attention', 'unconfirmed', 'clicked', 'visited'
 )
 $script:ManualVerificationHandoffDeferredCauses = @('login_required', 'managed_challenge_timeout')
+. (Join-Path $PSScriptRoot 'ResultContract.ps1')
 
 function ConvertTo-ManualVerificationOrigin($Value) {
     $uri = try { [uri]([string]$Value) } catch { $null }
@@ -13,8 +14,33 @@ function ConvertTo-ManualVerificationOrigin($Value) {
     return "$($uri.Scheme)://$($uri.Authority)"
 }
 
-function Test-ManualVerificationTerminalStatus($Status) {
-    return [string]$Status -in $script:ManualVerificationTerminalStatuses
+function Test-ManualVerificationTerminalStatus($Status, $Evidence = $null) {
+    if ([string]$Status -in $script:ManualVerificationTerminalStatuses) { return $true }
+    if ([string]$Status -ne 'not_available') { return $false }
+    return Test-ConfirmedNotAvailable ([pscustomobject]@{
+        status = $Status
+        availabilityKind = $Evidence.availabilityKind
+        disabledByConfig = $Evidence.disabledByConfig
+        temporarilyUnavailable = $Evidence.temporarilyUnavailable
+        evidence = $Evidence
+    })
+}
+
+function Test-ManualVerificationResultTerminal($Result) {
+    return Test-CheckinResultTerminal $Result
+}
+
+function Test-ManualVerificationTargetTerminal($Target) {
+    if ($null -eq $Target) { return $false }
+    if ([string]$Target.verificationStatus -in $script:ManualVerificationTerminalStatuses) { return $true }
+    if ([string]$Target.verificationStatus -ne 'not_available') { return $false }
+    return Test-ConfirmedNotAvailable ([pscustomobject]@{
+        status = [string]$Target.verificationStatus
+        availabilityKind = $Target.availabilityKind
+        disabledByConfig = $Target.disabledByConfig
+        temporarilyUnavailable = $Target.temporarilyUnavailable
+        evidence = $Target.evidence
+    })
 }
 
 function ConvertTo-ManualVerificationUtcDateTime($Value) {
@@ -62,7 +88,7 @@ function Test-ManualVerificationFinalReport($Report) {
 }
 
 function Test-ManualVerificationImmediateResult($Result, [datetime]$RetryAt) {
-    if ($null -eq $Result -or (Test-ManualVerificationTerminalStatus $Result.status)) { return $false }
+    if ($null -eq $Result -or (Test-ManualVerificationResultTerminal $Result)) { return $false }
     $status = [string]$Result.status
     if ($status -eq 'deferred') {
         if (-not $Result.nextEligibleAt) { return $true }
@@ -74,7 +100,7 @@ function Test-ManualVerificationImmediateResult($Result, [datetime]$RetryAt) {
 }
 
 function Test-ManualVerificationHandoffResult($Result) {
-    if ($null -eq $Result -or (Test-ManualVerificationTerminalStatus $Result.status)) { return $false }
+    if ($null -eq $Result -or (Test-ManualVerificationResultTerminal $Result)) { return $false }
     if ([string]$Result.status -eq 'deferred') {
         return [string]$Result.retryCause -in $script:ManualVerificationHandoffDeferredCauses
     }
@@ -82,7 +108,10 @@ function Test-ManualVerificationHandoffResult($Result) {
 }
 
 function Get-ManualHandoffTargets($Report, [datetime]$Now = (Get-Date)) {
-    if ($null -eq $Report -or [string]$Report.runState -ne 'final' -or $Report.isComplete -ne $true) {
+    # A final but partial report still needs a durable handoff.  The automatic
+    # runner must not silently drop sites when a timeout or browser restart
+    # prevents the report from reaching plannedTotal.
+    if ($null -eq $Report -or [string]$Report.runState -notin @('final', 'in_progress') -or @($Report.results).Count -eq 0) {
         return @()
     }
     $targets = @()
@@ -115,7 +144,7 @@ function Get-PendingManualVerification([string]$Path) {
     foreach ($target in @($document.targets)) {
         $origin = ConvertTo-ManualVerificationOrigin $target.origin
         if (-not $origin) { return $null }
-        if (-not (Test-ManualVerificationTerminalStatus $target.verificationStatus)) {
+        if (-not (Test-ManualVerificationTargetTerminal $target)) {
             $origins += $origin
         }
     }
@@ -176,11 +205,15 @@ function Update-ManualVerificationState($Pending, $Report, [string]$Path, [datet
             $target.verificationStatus = [string]$result.status
             $target | Add-Member -NotePropertyName verificationReason -NotePropertyValue ([string]$result.reason) -Force
             $target | Add-Member -NotePropertyName retryCause -NotePropertyValue ([string]$result.retryCause) -Force
+            $target | Add-Member -NotePropertyName availabilityKind -NotePropertyValue ([string]$result.availabilityKind) -Force
+            $target | Add-Member -NotePropertyName disabledByConfig -NotePropertyValue ($result.disabledByConfig -eq $true) -Force
+            $target | Add-Member -NotePropertyName temporarilyUnavailable -NotePropertyValue ($result.temporarilyUnavailable -eq $true) -Force
+            $target | Add-Member -NotePropertyName evidence -NotePropertyValue $result.evidence -Force
             $nextEligibleAt = ConvertTo-ManualVerificationUtcDateTime $result.nextEligibleAt
             $nextEligibleAtText = if ($null -ne $nextEligibleAt) { $nextEligibleAt.ToString('o') } else { [string]$result.nextEligibleAt }
             $target | Add-Member -NotePropertyName nextEligibleAt -NotePropertyValue $nextEligibleAtText -Force
         }
-        if (-not (Test-ManualVerificationTerminalStatus $target.verificationStatus)) {
+        if (-not (Test-ManualVerificationTargetTerminal $target)) {
             $allConfirmed = $false
             $pendingOrigins += $origin
         }

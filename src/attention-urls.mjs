@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readBookmarkPlan } from "./bookmarks.mjs";
+import { isTerminalResult } from "./result-contract.mjs";
 
 export const ATTENTION_STATUSES = new Set([
   "error",
@@ -10,11 +11,12 @@ export const ATTENTION_STATUSES = new Set([
   "managed_challenge",
   "managed_challenge_timeout",
   "needs_attention",
+  "unconfirmed",
+  "clicked",
+  "visited",
 ]);
 
 const MANUAL_DEFERRED_CAUSES = new Set(["login_required", "managed_challenge_timeout"]);
-const AUTHORITATIVE_STATUSES = new Set(["signed", "already_signed", "not_available"]);
-
 export function requiresManualAttention(result) {
   if (result?.status === "deferred") return MANUAL_DEFERRED_CAUSES.has(result.retryCause);
   return ATTENTION_STATUSES.has(result?.status);
@@ -88,7 +90,7 @@ export function mergeAttentionEvidence(latest, runReports = []) {
     .map((result) => [result.origin, result]));
   for (const [origin, candidate] of newestByOrigin) {
     const current = merged.get(origin);
-    if (AUTHORITATIVE_STATUSES.has(current?.status)) continue;
+    if (isTerminalResult(current)) continue;
     merged.set(origin, candidate);
   }
   return {

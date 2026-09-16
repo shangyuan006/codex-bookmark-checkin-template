@@ -44,6 +44,15 @@ const latest = {
   ],
 };
 
+test("unconfirmed outcomes reach both automatic and explicit manual handoff", () => {
+  for (const status of ["unconfirmed", "clicked", "visited"]) {
+    const pending = {...latest,results:[{origin:"https://alpha.example",status}]};
+    assert.equal(requiresManualAttention(pending.results[0]),true);
+    assert.equal(buildAttentionHandoff({plan,latest:pending}).targets[0].origin,"https://alpha.example");
+    assert.equal(buildAttentionHandoff({plan,latest:pending,requestedOrigins:["https://alpha.example"]}).targets.length,1);
+  }
+});
+
 test("手动交接忽略旧报告 URL，并从当前书签计划解析地址", () => {
   const handoff = buildAttentionHandoff({ plan, latest });
 
@@ -141,7 +150,11 @@ test("persisted handoff accepts clicked evidence and excludes abandoned origins"
     plan,
     latest: unresolved,
     excludedOrigins: ["https://beta.example"],
-  }).targets, []);
+  }).targets, [{
+    origin: "https://alpha.example",
+    url: "https://alpha.example/user/attendance",
+    previousStatus: "clicked",
+  }]);
   assert.throws(() => buildAttentionHandoff({
     plan,
     latest: unresolved,

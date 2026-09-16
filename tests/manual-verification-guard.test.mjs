@@ -82,6 +82,30 @@ test("completed records do not block ordinary runs", () => {
   }));
 });
 
+test("not_available requires authoritative evidence before manual verification is consumed", () => {
+  const target = {
+    origin: "https://disabled.example",
+    verificationStatus: "not_available",
+  };
+  assert.deepEqual(pendingManualVerificationOrigins({
+    ...pending,
+    targets: [target],
+  }), ["https://disabled.example"]);
+  assert.deepEqual(pendingManualVerificationOrigins({
+    ...pending,
+    targets: [{
+      ...target,
+      availabilityKind: "feature_disabled",
+      evidence: {
+        source: "configuration",
+        outcome: "known_no_checkin_feature",
+        authoritative: true,
+        confirmedAt: "2026-08-12T01:00:00.000Z",
+      },
+    }],
+  }), []);
+});
+
 test("malformed current-day pending records fail closed", () => {
   assert.throws(() => assertManualVerificationExecution({
     ...pending,

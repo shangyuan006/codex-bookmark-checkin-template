@@ -8,6 +8,7 @@ import { loginHelperOutcomeFromStreams } from "./login-recovery.mjs";
 import { localRunDate, nextShanghaiTime } from "./retry-policy.mjs";
 import { normalizeAgentRouterAccountKey, normalizeReauthProvider } from "./result-identity.mjs";
 import { atomicWriteJson, safeErrorMessage } from "./security.mjs";
+import { hasCurrentReauthEvidence, reauthRecoveryAction, resetReauthLoginEvidence } from "./reauth-recovery.mjs";
 
 const execFileAsync = promisify(execFile);
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -848,8 +849,8 @@ async function inspectCurrentLogin(config, rule) {
   }
 }
 
-export function classifyReauthSessionAfterOAuthFailure(currentLogin) {
-  if (currentLogin?.valid && currentLogin?.explicitLoginSuccess) {
+export function classifyReauthSessionAfterOAuthFailure(currentLogin, previous, now = new Date()) {
+  if (hasCurrentReauthEvidence(currentLogin, previous, now)) {
     return {
       status: "already_signed",
       reason: "OAuth 未完成，但同一隔离会话已确认目标站今日状态",
@@ -862,6 +863,13 @@ export async function inspectConfiguredReauthLogin(config, rule) {
   return inspectCurrentLogin(config, rule);
 }
 
+export async function inspectConfiguredReauthRecovery(rule, now = new Date()) {
+  const state = await readState(rule.statePath ?? defaultStatePath);
+  // Never borrow another account's legacy origin-only record.
+  const previous = state.entries?.[`${rule.origin}::${rule.accountKey}`];
+  return { previous, action: reauthRecoveryAction(previous, now) };
+}
+
 async function confirmReauthSessionAfterOAuthFailure(config, rule, statePath, stateKey, date) {
   let currentLogin;
   try {
@@ -869,9 +877,9 @@ async function confirmReauthSessionAfterOAuthFailure(config, rule, statePath, st
   } catch {
     return null;
   }
-  const result = classifyReauthSessionAfterOAuthFailure(currentLogin);
-  if (!result) return null;
   const refreshed = await readState(statePath);
+  const result = classifyReauthSessionAfterOAuthFailure(currentLogin, refreshed.entries?.[stateKey]);
+  if (!result || localRunDate() !== date) return null;
   await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));
   return result;
 }
@@ -897,19 +905,19 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   const stateKey = `${rule.origin}::${rule.accountKey}`;
   const accountConfig = { ...config, automationUserDataDir: rule.automationUserDataDir };
   const state = await readState(statePath);
-  const previous = state.entries?.[stateKey] ?? state.entries?.[rule.origin];
-  if (shouldReuseCompletedReauthState(previous, date, options.forceReauth)) {
+  const previous = state.entries?.[stateKey];
+  if (shouldReuseCompletedReauthState(previous, date, options.forceReauth, now)) {
     return { status: "already_signed", reason: "今日已通过重新登录确认额度到账" };
   }
   if (options.postOAuthVerify) {
-    if (previous?.date !== date || previous.status !== "logged_out") {
+    if (reauthRecoveryAction(previous, now) !== "resume") {
       return {
         status: "needs_attention",
         reason: "OAuth 后复核缺少今天的已退出状态，未再次发起登录",
       };
     }
     const currentLogin = await inspectCurrentLogin(accountConfig, rule);
-    if (!currentLogin.valid || !currentLogin.explicitLoginSuccess) {
+    if (!hasCurrentReauthEvidence(currentLogin, previous)) {
       return {
         status: "needs_attention",
         reason: "OAuth 后未取得目标站权威登录或额度到账信号，未再次发起登录",
@@ -919,7 +927,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));
     return { status: "signed", reason: "重新登录后站点确认额度已到账" };
   }
-  if (previous?.date === date && previous.status === "logged_out") {
+  if (reauthRecoveryAction(previous, now) === "resume") {
     let currentLogin = await inspectCurrentLogin(accountConfig, rule);
     if (!currentLogin.valid) {
       const oauthResult = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO"
@@ -938,7 +946,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
       }
       currentLogin = await inspectCurrentLogin(accountConfig, rule);
     }
-    if (previous.status === "logged_out" && currentLogin.valid && currentLogin.explicitLoginSuccess) {
+    if (hasCurrentReauthEvidence(currentLogin, previous)) {
       const refreshed = await readState(statePath);
       await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));
       return { status: "signed", reason: "重新登录后站点确认额度已到账" };
@@ -948,16 +956,8 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
       reason: "今日重新认证曾中断；登录已尽力恢复，但缺少登录前后额度证据",
     };
   }
-  if (previous?.date === date && previous.status === "started") {
-    const currentLogin = await inspectCurrentLogin(accountConfig, rule);
-    if (currentLogin.valid && currentLogin.explicitLoginSuccess) {
-      const refreshed = await readState(statePath);
-      await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));
-      return { status: "signed", reason: "重新登录后站点确认额度已到账" };
-    }
-    // A started run may have been interrupted before OAuth login. Continue
-    // with a fresh before/after cycle instead of leaving the account stuck.
-  }
+  // Missing/started/old records cannot date a persisted login marker. Restart
+  // the before/after cycle rather than accepting that marker as today's proof.
 
   let beforeSession;
   let before;
@@ -1000,10 +1000,14 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     }
     if (logoutMatches.length !== 1) throw new Error("没有找到唯一可见的退出动作");
     await writeState(statePath, state, stateKey, buildReauthStateEntry(date, "started", now));
+    const loginEvidenceReset = await resetReauthLoginEvidence(beforeSession.page, rule);
     await logoutMatches[0].click();
     await beforeSession.page.waitForTimeout(1_000);
     const refreshed = await readState(statePath);
-    await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "logged_out", new Date()));
+    await writeState(statePath, refreshed, stateKey, {
+      ...buildReauthStateEntry(date, "logged_out", new Date()),
+      loginEvidenceReset,
+    });
   } catch (error) {
     return { status: "needs_attention", reason: safeErrorMessage(error) };
   } finally {
@@ -1047,10 +1051,10 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   }
 }
 
-export function shouldReuseCompletedReauthState(previous, date, forceReauth = false) {
+export function shouldReuseCompletedReauthState(previous, date, forceReauth = false, now = new Date()) {
   return forceReauth !== true
     && previous?.date === date
-    && previous.status === "completed";
+    && reauthRecoveryAction(previous, now) === "complete";
 }
 
 export async function runConfiguredReauthCheckin(target, config, options = {}) {

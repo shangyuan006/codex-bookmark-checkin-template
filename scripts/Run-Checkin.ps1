@@ -15,8 +15,10 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 . (Join-Path $PSScriptRoot 'RunLock.ps1')
 . (Join-Path $PSScriptRoot 'ManualVerification.ps1')
+. (Join-Path $PSScriptRoot 'ResultContract.ps1')
 . (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 . (Join-Path $PSScriptRoot 'NativeFallbackPolicy.ps1')
+. (Join-Path $PSScriptRoot 'PreflightScope.ps1')
 . (Join-Path $PSScriptRoot 'TaskRetryPolicy.ps1')
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $reporterScript = Join-Path $PSScriptRoot 'Submit-UnifiedCheckinReport.ps1'
@@ -36,6 +38,20 @@ $resumeCandidate = $null
 $wrapperMutex = $null
 $wrapperMutexOwned = $false
 $manualVerification = $null
+$currentPlanFingerprint = ''
+
+function Get-CurrentPlanFingerprint {
+    try {
+        $currentPlanScript = Join-Path $root 'src\current-plan.mjs'
+        $raw = @(& $node $currentPlanScript '--root' $root 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $raw.Count -eq 0) { return '' }
+        $plan = ($raw -join [Environment]::NewLine) | ConvertFrom-Json
+        $fingerprint = [string]$plan.planFingerprint
+        if ($fingerprint -match '^[a-f0-9]{64}$') { return $fingerprint }
+    }
+    catch { }
+    return ''
+}
 
 function Get-FreshResumeReport([datetime]$NotBefore) {
     $logsRoot = Join-Path $root 'logs'
@@ -55,6 +71,13 @@ function Get-FreshResumeReport([datetime]$NotBefore) {
         try {
             $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $file.FullName | ConvertFrom-Json
             if ([string]$value.runId -like "$todayPrefix*" -and $null -ne $value.results) {
+                $candidateFingerprint = [string]$value.planFingerprint
+                if (-not $candidateFingerprint -and $value.bookmarkSummary) {
+                    $candidateFingerprint = [string]$value.bookmarkSummary.planFingerprint
+                }
+                if ($currentPlanFingerprint -and $candidateFingerprint -and $candidateFingerprint -ne $currentPlanFingerprint) {
+                    continue
+                }
                 $plannedTotal = if ($null -ne $value.plannedTotal) { [int]$value.plannedTotal } else { 0 }
                 $processedTotal = if ($null -ne $value.processedTotal) { [int]$value.processedTotal } else { @($value.results).Count }
                 $completeFinal = [string]$value.runState -eq 'final' `
@@ -83,6 +106,13 @@ function Get-TodayResumeReport {
     try {
         $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json
         $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
+        $latestFingerprint = [string]$value.planFingerprint
+        if (-not $latestFingerprint -and $value.bookmarkSummary) {
+            $latestFingerprint = [string]$value.bookmarkSummary.planFingerprint
+        }
+        if ($currentPlanFingerprint -and $latestFingerprint -and $latestFingerprint -ne $currentPlanFingerprint) {
+            return $null
+        }
         $minimumTargets = [Math]::Max(1, [int]$config.minimumBookmarkTargetCount)
         if ([string]$value.runId -like "$todayPrefix*" `
             -and [string]$value.runState -eq 'final' `
@@ -106,7 +136,7 @@ function Test-IsCompleteFinalReport($Report) {
 function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
     $results = @($Report.results)
     if (-not (Test-IsCompleteFinalReport $Report)) { return $true }
-    $unresolved = @($results | Where-Object { $_.status -notin @('signed', 'already_signed', 'not_available') })
+    $unresolved = @($results | Where-Object { -not (Test-CheckinResultTerminal $_) })
     if ($unresolved.Count -eq 0) { return $false }
     $immediateRetryStatuses = @('error', 'login_required', 'managed_challenge', 'managed_challenge_timeout', 'unconfirmed', 'clicked', 'visited')
     foreach ($result in $unresolved) {
@@ -211,6 +241,7 @@ function Write-ManualHandoff($Report, [datetime]$Now = (Get-Date)) {
         createdAt = $Now.ToUniversalTime().ToString('o')
         sourceRunId = [string]$Report.runId
         sourceFinishedAt = [string]$Report.finishedAt
+        sourceReportComplete = ($Report.isComplete -eq $true)
         authoritativeEvidenceRequired = $true
         targets = $targets
     }
@@ -240,6 +271,7 @@ try {
     if (-not (Test-Path -LiteralPath $configPath)) { throw '尚未初始化，请先运行 scripts\Initialize-Checkin.ps1。' }
     $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
     $node = Resolve-CheckinNode $config
+    $currentPlanFingerprint = Get-CurrentPlanFingerprint
     $requestedOrigins = @(Resolve-RequestedCheckinOrigins $Origins)
     if ($ReauthAccountKey -and $requestedOrigins.Count -gt 0) {
         throw 'Origins 不能与 Agent Router 的 ReauthAccountKey 同时使用。'
@@ -389,7 +421,7 @@ try {
                     foreach ($result in @($resumeCandidate.Report.results)) {
                         $resultOrigin = [string]$result.origin
                         $previousOriginSet[$resultOrigin] = $true
-                        if ([string]$result.status -notin @('signed', 'already_signed', 'not_available')) {
+                        if (-not (Test-CheckinResultTerminal $result)) {
                             $pendingOriginSet[$resultOrigin] = $true
                         }
                     }
@@ -419,11 +451,18 @@ try {
                         -not ($nativeFallbackOnlyOrigins -contains [string]$_.origin)
                     })
                 }
+                $scopeOrigins = @(Get-CheckinRunOrigins -Arguments $runArguments)
+                $excludedPreflightOrigins = @($config.disabledCheckinOrigins) + @($config.knownNoCheckinFeatureOrigins)
+                if (-not $OverrideTodayAbandonment) {
+                    $excludedPreflightOrigins += @((Get-TodayAbandonedOrigins -Path $manualAbandonPath).Keys)
+                }
+                $preflightTargets = @(Select-CheckinPreflightTargets -Targets $preflightTargets `
+                    -ScopeOrigins $scopeOrigins -ExcludedOrigins @($excludedPreflightOrigins | Where-Object { $_ }))
                 $preflightOrigins = @($preflightTargets | ForEach-Object {
                     if (@($_.allowedOrigins).Count -gt 0) { @($_.allowedOrigins) } else { [string]$_.origin }
-                } | Sort-Object -Unique)
+                } | Where-Object { $_ -notin $excludedPreflightOrigins } | Sort-Object -Unique)
                 if ($preflightOrigins.Count -gt 0) {
-                    & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins
+                    & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins -OverrideTodayAbandonment:$OverrideTodayAbandonment
                 }
             }
 
@@ -515,7 +554,10 @@ try {
                     }
                 }
             }
-            if ($null -ne $freshCandidate -and (Test-IsCompleteFinalReport $freshCandidate.Report)) {
+            if ($null -ne $freshCandidate `
+                -and $null -ne $freshCandidate.Report `
+                -and [string]$freshCandidate.Report.runState -in @('final', 'in_progress') `
+                -and @($freshCandidate.Report.results).Count -gt 0) {
                 [void](Write-ManualHandoff $freshCandidate.Report (Get-Date))
             }
             if ($nodeExitCode -eq 0 -and ($null -eq $freshCandidate -or -not (Test-IsCompleteFinalReport $freshCandidate.Report))) {

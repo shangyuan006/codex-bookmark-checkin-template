@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import {
   getConfiguredReauthAccounts,
   inspectConfiguredReauthLogin,
+  inspectConfiguredReauthRecovery,
+  classifyReauthSessionAfterOAuthFailure,
 } from "./reauth-checkin.mjs";
 
 const rootDirectory = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -26,11 +28,20 @@ try {
   const account = getConfiguredReauthAccounts(target, config)
     .find((candidate) => candidate.accountKey === accountKey);
   if (!account) throw new Error("configured Agent Router account was not found");
-  const login = await inspectConfiguredReauthLogin({
-    ...config,
-    automationUserDataDir: account.automationUserDataDir,
-  }, account);
-  print(login.valid && login.explicitLoginSuccess ? "already_signed" : "needs_attention");
+  const recovery = await inspectConfiguredReauthRecovery(account);
+  if (process.argv.includes("--recovery-state")) {
+    process.stdout.write(`${JSON.stringify({ action: recovery.action })}\n`);
+  } else if (recovery.action === "complete") {
+    print("already_signed");
+  } else if (recovery.action !== "resume") {
+    print("needs_attention");
+  } else {
+    const login = await inspectConfiguredReauthLogin({
+      ...config,
+      automationUserDataDir: account.automationUserDataDir,
+    }, account);
+    print(classifyReauthSessionAfterOAuthFailure(login, recovery.previous)?.status ?? "needs_attention");
+  }
 } catch {
   print("needs_attention");
   process.exitCode = 2;

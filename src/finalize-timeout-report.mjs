@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { publicBookmarkReport } from "./bookmarks.mjs";
 import { readEffectiveBookmarkPlan } from "./effective-bookmark-plan.mjs";
+import { buildCurrentPlan } from "./current-plan.mjs";
 import { summarizeResults, writeRunResult } from "./logger.mjs";
 import { isCurrentLocalRunId, nextDeferredRetryAt } from "./retry-policy.mjs";
 
@@ -69,6 +70,7 @@ export function buildTimeoutReport(plan, progress, now = new Date()) {
     startedAt: progress.startedAt ?? now.toISOString(),
     finishedAt: now.toISOString(),
     timeoutRecovered: true,
+    planFingerprint: plan.planFingerprint ?? null,
     bookmarkSummary: publicBookmarkReport(plan),
     summary: summarizeResults(results),
     nextRetryAt: nextDeferredRetryAt(results, now),
@@ -97,7 +99,13 @@ async function main() {
     config,
     path.join(rootDirectory, "data", "last-valid-bookmark-plan.json"),
   );
-  const report = buildTimeoutReport(plan, progress);
+  const metadata = buildCurrentPlan(plan, config);
+  const enrichedPlan = { ...plan, planFingerprint: metadata.planFingerprint };
+  const progressFingerprint = String(progress.planFingerprint ?? "").trim();
+  if (progressFingerprint && progressFingerprint !== metadata.planFingerprint) {
+    throw new Error("超时进度报告与当前签到计划不一致，拒绝混用旧结果");
+  }
+  const report = buildTimeoutReport(enrichedPlan, progress);
   const runLog = { runId: report.runId, directory: path.dirname(progressPath) };
   const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);
   const updateLatest = report.isComplete && report.results.length >= minimumTargets;

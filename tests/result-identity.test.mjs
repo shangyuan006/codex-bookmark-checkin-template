@@ -4,6 +4,7 @@ import {
   normalizeAgentRouterAccountKey,
   normalizeReauthProvider,
   reauthAccountMetadataForOrigin,
+  compatiblePriorResult,
   resultIdentity,
 } from "../src/result-identity.mjs";
 
@@ -70,4 +71,50 @@ test("Agent Router treats legacy accountId as a key and validates key uniqueness
   assert.throws(() => reauthAccountMetadataForOrigin({
     agentrouterAccounts: [{ origin: "http://router.example", accountId: "one" }],
   }, "https://router.example"), /HTTPS origin/);
+});
+
+test("prior results match account-aware identities and preserve current metadata", () => {
+  const prior = compatiblePriorResult({
+    origin: "https://router.example/",
+    accountKey: "Linux.DO",
+    accountId: "account-2",
+    title: "当前标题",
+  }, [{
+    origin: "https://ROUTER.example",
+    accountKey: "linux-do",
+    accountId: "account-2",
+    status: "deferred",
+    retrySequence: 1,
+  }]);
+
+  assert.equal(prior.status, "deferred");
+  assert.equal(prior.title, "当前标题");
+  assert.equal(prior.accountKey, "Linux.DO");
+});
+
+test("legacy origin-only results migrate only to an unambiguous primary account", () => {
+  const legacy = { origin: "https://router.example/", status: "deferred" };
+  assert.equal(
+    compatiblePriorResult({ origin: "https://router.example", accountKey: "github" }, [legacy]).migratedLegacyIdentity,
+    true,
+  );
+  assert.equal(
+    compatiblePriorResult({
+      origin: "https://router.example", accountKey: "linuxdo", supplementalAccount: true,
+    }, [legacy]),
+    null,
+  );
+  assert.equal(
+    compatiblePriorResult({ origin: "https://router.example", accountKey: "github" }, [legacy, legacy]),
+    null,
+  );
+});
+
+test("malformed prior results cannot affect retry state", () => {
+  assert.equal(
+    compatiblePriorResult({ origin: "https://router.example", accountKey: "github" }, [
+      { origin: "not-an-origin", status: "deferred" },
+    ]),
+    null,
+  );
 });

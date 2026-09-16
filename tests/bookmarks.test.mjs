@@ -11,6 +11,25 @@ test("普通签到书签只接受无凭据 HTTPS", () => {
   assert.equal(normalizeHttpUrl(`https://user:secret${"@"}example.test/checkin`), null);
 });
 
+test("disabled origins stay out of live targets and related candidate navigation", async () => {
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),"checkin-disabled-"));
+  try {
+    const file=path.join(directory,"Bookmarks");
+    await fs.writeFile(file,JSON.stringify({roots:{bar:{type:"folder",name:"daily",children:[{
+      type:"folder",name:"sites",children:[
+        {type:"url",name:"Active",url:"https://active.example/profile"},
+        {type:"url",name:"Closed",url:"https://closed.example/profile"},
+      ],
+    }]}}}));
+    const plan=await readBookmarkPlan(file,{mobileFolderNames:["daily"],targetFolderNames:["sites"],
+      disabledCheckinOrigins:["https://closed.example"],relatedCandidateUrls:{"https://active.example":["https://closed.example/other"]}});
+    assert.equal(plan.targetCount,1);
+    assert.equal(plan.exactUrlCount,1);
+    assert.deepEqual(plan.targets[0].allowedOrigins,["https://active.example"]);
+    assert.deepEqual(plan.targets[0].candidates,["https://active.example/profile"]);
+  } finally { await fs.rm(directory,{recursive:true,force:true}); }
+});
+
 test("不预设名称时列出候选书签目录供用户选择", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "checkin-candidates-"));
   const file = path.join(directory, "Bookmarks");

@@ -199,7 +199,18 @@ test("只有所有人工 origin 都得到权威终态后才完成记录", async 
     finalReport([
       { origin: "https://one.example", status: "signed", reason: "signed" },
       { origin: "https://two.example", status: "already_signed", reason: "already" },
-      { origin: "https://three.example", status: "not_available", reason: "authoritative absence" },
+      {
+        origin: "https://three.example",
+        status: "not_available",
+        availabilityKind: "feature_disabled",
+        reason: "authoritative absence",
+        evidence: {
+          source: "configuration",
+          outcome: "known_no_checkin_feature",
+          authoritative: true,
+          confirmedAt: "2026-07-28T05:00:00.000Z",
+        },
+      },
     ]),
   );
 

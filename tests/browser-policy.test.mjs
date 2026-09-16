@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { isConfirmedNotAvailable } from "../src/result-contract.mjs";
 import {
   CHALLENGE_SELECTOR,
   assertCalendarDayCheckinLocation,
@@ -219,8 +220,12 @@ async function runLegacyNewApiCheckin(statuses, {
   selfStatus = 200,
   statusHttpStatus = 200,
   statusMessage = null,
+  postStatus = 200,
+  postMessage = null,
+  controls = [],
+  passwordVisible = false,
 } = {}) {
-  const names = ["localStorage", "sessionStorage", "document", "fetch", "setTimeout"];
+  const names = ["localStorage", "sessionStorage", "document", "fetch", "setTimeout", "getComputedStyle"];
   const originals = new Map(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const statusQueue = [...statuses];
   const requests = [];
@@ -233,7 +238,15 @@ async function runLegacyNewApiCheckin(statuses, {
     Object.defineProperties(globalThis, {
       localStorage: { configurable: true, value: storage },
       sessionStorage: { configurable: true, value: { length: 0, key: () => null, getItem: () => null } },
-      document: { configurable: true, value: { body: { innerText: "" } } },
+      document: { configurable: true, value: {
+        body: { innerText: "" },
+        querySelectorAll: selector => (selector.includes('type="password"')
+          ? (passwordVisible ? ["密码"] : []) : controls).map(text => ({
+          innerText: text, getAttribute: () => null,
+          getBoundingClientRect: () => ({width:100,height:30}),
+        })),
+      } },
+      getComputedStyle: { configurable: true, value: () => ({display:"block",visibility:"visible"}) },
       setTimeout: { configurable: true, value: (callback) => { callback(); return 0; } },
       fetch: {
         configurable: true,
@@ -248,11 +261,11 @@ async function runLegacyNewApiCheckin(statuses, {
             };
           }
           if (options.method === "POST") {
-            return { status: 200, json: async () => ({ success: true }) };
+            return { status: postStatus, json: async () => postMessage ? ({success:false,message:postMessage}) : ({ success: true }) };
           }
           const checked = statusQueue.shift() ?? false;
           return {
-            status: statusHttpStatus,
+            status: Array.isArray(statusHttpStatus) ? statusHttpStatus.shift() : statusHttpStatus,
             json: async () => statusMessage
               ? ({ success: false, message: statusMessage })
               : ({ success: true, data: { stats: { checked_in_today: checked } } }),
@@ -297,6 +310,7 @@ test("legacy New API reports an invalid session instead of no_action", async () 
 test("legacy New API treats an explicit disabled response as authoritative", async () => {
   const disabled = await runLegacyNewApiCheckin([], { statusMessage: "签到功能未启用" });
   assert.equal(disabled.result.status, "not_available");
+  assert.equal(isConfirmedNotAvailable(disabled.result), true);
   assert.equal(disabled.requests.filter((request) => request.method === "POST").length, 0);
 
   const source = await (await import("node:fs/promises"))
@@ -306,6 +320,34 @@ test("legacy New API treats an explicit disabled response as authoritative", asy
   const sequentialActions = source.indexOf("tryConfiguredSequentialActions(page", apiProbe);
   assert.ok(apiProbe >= 0 && disabledTerminal > apiProbe);
   assert.ok(sequentialActions > disabledTerminal);
+});
+
+test("API session failures allow a visible check-in page without starting login recovery", async () => {
+  for (const options of [
+    {storageUserId:null,selfStatus:401},
+    {statusHttpStatus:403},
+    {postStatus:403},
+  ]) {
+    const {result} = await runLegacyNewApiCheckin([false], {...options, controls:["立即签到"]});
+    assert.equal(result, null);
+  }
+  const loggedOut = await runLegacyNewApiCheckin([], {statusHttpStatus:401,controls:["立即签到"],passwordVisible:true});
+  assert.equal(loggedOut.result.status, "login_required");
+  const complete = await runLegacyNewApiCheckin([], {statusHttpStatus:403,controls:["已签到"]});
+  assert.equal(complete.result.status, "already_signed");
+});
+
+test("a submitted action with unavailable verification must not trigger a second submission", async () => {
+  const {result,requests} = await runLegacyNewApiCheckin([false], {statusHttpStatus:[200,403],controls:["立即签到"]});
+  assert.equal(result.status,"needs_attention");
+  assert.equal(result.submissionAttempted,true);
+  assert.equal(requests.filter(r=>r.method==="POST").length,1);
+});
+
+test("disabled action response retains authoritative evidence through the result contract", async () => {
+  const {result} = await runLegacyNewApiCheckin([false], {postMessage:"签到功能未启用"});
+  assert.equal(isConfirmedNotAvailable(result),true);
+  assert.equal(result.evidence.source,"new_api_checkin_action");
 });
 
 test("签到入口发现拒绝被浏览器解析成同源路径的畸形 href", () => {
@@ -737,6 +779,40 @@ test("pre-check-in terminal paths stop navigation and are treated as already sig
   assert.equal(pageCount, 1);
   assert.equal(gotoCount, 0);
   assert.equal(targetResult.status, "already_signed");
+});
+
+test("pre-check-in can treat a missing configured navigation control as an explicit terminal state", async () => {
+  const target = {
+    origin: "https://bookmark.test",
+    allowedOrigins: ["https://bookmark.test"],
+  };
+  const config = {
+    preCheckinNavigationRules: {
+      "https://bookmark.test": {
+        steps: [{ selector: "a.check-in" }],
+        expectedPath: "/check-in.php",
+        terminalWhenNavigationControlMissing: true,
+        waitMs: 1,
+      },
+    },
+  };
+  assert.deepEqual(getConfiguredPreCheckinNavigationRule(target, target.origin, config), {
+    expectedPath: "/check-in.php",
+    steps: [{ selector: "a.check-in", role: "", name: "" }],
+    terminalWhenNavigationControlMissing: true,
+    waitMs: 500,
+    afterClickWaitMs: 500,
+  });
+  const page = {
+    url: () => "https://bookmark.test/",
+    locator: () => ({ count: async () => 0 }),
+    getByRole: () => ({ count: async () => 0 }),
+    waitForTimeout: async () => {},
+  };
+  assert.deepEqual(
+    await navigateConfiguredPreCheckinPage(page, target, target.origin, config),
+    { terminalNoAction: true },
+  );
 });
 
 test("pre-check-in navigation can explicitly click one hidden menu link", async () => {

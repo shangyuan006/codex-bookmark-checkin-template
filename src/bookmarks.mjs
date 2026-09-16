@@ -367,8 +367,16 @@ export async function readBookmarkPlan(bookmarksPath, options = {}) {
     });
   }
 
+  const disabledOrigins = new Set((options.disabledCheckinOrigins ?? []).map(value => {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+      throw new Error("停用站点必须使用无凭据的 HTTPS origin");
+    }
+    return url.origin;
+  }));
   const exactMap = new Map();
   for (const entry of allEntries) {
+    if (disabledOrigins.has(new URL(entry.normalizedUrl).origin)) continue;
     const existing = exactMap.get(entry.normalizedUrl);
     if (existing) {
       existing.sourcePaths.add(entry.sourcePath);
@@ -408,14 +416,15 @@ export async function readBookmarkPlan(bookmarksPath, options = {}) {
       ...target.candidates,
       ...((options.relatedCandidateUrls ?? {})[target.origin] ?? [])
         .map(normalizeHttpUrl)
-        .filter(Boolean),
+        .filter(url => url && !disabledOrigins.has(new URL(url).origin)),
     ])].sort((a, b) => candidateScore(b) - candidateScore(a)),
     allowedOrigins: [...new Set([
       target.origin,
       ...((options.relatedCandidateUrls ?? {})[target.origin] ?? [])
         .map(normalizeHttpUrl)
         .filter(Boolean)
-        .map((url) => new URL(url).origin),
+        .map((url) => new URL(url).origin)
+        .filter(origin => !disabledOrigins.has(origin)),
     ])],
     folderNames: [...target.folderNames].sort(),
     sourcePaths: [...target.sourcePaths].sort(),
@@ -536,6 +545,7 @@ export function publicBookmarkReport(plan) {
     comparison: plan.comparison,
     exactUrlCount: plan.exactUrlCount,
     targetCount: plan.targetCount,
+    planFingerprint: plan.planFingerprint ?? null,
     targets: plan.targets.map((target) => ({
       origin: target.origin,
       title: target.title,

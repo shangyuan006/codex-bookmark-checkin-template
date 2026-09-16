@@ -5,8 +5,7 @@ import {
   ensurePrivateDirectory,
   redactPrivateResultText,
 } from "./security.mjs";
-
-const AUTHORITATIVE_STATUSES = new Set(["signed", "already_signed", "not_available"]);
+import { isTerminalResult } from "./result-contract.mjs";
 
 export function sanitizeForPersistence(value) {
   if (typeof value === "string") return redactPrivateResultText(value);
@@ -34,8 +33,8 @@ export function summarizeResults(results) {
 }
 
 function shouldPromote(current, incoming) {
-  if (!AUTHORITATIVE_STATUSES.has(incoming?.status)) return false;
-  if (!AUTHORITATIVE_STATUSES.has(current?.status)) return true;
+  if (!isTerminalResult(incoming)) return false;
+  if (!isTerminalResult(current)) return true;
   return incoming.status === "signed" && current.status !== "signed";
 }
 
@@ -61,7 +60,7 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
     || runDate(incoming.runId) !== latestDate) return null;
 
   const incomingByOrigin = new Map(incoming.results
-    .filter((result) => result?.origin && AUTHORITATIVE_STATUSES.has(result.status))
+    .filter((result) => result?.origin && isTerminalResult(result))
     .map((result) => [result.origin, result]));
   const bookmarkPlan = currentBookmarkPlan(incoming);
   if (bookmarkPlan) {
@@ -90,6 +89,10 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
       .sort((left, right) => left - right);
     return {
       ...latest,
+      planFingerprint: incoming.planFingerprint
+        ?? incoming.bookmarkSummary?.planFingerprint
+        ?? latest.planFingerprint
+        ?? null,
       plannedTotal: results.length,
       processedTotal: results.length,
       isComplete: true,

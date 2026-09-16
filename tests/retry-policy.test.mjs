@@ -7,11 +7,31 @@ import {
   deferUnresolvedLogin,
   isCurrentLocalRunId,
   isRetryEligible,
+  recoveryEntriesForResults,
   isResumeRetryEligible,
   nextDeferredRetryAt,
   nextShanghaiTime,
   withRetrySchedule,
 } from "../src/retry-policy.mjs";
+
+test("原生成功结果提前插入后，复查仍按来源匹配并替换原结果", () => {
+  const targets = ['a', 'b', 'c', 'd'].map(name => ({origin:`https://${name}.example`}));
+  const results = [
+    {...targets[3], status:'signed'},
+    {...targets[0], status:'signed'},
+    {...targets[1], status:'login_required'},
+    {...targets[2], status:'interactive_challenge'},
+  ];
+  const entries = recoveryEntriesForResults(results, targets);
+  assert.deepEqual(entries.map(({resultIndex,target}) => [resultIndex,target.origin]), [
+    [2,targets[1].origin], [3,targets[2].origin],
+  ]);
+  for (const {resultIndex,target} of entries) results[resultIndex] = {...target,status:'signed'};
+  assert.equal(new Set(results.map(result => result.origin)).size,4);
+  assert.ok(results.every(result => result.status === 'signed'));
+  assert.deepEqual(recoveryEntriesForResults(results,targets),[]);
+  assert.throws(() => recoveryEntriesForResults([{origin:'https://unknown.example',status:'login_required'}],targets),/no matching selected target/);
+});
 
 test("续跑只为配置了重认证的 needs_attention 站点放行", () => {
   const result = { origin: "https://reauth.test", status: "needs_attention" };
@@ -208,7 +228,8 @@ test("自动登录恢复仍失败时使用独立的六小时退避时间", () =>
   assert.equal(result.status, "deferred");
   assert.equal(result.retryCause, "login_required");
   assert.equal(result.nextEligibleAt, "2026-07-23T11:00:00.000Z");
-  assert.equal(result.reason, "自动登录恢复未成功，等待后续符合条件的运行重试");
+  assert.match(result.reason, /^登录状态失效/);
+  assert.match(result.reason, /已安排低频重试$/);
 });
 
 test("非登录异常不会被登录退避策略改写", () => {

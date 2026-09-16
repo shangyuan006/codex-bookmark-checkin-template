@@ -66,6 +66,61 @@ export function resultIdentity(value) {
   return accountKey ? `${origin}#account=${encodeURIComponent(accountKey)}` : origin;
 }
 
+function copyTargetMetadata(target, prior) {
+  return {
+    ...prior,
+    ...(target?.title ? { title: target.title } : {}),
+    ...(target?.accountKey ? { accountKey: target.accountKey } : {}),
+    ...(target?.accountId ? { accountId: target.accountId } : {}),
+    ...(target?.accountLabel ? { accountLabel: target.accountLabel } : {}),
+    ...(target?.provider ? { provider: target.provider } : {}),
+    ...(target?.upstreamProvider ? { upstreamProvider: target.upstreamProvider } : {}),
+  };
+}
+
+/**
+ * Find a result from an older report without allowing malformed or
+ * supplemental-account entries to inherit the wrong retry state.
+ */
+export function compatiblePriorResult(target, previousResults = []) {
+  let expectedIdentity;
+  try {
+    expectedIdentity = resultIdentity(target);
+  } catch {
+    return null;
+  }
+
+  const exact = (previousResults ?? []).find((result) => {
+    try { return resultIdentity(result) === expectedIdentity; }
+    catch { return false; }
+  });
+  if (exact) {
+    const targetAccountId = String(target?.accountId ?? "").trim();
+    const priorAccountId = String(exact?.accountId ?? "").trim();
+    if (targetAccountId && priorAccountId && targetAccountId !== priorAccountId) return null;
+    return copyTargetMetadata(target, exact);
+  }
+
+  // Reports written before account-aware identities only had an origin. They
+  // can migrate to the primary account, never to a supplemental account, and
+  // only when that legacy origin is unambiguous.
+  if (!target?.accountKey || target?.supplementalAccount) return null;
+  let targetOrigin;
+  try { targetOrigin = normalizeOrigin(target.origin, "target.origin"); }
+  catch { return null; }
+  const legacy = (previousResults ?? []).filter((result) => {
+    if (String(result?.accountKey ?? "").trim()) return false;
+    try { return normalizeOrigin(result.origin, "prior.origin") === targetOrigin; }
+    catch { return false; }
+  });
+  if (legacy.length !== 1) return null;
+  return {
+    ...copyTargetMetadata({ ...target, accountKey: target.accountKey }, legacy[0]),
+    accountKey: target.accountKey,
+    migratedLegacyIdentity: true,
+  };
+}
+
 export function reauthAccountMetadataForOrigin(config, origin) {
   const normalizedOrigin = normalizeOrigin(origin);
   if (!normalizedOrigin.startsWith("https://")) {

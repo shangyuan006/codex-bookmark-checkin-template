@@ -133,6 +133,10 @@ test("Cloudflare 隐藏 checkbox 时只回退到与其关联的可见 label", as
   assert.match(source, /frameBox\.height < 40 \|\| frameBox\.height > 180/);
   assert.match(source, /page\.locator\('iframe\[src\]'\)/);
   assert.match(source, /allowedParentFrameCount/);
+  assert.match(source, /inspectClosedShadowChallengeFrames/);
+  assert.match(source, /DOM\.getDocument/);
+  assert.match(source, /pierce: true/);
+  assert.match(source, /closedShadowFrameCount/);
   assert.match(source, /details\.allowedFrameCount > 1 \|\| details\.allowedParentFrameCount > 1/);
   assert.match(source, /challenge_frame_not_unique/);
   assert.match(source, /frameClickCandidates\.length === 1/);

@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { publicBookmarkReport } from "./bookmarks.mjs";
 import { launchAutomationContext, processTarget } from "./browser.mjs";
 import { readEffectiveBookmarkPlan } from "./effective-bookmark-plan.mjs";
+import { buildCurrentPlan } from "./current-plan.mjs";
+import { logicalCompletionKey } from "./logical-checkin.mjs";
 import {
   aggregateReauthResults,
   getConfiguredReauthAccounts,
@@ -22,6 +24,10 @@ import {
   writeRunResult,
 } from "./logger.mjs";
 import { loginHelperOutcome, loginHelperOutcomeFromStreams, resolveLoginRecoveryUrl } from "./login-recovery.mjs";
+import { runRecoveryProcess } from "./recovery-process.mjs";
+import { continueNativeCheckinAfterLogin } from "./native-login-continuation.mjs";
+import { configuredNoCheckinResult, isTerminalResult } from "./result-contract.mjs";
+import { freshNativePreflightResults, nativePreflightProgress } from "./native-preflight-state.mjs";
 import { assertManualVerificationExecution } from "./manual-verification-guard.mjs";
 import { atomicWriteJson, ensurePrivateDirectory, safeErrorMessage } from "./security.mjs";
 import { acquireRunLock, releaseRunLock } from "./run-lock.mjs";
@@ -40,6 +46,7 @@ import {
   isCurrentLocalRunId,
   localRunDate,
   isRetryEligible,
+  recoveryEntriesForResults,
   isResumeRetryEligible,
   nextDeferredRetryAt,
 } from "./retry-policy.mjs";
@@ -108,6 +115,7 @@ if (!dryRun && !listPreflightTargets && !reauthAccountKey) {
 
 async function readValidatedBookmarkPlan() {
   const plan = await readEffectiveBookmarkPlan(config.bookmarksPath, config, lastValidBookmarkPlanPath);
+  plan.planFingerprint = buildCurrentPlan(plan, config).planFingerprint;
   await atomicWriteJson(lastValidBookmarkPlanPath, publicBookmarkReport(plan));
   return plan;
 }
@@ -122,17 +130,14 @@ async function readFreshNativeWafPreflight() {
   const report = await fs.readFile(nativeWafPreflightPath, "utf8")
     .then((text) => JSON.parse(text))
     .catch(() => null);
-  const generatedAt = Date.parse(report?.generatedAt ?? "");
-  if (!Number.isFinite(generatedAt) || Date.now() - generatedAt > 10 * 60 * 1000) return new Map();
-  return new Map((report?.results ?? [])
-    .filter((result) => allowedOrigins.has(result?.origin) && result?.status === "signed")
-    .map((result) => [result.origin, result]));
+  return freshNativePreflightResults(report, allowedOrigins);
 }
 
 const lockLease = await acquireRunLock(lockPath);
 try {
   const plan = await readValidatedBookmarkPlan();
-  const report = publicBookmarkReport(plan);
+  const planMetadata = buildCurrentPlan(plan, config);
+  const report = { ...publicBookmarkReport(plan), planFingerprint: planMetadata.planFingerprint };
   const reportPath = path.join(rootDirectory, "outputs", "bookmark-comparison.json");
   await atomicWriteJson(reportPath, report);
 
@@ -161,6 +166,12 @@ try {
       resumeBase = JSON.parse(await fs.readFile(resolvedResume, "utf8"));
       if (!Array.isArray(resumeBase?.results)) throw new Error("续跑报告缺少站点结果");
       if (!isCurrentLocalRunId(resumeBase.runId)) throw new Error("续跑报告不是今天生成的，拒绝复用旧签到结果");
+      const resumeFingerprint = String(
+        resumeBase.planFingerprint ?? resumeBase.bookmarkSummary?.planFingerprint ?? "",
+      ).trim();
+      if (resumeFingerprint && resumeFingerprint !== planMetadata.planFingerprint) {
+        throw new Error("续跑报告与当前签到计划不一致，拒绝混用旧结果");
+      }
       if (!selectedOrigins) {
         const currentOrigins = new Set(plan.targets.map((target) => target.origin));
         const previousOrigins = new Set(resumeBase.results.map((result) => result.origin));
@@ -194,6 +205,15 @@ try {
     const selectedTargets = limit
       ? originFilteredTargets.slice(offset, offset + limit)
       : originFilteredTargets.slice(offset);
+    // Persist native confirmations before OAuth or browser startup can fail.
+    // Origin-only evidence cannot replace a multi-account reauthentication result.
+    const nativeCompletedResults = nativePreflightProgress(
+      selectedTargets.filter(target => !getConfiguredReauthRule(target, config)
+        && !configuredNoCheckinResult(target, config)), nativeWafPreflight,
+    );
+    results.push(...nativeCompletedResults);
+    results.push(...selectedTargets.map(target => configuredNoCheckinResult(target, config)).filter(Boolean));
+    const precompletedOrigins = new Set(results.map(result => result.origin));
     const selectedOriginList = selectedTargets.map((target) => target.origin);
     const plannedTotal = preferredTargets.length;
     const logicalCompletions = new Map();
@@ -234,6 +254,7 @@ try {
       const completedSelectedResults = selectedCompletedProgressResults();
       await atomicWriteJson(path.join(runLog.directory, "progress.json"), sanitizeForPersistence({
         runId: runLog.runId,
+        planFingerprint: planMetadata.planFingerprint,
         runState: "in_progress",
         isComplete: false,
         phase,
@@ -252,7 +273,8 @@ try {
     };
 
     await writeProgress("initial");
-    const configuredReauthTargets = selectedTargets.filter((target) => getConfiguredReauthRule(target, config));
+    const configuredReauthTargets = selectedTargets.filter((target) => !precompletedOrigins.has(target.origin)
+      && getConfiguredReauthRule(target, config));
     for (let index = 0; index < configuredReauthTargets.length; index += 1) {
       const target = configuredReauthTargets[index];
       const accountCount = getConfiguredReauthAccounts(target, config).length;
@@ -308,22 +330,24 @@ try {
         reauthResults.set(target.origin, { status: "needs_attention", reason: safeErrorMessage(error) });
       }
     }
-    const needsGenericBrowser = selectedTargets.some((target) => !reauthResults.has(target.origin));
+    const needsGenericBrowser = selectedTargets.some((target) => !reauthResults.has(target.origin)
+      && !precompletedOrigins.has(target.origin));
     const context = needsGenericBrowser ? await launchAutomationContext(config) : null;
 
     const rememberLogicalCompletion = (target, result) => {
-      const group = config.logicalCheckinGroups?.[target.origin];
-      if (group && ["signed", "already_signed"].includes(result.status)) {
-        logicalCompletions.set(group, { origin: target.origin, result });
+      const key = logicalCompletionKey(result, config.logicalCheckinGroups);
+      if (key && ["signed", "already_signed"].includes(result.status)) {
+        logicalCompletions.set(key, { origin: target.origin, result });
       }
     };
+    for (const result of nativeCompletedResults) rememberLogicalCompletion(result, result);
 
     const runOneTarget = async (activeContext, target, allowReuse = true) => {
       const started = Date.now();
       const reauthResult = reauthResults.get(target.origin);
       if (reauthResult) return { ...reauthResult, attempt: 1, durationMs: Date.now() - started };
-      const group = config.logicalCheckinGroups?.[target.origin];
-      const reused = allowReuse && group ? logicalCompletions.get(group) : null;
+      const groupKey = logicalCompletionKey(target, config.logicalCheckinGroups);
+      const reused = allowReuse && groupKey ? logicalCompletions.get(groupKey) : null;
       if (reused && reused.origin !== target.origin) {
         return {
           status: "already_signed",
@@ -334,12 +358,8 @@ try {
           durationMs: Date.now() - started,
         };
       }
-      const result = await runWithRecentNotAvailableCache(target, siteState, config, async () => {
-        const preflight = nativeWafPreflight.get(target.origin);
-        return preflight
-          ? { status: "signed", reason: preflight.reason, url: preflight.url, attempt: 1, nativePreflight: true }
-          : processTarget(activeContext, target, config, qaRules, runLog.directory);
-      });
+      const result = await runWithRecentNotAvailableCache(target, siteState, config,
+        () => processTarget(activeContext, target, config, qaRules, runLog.directory));
       const timed = { ...result, durationMs: Date.now() - started };
       rememberLogicalCompletion(target, timed);
       return timed;
@@ -348,6 +368,7 @@ try {
     try {
       for (let index = 0; index < selectedTargets.length; index += 1) {
         const target = selectedTargets[index];
+        if (precompletedOrigins.has(target.origin)) continue;
         console.log(`[${index + 1}/${selectedTargets.length}] ${target.origin}`);
         const targetResult = await runOneTarget(context, target);
         results.push({
@@ -369,15 +390,12 @@ try {
     const recoveryRounds = Math.max(1, Math.min(3, Number(config.recoveryRounds) || 2));
     const recoveryDelays = Array.isArray(config.recoveryDelaysMs) ? config.recoveryDelaysMs : [5000, 30000];
     for (let round = 0; round < recoveryRounds; round += 1) {
-      const recoveryIndexes = results
-        .map((result, index) => isRetryEligible(result) ? index : -1)
-        .filter((index) => index >= 0);
-      if (recoveryIndexes.length === 0) break;
-      console.log(`[recovery ${round + 1}/${recoveryRounds}] 将复查 ${recoveryIndexes.length} 个异常站点`);
+      const recoveryEntries = recoveryEntriesForResults(results, selectedTargets);
+      if (recoveryEntries.length === 0) break;
+      console.log(`[recovery ${round + 1}/${recoveryRounds}] 将复查 ${recoveryEntries.length} 个异常站点`);
       const loginOutcomes = new Map();
-      for (const resultIndex of recoveryIndexes) {
+      for (const { resultIndex } of recoveryEntries) {
         const current = results[resultIndex];
-        const target = selectedTargets[resultIndex];
         const provider = config.automaticOAuthProviders?.[current.origin];
         const nativeOAuthCheckinEnabled = Boolean(provider)
           && (config.nativeOAuthCheckinOrigins ?? []).includes(current.origin);
@@ -434,11 +452,15 @@ try {
         let authoritativeCheckinStatus = null;
         for (const method of methods) {
           try {
-            const helperOutput = await execFileAsync(method.executable, method.args, {
+            const helperOutput = await runRecoveryProcess(method.executable, method.args, {
               cwd: rootDirectory,
+              powershellExecutable: config.powershellExecutable || "pwsh.exe",
               windowsHide: true,
               timeout: 180000,
               maxBuffer: 1024 * 1024,
+              beforeTerminate: () => execFileAsync(config.powershellExecutable || "pwsh.exe", [
+                "-NoProfile", "-NonInteractive", "-File", path.join(rootDirectory, "scripts", "Close-RecoveryBrowser.ps1"),
+              ], { cwd: rootDirectory, windowsHide: true, timeout: 25000, maxBuffer: 65536 }),
             });
             const outcome = loginHelperOutcomeFromStreams(helperOutput.stdout, helperOutput.stderr);
             attempts.push({ method: method.method, ...outcome });
@@ -448,6 +470,7 @@ try {
               break;
             }
           } catch (error) {
+            if (error.cleanupFailed) throw new Error("登录恢复超时后未能安全释放浏览器或子进程，停止本轮以避免并发占用");
             const fallback = error?.code === "ETIMEDOUT" ? "timeout" : "failed";
             const outcome = loginHelperOutcomeFromStreams(error?.stdout, error?.stderr, fallback);
             const failedOutcome = outcome.status === "logged_in" ? loginHelperOutcome("", fallback) : outcome;
@@ -467,28 +490,45 @@ try {
       }
 
       const delayMs = Math.max(0, Number(recoveryDelays[Math.min(round, recoveryDelays.length - 1)]) || 0);
+      const nativeContinuations = new Map();
+      for (const { target } of recoveryEntries) {
+        const continuation = await continueNativeCheckinAfterLogin(target, config, loginOutcomes.get(target.origin), {
+          runPreflight: origin => runRecoveryProcess(config.powershellExecutable || 'pwsh.exe', [
+            '-NoProfile', '-NonInteractive', '-File', path.join(rootDirectory, 'scripts', 'Prepare-NativeWafSession.ps1'),
+            '-Origins', origin,
+          ], {
+            cwd: rootDirectory, powershellExecutable: config.powershellExecutable || 'pwsh.exe',
+            windowsHide: true, timeout: 360000, maxBuffer: 1024 * 1024,
+            beforeTerminate: () => execFileAsync(config.powershellExecutable || 'pwsh.exe', [
+              '-NoProfile', '-NonInteractive', '-File', path.join(rootDirectory, 'scripts', 'Close-RecoveryBrowser.ps1'),
+            ], { cwd: rootDirectory, windowsHide: true, timeout: 25000, maxBuffer: 65536 }),
+          }),
+          readConfirmations: readFreshNativeWafPreflight,
+        });
+        if (continuation) nativeContinuations.set(target.origin, continuation);
+      }
       if (delayMs > 0) await wait(delayMs);
-      const needsRecoveryBrowser = recoveryIndexes.some((resultIndex) => {
-        const origin = selectedTargets[resultIndex].origin;
-        return !["signed", "already_signed"].includes(loginOutcomes.get(origin)?.authoritativeCheckinStatus);
+      const needsRecoveryBrowser = recoveryEntries.some(({ target }) => {
+        const origin = target.origin;
+        return !nativeContinuations.has(origin)
+          && !["signed", "already_signed"].includes(loginOutcomes.get(origin)?.authoritativeCheckinStatus);
       });
       const recoveryContext = needsRecoveryBrowser ? await launchAutomationContext(config) : null;
       try {
-        for (let recoveryIndex = 0; recoveryIndex < recoveryIndexes.length; recoveryIndex += 1) {
-          const resultIndex = recoveryIndexes[recoveryIndex];
-          const target = selectedTargets[resultIndex];
+        for (let recoveryIndex = 0; recoveryIndex < recoveryEntries.length; recoveryIndex += 1) {
+          const { resultIndex, target } = recoveryEntries[recoveryIndex];
           const initialResult = results[resultIndex];
-          console.log(`[recovery ${round + 1}.${recoveryIndex + 1}/${recoveryIndexes.length}] ${target.origin}`);
+          console.log(`[recovery ${round + 1}.${recoveryIndex + 1}/${recoveryEntries.length}] ${target.origin}`);
           const loginOutcome = loginOutcomes.get(target.origin);
           const sameSessionStatus = loginOutcome?.authoritativeCheckinStatus;
-          const recoveredResult = ["signed", "already_signed"].includes(sameSessionStatus)
+          const recoveredResult = nativeContinuations.get(target.origin) ?? (["signed", "already_signed"].includes(sameSessionStatus)
             ? {
                 status: sameSessionStatus,
                 reason: sameSessionStatus === "signed"
                   ? "原生同会话 OAuth 后由签到接口确认今日签到完成"
                   : "原生同会话 OAuth 后由签到接口确认今日已签到",
               }
-            : await runOneTarget(recoveryContext, target);
+            : await runOneTarget(recoveryContext, target));
           const priorHistory = initialResult.recovery?.history ?? [];
           results[resultIndex] = {
             origin: target.origin,
@@ -507,7 +547,7 @@ try {
           };
           await writeProgress(`recovery_${round + 1}`, {
             recoveryCompleted: recoveryIndex + 1,
-            recoveryTotal: recoveryIndexes.length,
+            recoveryTotal: recoveryEntries.length,
           });
         }
       } finally {
@@ -517,7 +557,8 @@ try {
 
     const finishedAt = new Date();
     const assembledResults = resumeBase
-      ? preferredTargets.map((target) => results.find((result) => result.origin === target.origin)
+      ? preferredTargets.map((target) => configuredNoCheckinResult(target, config)
+        ?? results.find((result) => result.origin === target.origin)
         ?? resumeBase.results.find((result) => result.origin === target.origin)
         ?? { origin: target.origin, title: target.title, folderNames: target.folderNames, status: "error", reason: "续跑未生成站点结果" })
       : results;
@@ -538,6 +579,7 @@ try {
     const scopeComplete = selectedTotal > 0 && selectedProcessedTotal === selectedTotal;
     const output = {
       runId: runLog.runId,
+      planFingerprint: planMetadata.planFingerprint,
       runState: "final",
       plannedTotal,
       processedTotal,
@@ -562,9 +604,9 @@ try {
     });
     await writeSiteState(siteStatePath, updateSiteState(siteState, results, finishedAt));
     await writeQaCache(qaCachePath, updateQaCache(qaCache, results, finishedAt));
-    await fs.rm(nativeWafPreflightPath, { force: true }).catch(() => {});
+    // Keep same-day confirmations for scoped retries; readers reject prior-day evidence.
     console.log(JSON.stringify({ resultPath, selectedSummary, summary }, null, 2));
-    if (!isComplete || finalResults.some((result) => !TERMINAL_STATUSES.has(result.status))) {
+    if (!isComplete || finalResults.some((result) => !isTerminalResult(result))) {
       process.exitCode = 2;
     }
   }

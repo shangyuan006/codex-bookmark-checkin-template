@@ -3,7 +3,8 @@ param(
     [int]$LoadTimeoutSeconds = 20,
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string[]]$Origins
+    [string[]]$Origins,
+    [switch]$OverrideTodayAbandonment
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +27,9 @@ function Resolve-NativeProfilePath([string]$ConfiguredPath) {
     return $candidate
 }
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+. (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
+. (Join-Path $PSScriptRoot 'NativePreflightCheckpoint.ps1')
+$preflightPath = Join-Path $root 'tmp\native-waf-preflight.json'
 $node = Resolve-CheckinNode $config
 $browser = Resolve-CheckinBrowser $config
 $inspector = Join-Path $root 'src\native-browser-inspect.mjs'
@@ -45,6 +49,8 @@ $items = @($config.nativeWafPreflightUrls | ForEach-Object {
         passiveOnly = $passiveOnly
         action = $null
         newApiCheckin = $false
+        nativeMinimal = $false
+        maxAttempts = 2
         profilePath = Resolve-NativeProfilePath $(if ($profileConfigured) { [string]$_.automationUserDataDir } else { '' })
         profileConfigured = $profileConfigured
     }
@@ -82,6 +88,8 @@ $items += @($config.nativeChallengePreflight | ForEach-Object {
         passiveOnly = $passiveOnly
         action = $action
         newApiCheckin = $newApiCheckin
+        nativeMinimal = [bool]$_.nativeMinimal
+        maxAttempts = if ($null -ne $_.maxAttempts) { [Math]::Max(1, [Math]::Min(2, [int]$_.maxAttempts)) } else { 2 }
         profilePath = Resolve-NativeProfilePath ([string]$_.automationUserDataDir)
         profileConfigured = -not [string]::IsNullOrWhiteSpace([string]$_.automationUserDataDir)
     }
@@ -96,6 +104,12 @@ foreach ($origin in $Origins) {
     $originSet[$originUri.GetLeftPart([System.UriPartial]::Authority)] = $true
 }
 $items = @($items | Where-Object { $originSet.ContainsKey(([uri]$_.url).GetLeftPart([System.UriPartial]::Authority)) })
+$abandoned = Get-TodayAbandonedOrigins -Path (Join-Path $root 'tmp/manual-abandon.json')
+$items = @($items | Where-Object {
+    $origin = ([uri]$_.url).GetLeftPart([System.UriPartial]::Authority)
+    ($OverrideTodayAbandonment -or -not $abandoned.ContainsKey($origin)) -and $origin -notin @($config.disabledCheckinOrigins) `
+        -and $origin -notin @($config.knownNoCheckinFeatureOrigins)
+})
 
 if ($items.Count -eq 0) { return }
 
@@ -129,7 +143,7 @@ foreach ($configuredProfile in @($items.profilePath | Select-Object -Unique)) {
     }
 }
 
-$preflightResults = @()
+$preflightResults = @(Read-NativePreflightConfirmations -Path $preflightPath)
 
 function Close-AutomationBrowser([string]$ProfilePath) {
     $targets = @(Get-AutomationBrowserProcesses $ProfilePath)
@@ -155,6 +169,10 @@ foreach ($item in $items) {
     $url = [string]$item.url
     $origin = ([uri]$url).GetLeftPart([System.UriPartial]::Authority)
     $hostName = ([uri]$url).Host
+
+    if (@($preflightResults | Where-Object { $_.origin -eq $origin -and $_.status -in @('signed', 'already_signed') }).Count -gt 0) {
+        continue
+    }
 
     if ([bool]$item.passiveOnly) {
         $passivePrepared = $false
@@ -189,6 +207,7 @@ foreach ($item in $items) {
             }
             inspectionStatus = if ($passivePrepared) { 'passive_wait' } else { 'unavailable' }
         }
+        Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults
         continue
     }
 
@@ -202,27 +221,49 @@ foreach ($item in $items) {
         [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($actionJson))
     }
     else { '' }
-    for ($inspectionAttempt = 1; $inspectionAttempt -le 2 -and $null -eq $inspection; $inspectionAttempt++) {
-        $debugPort = Get-Random -Minimum 12000 -Maximum 32000
-        & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -RemoteDebuggingPort $debugPort -UserDataDirOverride $profilePath -Urls @($url)
-        Start-Sleep -Seconds 2
+    for ($inspectionAttempt = 1; $inspectionAttempt -le $item.maxAttempts -and $null -eq $inspection; $inspectionAttempt++) {
+        $attemptFailure = $null
         try {
-            $inspectionText = & $node $inspector $debugPort $origin ([int]$item.waitSeconds) $inspectionMode $actionConfigBase64 2>$null
-            if ($LASTEXITCODE -eq 0 -and $inspectionText) {
-                $inspection = $inspectionText | ConvertFrom-Json
-                $lastInspection = $inspection
-                $attemptExplicit = [string]$inspection.status -in @('signed', 'already_signed') `
-                    -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
-                $attemptEndpoint = [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
-                    -and [bool]$inspection.attendanceEndpoint -and [string]$inspection.status -eq 'ready'
-                $attemptPrepared = -not $hasAction -and -not $hasNewApiCheckin -and -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
-                    -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
-                if (-not $attemptExplicit -and -not $attemptEndpoint -and -not $attemptPrepared) { $inspection = $null }
+            $debugPort = Get-Random -Minimum 12000 -Maximum 32000
+            & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -NativeMinimal:([bool]$item.nativeMinimal) -RemoteDebuggingPort $debugPort -UserDataDirOverride $profilePath -Urls @($url)
+            Start-Sleep -Seconds 2
+            try {
+                $inspectionText = & $node $inspector $debugPort $origin ([int]$item.waitSeconds) $inspectionMode $actionConfigBase64 2>$null
+                if ($LASTEXITCODE -eq 0 -and $inspectionText) {
+                    $inspection = $inspectionText | ConvertFrom-Json
+                    $lastInspection = $inspection
+                    $attemptExplicit = [string]$inspection.status -in @('signed', 'already_signed') `
+                        -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
+                    $attemptEndpoint = [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
+                        -and [bool]$inspection.attendanceEndpoint -and [string]$inspection.status -eq 'ready'
+                    $attemptPrepared = -not $hasAction -and -not $hasNewApiCheckin -and -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
+                        -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
+                    if (-not $attemptExplicit -and -not $attemptEndpoint -and -not $attemptPrepared) { $inspection = $null }
+                }
+            }
+            catch { $inspection = $null }
+            if ($null -ne $inspection -and ($attemptExplicit -or $attemptEndpoint)) {
+                # Persist confirmation before browser cleanup, which can itself fail.
+                $confirmedResult = [pscustomobject]@{
+                    origin = $origin
+                    url = $url
+                    status = 'signed'
+                    reason = if ($attemptExplicit) { '原生页面或接口明确确认今天已签到' } else { '原生验证已确认配置的签到端点完整加载' }
+                    inspectionStatus = [string]$inspection.status
+                    actionAttempted = [bool]$inspection.actionAttempted
+                    actionOutcome = [string]$inspection.actionOutcome
+                    challengeOutcome = [string]$inspection.challengeOutcome
+                    newApiConfirmed = [bool]$inspection.newApiConfirmed
+                }
+                Write-NativePreflightCheckpoint -Path $preflightPath -Results @($preflightResults + @($confirmedResult))
             }
         }
-        catch { $inspection = $null }
-        Close-AutomationBrowser $profilePath
-        if ($null -eq $inspection -and $inspectionAttempt -lt 2) { Start-Sleep -Seconds 1 }
+        catch { $attemptFailure = $_; throw }
+        finally {
+            Complete-NativePreflightAttempt -Cleanup { Close-AutomationBrowser $profilePath } -Failure $attemptFailure
+        }
+        if ([string]$lastInspection.failureCode -eq 'safeline_client_challenge') { break }
+        if ($null -eq $inspection -and $inspectionAttempt -lt $item.maxAttempts) { Start-Sleep -Seconds 1 }
     }
     $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed') `
         -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
@@ -280,18 +321,7 @@ foreach ($item in $items) {
         newApiAttempted = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiAttempted
         newApiConfirmed = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiConfirmed
     }
+    Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults
 }
-
-$preflightPath = Join-Path $root 'tmp\native-waf-preflight.json'
-$preflightReport = [pscustomobject]@{
-    generatedAt = (Get-Date).ToUniversalTime().ToString('o')
-    results = $preflightResults
-}
-[System.IO.Directory]::CreateDirectory((Split-Path -Parent $preflightPath)) | Out-Null
-[System.IO.File]::WriteAllText(
-    $preflightPath,
-    ($preflightReport | ConvertTo-Json -Depth 5),
-    [System.Text.UTF8Encoding]::new($false)
-)
 
 Write-Output "已离屏预热 $($items.Count) 个原生验证会话。"

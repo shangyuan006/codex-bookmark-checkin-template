@@ -52,6 +52,9 @@ export function getConfiguredPreCheckinNavigationRule(target, activeOrigin, conf
     expectedPath,
     steps,
     ...(normalizedTerminalPaths.length > 0 ? { terminalPaths: normalizedTerminalPaths } : {}),
+    ...(raw.terminalWhenNavigationControlMissing === true
+      ? { terminalWhenNavigationControlMissing: true }
+      : {}),
     waitMs: Math.max(500, Math.min(30_000, Number(raw.waitMs) || 3_000)),
     afterClickWaitMs: Math.max(100, Math.min(3_000, Number(raw.afterClickWaitMs) || 500)),
   };
@@ -131,13 +134,23 @@ export async function navigateConfiguredPreCheckinPage(
     || isLoginPath(initialPath)) return false;
 
   for (const step of rule.steps) {
-    const selected = await waitForUniqueNavigationCandidate(
-      page,
-      step,
-      rule.waitMs,
-      allowedOrigins,
-      rule.terminalPaths ?? [],
-    );
+    let selected;
+    try {
+      selected = await waitForUniqueNavigationCandidate(
+        page,
+        step,
+        rule.waitMs,
+        allowedOrigins,
+        rule.terminalPaths ?? [],
+      );
+    } catch (error) {
+      if (rule.terminalWhenNavigationControlMissing
+        && error instanceof Error
+        && error.message === "pre-check-in navigation control was not found") {
+        return { terminalNoAction: true };
+      }
+      throw error;
+    }
     if (!selected) return false;
     if (selected.terminalPath) return selected;
     if (selected.allowHidden) {

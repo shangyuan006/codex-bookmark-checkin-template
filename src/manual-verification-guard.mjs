@@ -1,3 +1,5 @@
+import { isTerminalResult } from "./result-contract.mjs";
+
 function normalizeOrigin(value) {
   try {
     const url = new URL(String(value ?? ""));
@@ -8,13 +10,23 @@ function normalizeOrigin(value) {
   }
 }
 
+function isTerminalVerificationTarget(target) {
+  const status = String(target?.verificationStatus ?? "");
+  if (["signed", "already_signed"].includes(status)) return true;
+  if (status !== "not_available") return false;
+  return isTerminalResult({
+    ...target,
+    status,
+  });
+}
+
 export function pendingManualVerificationOrigins(document) {
   if (document?.state !== "pending_verification" || document?.authoritativeEvidenceRequired !== true) {
     return [];
   }
   const origins = [];
   for (const target of document.targets ?? []) {
-    if (["signed", "already_signed", "not_available"].includes(String(target?.verificationStatus))) continue;
+    if (isTerminalVerificationTarget(target)) continue;
     const origin = normalizeOrigin(target?.origin);
     if (!origin) return [];
     origins.push(origin);
