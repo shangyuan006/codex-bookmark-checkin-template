@@ -23,7 +23,8 @@ function Get-NativeFallbackRetryOrigins($Report, [string[]]$Origins) {
         'needs_attention', 'unconfirmed', 'visited', 'clicked'
     )
     return @($Report.results | Where-Object {
-        $originSet.ContainsKey([string]$_.origin) -and [string]$_.status -in $fallbackStatuses
+        $originSet.ContainsKey([string]$_.origin) -and [string]$_.status -in $fallbackStatuses `
+            -and $_.retryable -ne $false -and $_.submissionAttempted -ne $true
     } | ForEach-Object { [string]$_.origin } | Sort-Object -Unique)
 }
 

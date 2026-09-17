@@ -89,6 +89,7 @@ function Test-ManualVerificationFinalReport($Report) {
 
 function Test-ManualVerificationImmediateResult($Result, [datetime]$RetryAt) {
     if ($null -eq $Result -or (Test-ManualVerificationResultTerminal $Result)) { return $false }
+    if ($Result.retryable -eq $false -or $Result.submissionAttempted -eq $true) { return $false }
     $status = [string]$Result.status
     if ($status -eq 'deferred') {
         if (-not $Result.nextEligibleAt) { return $true }

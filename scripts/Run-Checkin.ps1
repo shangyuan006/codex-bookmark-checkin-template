@@ -140,6 +140,7 @@ function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
     if ($unresolved.Count -eq 0) { return $false }
     $immediateRetryStatuses = @('error', 'login_required', 'managed_challenge', 'managed_challenge_timeout', 'unconfirmed', 'clicked', 'visited')
     foreach ($result in $unresolved) {
+        if ($result.retryable -eq $false -or $result.submissionAttempted -eq $true) { continue }
         $status = [string]$result.status
         if ($status -eq 'deferred') {
             try {
@@ -393,6 +394,7 @@ try {
             $manualAttemptUpdate = $null
             $needsNativeFallbackRetry = $false
             $runArguments = @($arguments)
+            if ($attempt -gt 1) { $runArguments += '--automatic-retry' }
             if ($null -ne $resumeCandidate) {
                 $runArguments += @('--resume-report', [string]$resumeCandidate.Path)
             }
@@ -421,7 +423,11 @@ try {
                     foreach ($result in @($resumeCandidate.Report.results)) {
                         $resultOrigin = [string]$result.origin
                         $previousOriginSet[$resultOrigin] = $true
-                        if (-not (Test-CheckinResultTerminal $result)) {
+                        # Explicit/manual first attempts may reread a changed session.
+                        # Automatic continuation must honor a non-retryable blocker.
+                        $explicitFirstAttempt = $attempt -eq 1 -and ($requestedOrigins.Count -gt 0 -or $null -ne $manualVerification)
+                        if (-not (Test-CheckinResultTerminal $result) -and ($explicitFirstAttempt `
+                            -or ($result.retryable -ne $false -and $result.submissionAttempted -ne $true))) {
                             $pendingOriginSet[$resultOrigin] = $true
                         }
                     }
@@ -462,7 +468,9 @@ try {
                     if (@($_.allowedOrigins).Count -gt 0) { @($_.allowedOrigins) } else { [string]$_.origin }
                 } | Where-Object { $_ -notin $excludedPreflightOrigins } | Sort-Object -Unique)
                 if ($preflightOrigins.Count -gt 0) {
-                    & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins -OverrideTodayAbandonment:$OverrideTodayAbandonment
+                    $preflightAttemptId = [guid]::NewGuid().ToString('N')
+                    & (Join-Path $PSScriptRoot 'Prepare-NativeWafSession.ps1') -Origins $preflightOrigins -OverrideTodayAbandonment:$OverrideTodayAbandonment -AttemptId $preflightAttemptId
+                    $runArguments += @('--native-preflight-attempt', $preflightAttemptId)
                 }
             }
 

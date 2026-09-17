@@ -1370,7 +1370,8 @@ async function passLeichiConfirmation(page, config) {
   const text = String(await description.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
   if (!/客户端异常.*确认.*合法用户/.test(text) || !await button.isVisible()) return null;
 
-  await button.click({ timeout: 10000 });
+  try { await button.click({ timeout: 10000 }); }
+  catch { return { passed: false, reason: "雷池 WAF 合法用户确认控件无法点击" }; }
   const deadline = Date.now() + Math.min(config.cloudflareWaitMs, 30000);
   while (Date.now() < deadline) {
     await sleep(1000);
@@ -2416,7 +2417,7 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   }
   const leichi = await passLeichiConfirmation(page, config);
   if (leichi && !leichi.passed) {
-    return { status: "interactive_challenge", reason: leichi.reason, url: safeLogUrl(page.url()) };
+    return { status: "interactive_challenge", reason: leichi.reason, url: safeLogUrl(page.url()), failureCode: 'safeline_client_challenge', retryable: false };
   }
   if (leichi?.passed) {
     await page.waitForLoadState("domcontentloaded", { timeout: config.navigationTimeoutMs }).catch(() => {});
@@ -2932,6 +2933,9 @@ export async function processTarget(context, target, config, qaRules, logDirecto
           };
         }
         candidateHistory.push(candidateHistoryEntry(candidateUrl, result, attempt + 1));
+        // A blocked verification must not be reopened through a second bookmark
+        // candidate or a local retry. The caller still hands it to the user.
+        if (result.retryable === false) return { ...result, attempt: attempt + 1, candidateHistory };
         attemptResult = preferCandidateResult(attemptResult, result);
         lastResult = preferCandidateResult(lastResult, result);
         // A logical bookmark target can contain multiple related URLs.  One

@@ -336,10 +336,17 @@ export function isRetryEligible(result, now = new Date()) {
 }
 
 export function isResumeRetryEligible(result, reauthOrigins, now = new Date()) {
+  if (result?.retryable === false || result?.submissionAttempted === true) return false;
   if (isRetryEligible(result, now)) return true;
   return result?.status === "needs_attention"
     && reauthOrigins instanceof Set
     && reauthOrigins.has(result.origin);
+}
+
+export function filterAutomaticRetryOrigins(origins, results) {
+  const blocked = new Set(results.filter(result => result.retryable === false || result.submissionAttempted === true)
+    .map(result => result.origin));
+  return new Set([...origins].filter(origin => !blocked.has(origin)));
 }
 
 export function nextDeferredRetryAt(results, now = new Date()) {

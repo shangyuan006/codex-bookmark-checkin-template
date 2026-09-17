@@ -43,7 +43,7 @@ export function classifyPageText({
   const lowerUrl = String(url).toLowerCase();
 
   if (/雷池|safeline/i.test(text) && /客户端异常.*确认.*合法用户/.test(text)) {
-    return { status: 'interactive_challenge', reason: '雷池 WAF 要求合法用户确认', failureCode: 'safeline_client_challenge' };
+    return { status: 'interactive_challenge', reason: '雷池 WAF 要求合法用户确认', failureCode: 'safeline_client_challenge', retryable: false };
   }
 
   // A login form can legitimately contain an image CAPTCHA.  Treating every

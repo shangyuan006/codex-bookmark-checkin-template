@@ -27,7 +27,7 @@ import { loginHelperOutcome, loginHelperOutcomeFromStreams, resolveLoginRecovery
 import { runRecoveryProcess } from "./recovery-process.mjs";
 import { continueNativeCheckinAfterLogin } from "./native-login-continuation.mjs";
 import { configuredNoCheckinResult, isTerminalResult } from "./result-contract.mjs";
-import { freshNativePreflightResults, nativePreflightProgress } from "./native-preflight-state.mjs";
+import { freshNativePreflightResults, freshNativePreflightHandoffs, nativePreflightProgress } from "./native-preflight-state.mjs";
 import { assertManualVerificationExecution } from "./manual-verification-guard.mjs";
 import { atomicWriteJson, ensurePrivateDirectory, safeErrorMessage } from "./security.mjs";
 import { acquireRunLock, releaseRunLock } from "./run-lock.mjs";
@@ -47,6 +47,7 @@ import {
   localRunDate,
   isRetryEligible,
   recoveryEntriesForResults,
+  filterAutomaticRetryOrigins,
   isResumeRetryEligible,
   nextDeferredRetryAt,
 } from "./retry-policy.mjs";
@@ -65,6 +66,9 @@ const localQaConfig = await fs.readFile(path.join(rootDirectory, "config", "qa-r
 const dryRun = process.argv.includes("--dry-run");
 const listPreflightTargets = process.argv.includes("--list-preflight-targets");
 const ignoreNativePreflight = process.argv.includes("--ignore-native-preflight");
+const automaticRetry = process.argv.includes("--automatic-retry");
+const nativePreflightAttemptIndex = process.argv.indexOf("--native-preflight-attempt");
+const nativePreflightAttemptId = nativePreflightAttemptIndex >= 0 ? process.argv[nativePreflightAttemptIndex + 1] : null;
 const limitIndex = process.argv.indexOf("--limit");
 const offsetIndex = process.argv.indexOf("--offset");
 const originsIndex = process.argv.indexOf("--origins");
@@ -120,7 +124,7 @@ async function readValidatedBookmarkPlan() {
   return plan;
 }
 
-async function readFreshNativeWafPreflight() {
+async function readFreshNativeWafPreflight(includeHandoffs = false, attemptId = nativePreflightAttemptId) {
   if (ignoreNativePreflight) return new Map();
   const configuredUrls = [
     ...(config.nativeWafPreflightUrls ?? []).map((value) => typeof value === "string" ? value : value?.url),
@@ -130,7 +134,10 @@ async function readFreshNativeWafPreflight() {
   const report = await fs.readFile(nativeWafPreflightPath, "utf8")
     .then((text) => JSON.parse(text))
     .catch(() => null);
-  return freshNativePreflightResults(report, allowedOrigins);
+  const confirmations = freshNativePreflightResults(report, allowedOrigins);
+  if (!includeHandoffs) return confirmations;
+  const handoffs = freshNativePreflightHandoffs(report, allowedOrigins, attemptId);
+  return new Map([...handoffs, ...confirmations]);
 }
 
 const lockLease = await acquireRunLock(lockPath);
@@ -186,6 +193,9 @@ try {
         ]);
       }
     }
+    if (automaticRetry && resumeBase && selectedOrigins) {
+      selectedOrigins = filterAutomaticRetryOrigins(selectedOrigins, resumeBase.results);
+    }
     await cleanupOldLogs(logsRoot, config.logRetentionDays);
     const runLog = await createRunLog(logsRoot);
     const startedAt = new Date();
@@ -197,7 +207,7 @@ try {
       ...qaCache.entries.map((entry) => ({ ...entry, source: "verified_cache" })),
     ];
     const results = [];
-    const nativeWafPreflight = await readFreshNativeWafPreflight();
+    const nativeWafPreflight = await readFreshNativeWafPreflight(true);
     const preferredTargets = applyPreferredCandidates(plan.targets, siteState);
     const originFilteredTargets = selectedOrigins
       ? preferredTargets.filter((target) => selectedOrigins.has(target.origin))
@@ -207,11 +217,14 @@ try {
       : originFilteredTargets.slice(offset);
     // Persist native confirmations before OAuth or browser startup can fail.
     // Origin-only evidence cannot replace a multi-account reauthentication result.
-    const nativeCompletedResults = nativePreflightProgress(
+    const nativeResults = nativePreflightProgress(
       selectedTargets.filter(target => !getConfiguredReauthRule(target, config)
         && !configuredNoCheckinResult(target, config)), nativeWafPreflight,
     );
+    const nativeCompletedResults = nativeResults.filter(result => ['signed', 'already_signed'].includes(result.status));
+    const nativeHandoffResults = nativeResults.filter(result => result.retryable === false);
     results.push(...nativeCompletedResults);
+    results.push(...nativeHandoffResults);
     results.push(...selectedTargets.map(target => configuredNoCheckinResult(target, config)).filter(Boolean));
     const precompletedOrigins = new Set(results.map(result => result.origin));
     const selectedOriginList = selectedTargets.map((target) => target.origin);
@@ -493,9 +506,9 @@ try {
       const nativeContinuations = new Map();
       for (const { target } of recoveryEntries) {
         const continuation = await continueNativeCheckinAfterLogin(target, config, loginOutcomes.get(target.origin), {
-          runPreflight: origin => runRecoveryProcess(config.powershellExecutable || 'pwsh.exe', [
+          runPreflight: (origin, attemptId) => runRecoveryProcess(config.powershellExecutable || 'pwsh.exe', [
             '-NoProfile', '-NonInteractive', '-File', path.join(rootDirectory, 'scripts', 'Prepare-NativeWafSession.ps1'),
-            '-Origins', origin,
+            '-Origins', origin, '-AttemptId', attemptId,
           ], {
             cwd: rootDirectory, powershellExecutable: config.powershellExecutable || 'pwsh.exe',
             windowsHide: true, timeout: 360000, maxBuffer: 1024 * 1024,
@@ -503,7 +516,7 @@ try {
               '-NoProfile', '-NonInteractive', '-File', path.join(rootDirectory, 'scripts', 'Close-RecoveryBrowser.ps1'),
             ], { cwd: rootDirectory, windowsHide: true, timeout: 25000, maxBuffer: 65536 }),
           }),
-          readConfirmations: readFreshNativeWafPreflight,
+          readConfirmations: attemptId => readFreshNativeWafPreflight(true, attemptId),
         });
         if (continuation) nativeContinuations.set(target.origin, continuation);
       }

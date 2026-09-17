@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
     [string[]]$Origins,
-    [switch]$OverrideTodayAbandonment
+    [switch]$OverrideTodayAbandonment,
+    [string]$AttemptId = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -273,13 +274,18 @@ foreach ($item in $items) {
     $prepared = -not $hasAction -and -not $hasNewApiCheckin -and $null -ne $inspection -and [bool]$inspection.siteBodyLoaded `
         -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
     $reportedInspection = if ($null -ne $inspection) { $inspection } else { $lastInspection }
+    $requiresHandoff = -not $explicitlyConfirmed -and -not $endpointConfirmed `
+        -and [string]$reportedInspection.failureCode -eq 'safeline_client_challenge'
     if (-not $explicitlyConfirmed -and -not $endpointConfirmed -and -not $prepared) {
         Write-Warning "原生验证未能确认站点正文：$hostName"
     }
     $preflightResults += [pscustomobject]@{
         origin = $origin
         url = $url
-        status = if ($explicitlyConfirmed -or $endpointConfirmed) { 'signed' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
+        status = if ($explicitlyConfirmed -or $endpointConfirmed) { 'signed' } elseif ($requiresHandoff) { 'interactive_challenge' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
+        failureCode = if ($requiresHandoff) { 'safeline_client_challenge' } else { $null }
+        retryable = if ($requiresHandoff) { $false } else { $null }
+        preflightAttemptId = $AttemptId
         reason = if ($explicitlyConfirmed -and $hasAction -and [bool]$inspection.actionAttempted) {
             "原生 $($browser.DisplayName) 已执行签到动作，并由页面明确确认今天已签到"
         } elseif ($explicitlyConfirmed -and $hasNewApiCheckin -and [bool]$inspection.newApiConfirmed) {
@@ -292,6 +298,8 @@ foreach ($item in $items) {
             "原生 $($browser.DisplayName) 已通过 WAF，并确认签到端点完整加载"
         } elseif ($prepared) {
             "原生 $($browser.DisplayName) 已完成验证预热，等待自动化复查"
+        } elseif ($requiresHandoff) {
+            '雷池 WAF 要求合法用户确认，停止本轮自动重试并转人工处理'
         } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'action_not_found') {
             '原生签到未找到配置的唯一动作'
         } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'action_not_unique') {

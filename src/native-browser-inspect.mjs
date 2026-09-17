@@ -160,6 +160,7 @@ async function inspectWithPlaywright() {
       output = {
         status: current.state.status,
         failureCode: current.state.failureCode,
+        retryable: current.state.retryable,
         siteBodyLoaded: current.siteBodyLoaded,
         attendanceEndpoint: current.attendanceEndpoint,
         actionAttempted,
