@@ -33,11 +33,26 @@ if ($requested.Count -eq 0) { throw '至少需要一个今日放弃 origin。' }
 
 $pendingVerification = $null
 if (Test-Path -LiteralPath $verificationPath) {
-    $pendingVerification = Get-PendingManualVerification -Path $verificationPath
-    if ($null -eq $pendingVerification `
-        -or -not (Test-ManualVerificationCurrentDayDocument $pendingVerification.Document (Get-Date))) {
-        throw '现有人工复核记录不是今天有效的待复核状态，拒绝自动覆盖。'
+    $verificationDocument = try {
+        Get-Content -Raw -Encoding UTF8 -LiteralPath $verificationPath | ConvertFrom-Json
     }
+    catch { throw '现有人工复核记录无法读取，拒绝自动覆盖。' }
+    $completedVerification = [int]$verificationDocument.schemaVersion -eq 1 `
+        -and [string]$verificationDocument.state -eq 'verification_complete' `
+        -and $verificationDocument.authoritativeEvidenceRequired -eq $false `
+        -and @($verificationDocument.targets).Count -gt 0 `
+        -and @($verificationDocument.targets | Where-Object {
+            -not (Test-ManualVerificationTargetTerminal $_)
+        }).Count -eq 0
+    if (-not $completedVerification) {
+        $pendingVerification = Get-PendingManualVerification -Path $verificationPath
+        if ($null -eq $pendingVerification `
+            -or -not (Test-ManualVerificationCurrentDayDocument $pendingVerification.Document (Get-Date))) {
+            throw '现有人工复核记录不是今天有效的待复核状态，拒绝自动覆盖。'
+        }
+    }
+}
+if ($null -ne $pendingVerification) {
     $pendingOriginSet = @{}
     foreach ($origin in @($pendingVerification.Origins)) {
         $pendingOriginSet[[string]$origin] = $true
@@ -51,7 +66,7 @@ if (Test-Path -LiteralPath $verificationPath) {
 
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
 $node = Resolve-CheckinNode $config
-$attentionArguments = @((Join-Path $root 'src\attention-urls.mjs'))
+$attentionArguments = @((Join-Path $root 'src\attention-urls.mjs'), '--for-abandonment')
 foreach ($origin in @($requested.Keys | Sort-Object)) {
     $attentionArguments += @('--origin', $origin)
 }

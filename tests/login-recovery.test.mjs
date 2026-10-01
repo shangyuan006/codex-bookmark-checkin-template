@@ -6,6 +6,7 @@ import {
   loginHelperOutcomeFromStreams,
   parseLoginHelperResult,
   resolveLoginRecoveryUrl,
+  shouldRecheckCheckinAfterLogin,
 } from "../src/login-recovery.mjs";
 
 test("登录助手必须明确返回 logged_in 才算成功", () => {
@@ -53,6 +54,23 @@ test("OAuth helper result can be parsed from stderr without persisting raw diagn
   assert.equal(Object.hasOwn(outcome, "raw"), false);
 });
 
+test("OAuth helper exposes only bounded provider authorization challenge diagnostics", () => {
+  const outcome = loginHelperOutcome(JSON.stringify({
+    status: "needs_attention",
+    providerAuthorizationChallengeOutcome: "unresolved_after_click",
+    providerAuthorizationChallengeClicks: 2,
+    privatePageText: "secret",
+  }));
+  assert.equal(outcome.providerAuthorizationChallengeOutcome, "unresolved_after_click");
+  assert.equal(outcome.providerAuthorizationChallengeClicks, 2);
+  assert.equal(Object.hasOwn(outcome, "privatePageText"), false);
+  assert.equal(loginHelperOutcome(JSON.stringify({
+    status: "needs_attention",
+    providerAuthorizationChallengeOutcome: "private-value",
+    providerAuthorizationChallengeClicks: 99,
+  })).providerAuthorizationChallengeOutcome, undefined);
+});
+
 test("same-session OAuth helper exposes only authoritative check-in statuses", () => {
   assert.equal(loginHelperOutcome(JSON.stringify({
     status: "logged_in",
@@ -67,6 +85,18 @@ test("same-session OAuth helper exposes only authoritative check-in statuses", (
     status: "logged_in",
     checkinStatus: "already_signed",
   })).checkinStatus, "already_signed");
+});
+
+test("保存登录恢复后，未确认签到会触发一次同上下文复核", () => {
+  const loginOutcome = {
+    succeeded: true,
+    attempts: [{ method: "native_saved_password", status: "logged_in" }],
+  };
+  assert.equal(shouldRecheckCheckinAfterLogin(loginOutcome, { status: "deferred" }), true);
+  assert.equal(shouldRecheckCheckinAfterLogin(loginOutcome, { status: "login_required" }), true);
+  assert.equal(shouldRecheckCheckinAfterLogin(loginOutcome, { status: "already_signed" }), false);
+  assert.equal(shouldRecheckCheckinAfterLogin({ ...loginOutcome, authoritativeCheckinStatus: "signed" }, { status: "deferred" }), false);
+  assert.equal(shouldRecheckCheckinAfterLogin({ succeeded: true, attempts: [{ method: "other" }] }, { status: "deferred" }), false);
 });
 
 test("stdout status remains authoritative while stderr supplies a missing fixed stage", () => {
@@ -148,7 +178,9 @@ test("恢复调度只复用清理后的登录 URL 并解析助手状态", async 
   assert.match(source, /const needsRecoveryBrowser = recoveryEntries\.some/);
   assert.doesNotMatch(source, /selectedTargets\[resultIndex\]/);
   assert.match(source, /needsRecoveryBrowser \? await launchAutomationContext\(config\) : null/);
-  assert.match(source, /await recoveryContext\?\.close\(\)/);
+  assert.match(source, /await closeRunAutomationContext\(recoveryContext, `recovery-\$\{round \+ 1\}`\)/);
+  assert.match(source, /for \(let round = 0; round < recoveryRounds && !automationContextCleanupFailed/);
+  assert.doesNotMatch(source, /await (?:recoveryContext|context)\?\.close\(\)/);
 });
 
 test("OAuth helper exposes only fixed diagnostic stages", async () => {
@@ -162,6 +194,10 @@ test("OAuth helper exposes only fixed diagnostic stages", async () => {
   assert.match(source, /allowFrameCoordinateFallback: allowLinuxDoSsoFrameClick/);
   assert.match(source, /frameStableMs: ssoChallengeRule\.frameStableMs/);
   assert.match(source, /experimentalSsoChallengeOutcome/);
+  assert.match(source, /providerAuthorizationChallengeOutcome/);
+  assert.match(source, /providerAuthorizationChallengeClicks/);
+  assert.match(source, /resolved_after_click/);
+  assert.match(source, /unresolved_after_click/);
   assert.match(source, /setOAuthStage\("login_challenge"\)/);
   assert.match(source, /setOAuthStage\("linuxdo_session"\)/);
   assert.match(source, /setOAuthStage\("linuxdo_login_challenge"\)/);
@@ -170,14 +206,15 @@ test("OAuth helper exposes only fixed diagnostic stages", async () => {
   assert.match(source, /if \(initialSession !== "invalid"\) return false/);
   assert.doesNotMatch(source, /page\.goto\("https:\/\/linux\.do\/session\/current\.json"/);
   assert.match(source, /agentRouterOnly && !providerSessionConfirmed/);
-  assert.match(source, /if \(agentRouterOnly\) \{[\s\S]*?probeLinuxDoSession\(context, 2\)/);
-  assert.match(source, /probeLinuxDoSession\(context, 2\)[\s\S]*?acquireTargetPage\(context\)/);
+  assert.match(source, /if \(agentRouterOnly\) \{[\s\S]*?probeLinuxDoSession\(context, 3\)/);
+  assert.match(source, /probeLinuxDoSession\(context, 3\)[\s\S]*?acquireTargetPage\(context\)/);
   assert.match(source, /setOAuthStage\("provider_authorization"\)/);
   assert.match(source, /describeConfiguredAuthorizationSurface\(page, provider\)/);
   assert.match(source, /authorizationSurfaceReported = true/);
   assert.match(source, /clickConfiguredLoginChallengeControl\([\s\S]*?providerOrigin/);
   assert.match(source, /isConfiguredProviderAuthorizationPage\(page\.url\(\), provider\)[\s\S]*?authorizationDeadline/);
-  assert.match(source, /authorizationSubmitted = true[\s\S]*?providerChallengeClicked[\s\S]*?authorizationSubmitted = false/);
+  assert.match(source, /authorizationSubmitted = true[\s\S]*?providerChallengeClick[\s\S]*?authorizationSubmitted = false/);
+  assert.doesNotMatch(source, /if \(!providerChallengeClicked\)/);
   assert.match(source, /if \(isConfiguredProviderAuthorizationPage\(page\.url\(\), provider\)\) \{[\s\S]*?authorization did not complete/);
   assert.match(source, /setOAuthStage\("target_callback"\)/);
   assert.match(source, /setOAuthStage\("checkin_verification"\)/);

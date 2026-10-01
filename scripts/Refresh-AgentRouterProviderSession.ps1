@@ -4,7 +4,7 @@ param(
     [Alias('AccountId')]
     [string]$AccountKey,
     [ValidateRange(5, 30)]
-    [int]$WaitSeconds = 8
+    [int]$WaitSeconds = 12
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,7 +71,7 @@ $arguments = @(
     '--disable-component-update',
     '--window-position=-32000,-32000',
     '--window-size=1200,800',
-    'https://linux.do/'
+    'https://linux.do/login'
 )
 
 try {

@@ -18,6 +18,8 @@
   "newApiSignInRules": {},
   "bearerCheckinRules": {},
   "newApiCheckinOrigins": [],
+  "apiFirstOrigins": [],
+  "siteCycleRules": {},
   "nativeOAuthCheckinOrigins": [],
   "extendedDiscoveryOrigins": [],
   "autoDetectOAuthOrigins": [],

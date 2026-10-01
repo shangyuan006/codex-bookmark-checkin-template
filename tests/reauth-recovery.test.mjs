@@ -109,7 +109,7 @@ for (const scenario of ["restart", "complete", "fallback-write-failure", "restar
       if (scenario !== "complete") await fs.writeFile(providerState, JSON.stringify({ accountKey: "linuxdo", profile }));
       const result = spawnSync(powershellExecutable, ["-NoProfile", "-File", path.join(scripts, "Open-AgentRouterLogin.ps1"), "-AccountKey", "linuxdo", "-AgentRouterOnly"], { encoding: "utf8", timeout: 30000 });
       assert.equal(result.status, scenario === "fallback-write-failure" ? 1 : 0, result.stderr + result.stdout);
-      assert.equal(await fs.readFile(calls, "utf8"), scenario === "fallback-write-failure" ? "oauth\nverify\n" : scenario === "restart-manual" ? "full\nmanual\n" : "full\n");
+      assert.equal(await fs.readFile(calls, "utf8"), scenario === "fallback-write-failure" ? "oauth\nverify\n" : scenario === "restart-manual" ? "full\noauth\nmanual\n" : "full\n");
       if (scenario === "fallback-write-failure") {
         await fs.access(providerState);
         assert.doesNotMatch(result.stdout, /authoritatively confirms today's check-in/);

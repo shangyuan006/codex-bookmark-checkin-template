@@ -89,7 +89,14 @@ function Get-AccountReasonLabel([object]$AccountResult) {
         'interactive_challenge' { return '需要人工验证' }
         'managed_challenge_timeout' { return '验证超时' }
         'needs_attention' { return '需要人工处理' }
-        'not_available' { return '未开放签到' }
+        'not_available' {
+            if (-not (Test-ConfirmedNotAvailable $AccountResult)) { return '不可用结论未确认' }
+            switch ([string]$AccountResult.availabilityKind) {
+                'temporary_unavailable' { return '今日暂不可用' }
+                'task_disabled' { return '配置停用' }
+                default { return '未开放签到' }
+            }
+        }
         'no_action' { return '未找到签到入口' }
         'visited' { return '结果未确认' }
         'clicked' { return '结果未确认' }
@@ -182,6 +189,23 @@ function Get-ProjectedResultStatus([object]$Result) {
     return Get-NormalizedCheckinResultStatus $Result
 }
 
+function Get-UnavailableCounts($Results) {
+    $counts = [ordered]@{ feature_disabled = 0; temporary_unavailable = 0; task_disabled = 0 }
+    foreach ($result in @($Results)) {
+        if ((Get-ProjectedResultStatus $result) -ne 'not_available') { continue }
+        $kind = [string]$result.availabilityKind
+        if ($counts.Contains($kind)) { $counts[$kind]++ }
+    }
+    return [pscustomobject]$counts
+}
+
+function Format-UnavailableCounts($Counts) {
+    $lines = @("$($Counts.feature_disabled) 个未开放签到（功能关闭）")
+    if ($Counts.temporary_unavailable -gt 0) { $lines += "$($Counts.temporary_unavailable) 个今日暂不可用" }
+    if ($Counts.task_disabled -gt 0) { $lines += "$($Counts.task_disabled) 个配置停用" }
+    return $lines -join "`n"
+}
+
 if ($ReportPath) {
     $resolvedReport = (Resolve-Path -LiteralPath $ReportPath).Path
     $logsRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'logs'))
@@ -217,6 +241,8 @@ foreach ($selectedStatus in @($selectedStatuses | Sort-Object -Unique)) {
 }
 $selectedDone = @($selectedStatuses | Where-Object { $_ -in @('signed', 'already_signed') }).Count
 $selectedNotAvailable = @($selectedStatuses | Where-Object { $_ -eq 'not_available' }).Count
+$selectedAvailabilitySummary = Get-UnavailableCounts $selectedResults
+$selectedAvailabilityText = Format-UnavailableCounts $selectedAvailabilitySummary
 $selectedAbandonedCount = @($selectedStatuses | Where-Object { $_ -eq 'abandoned' }).Count
 $selectedProblems = @($selectedResults | Where-Object {
     -not (Test-ResultIsAbandoned $_) `
@@ -239,6 +265,8 @@ $done = @($results | Where-Object {
         -and -not (Test-ResultHasNestedAccountConflict $_)
 }).Count
 $notAvailable = @($statuses | Where-Object { $_ -eq 'not_available' }).Count
+$availabilitySummary = Get-UnavailableCounts $results
+$availabilityText = Format-UnavailableCounts $availabilitySummary
 $abandonedCount = @($statuses | Where-Object { $_ -eq 'abandoned' }).Count
 $parentProblems = @($results | Where-Object {
     -not (Test-ResultIsAbandoned $_) -and -not (Test-CheckinResultTerminal $_)
@@ -269,11 +297,11 @@ else { $status = 'unconfirmed' }
 $summary = if ($results.Count -gt 0 -or ($null -ne $report -and $plannedTotal -gt 0)) {
     if ($isTargetedReport) {
         $dailyHeading = if ($isCompleteFinalReport) { "今日累计：共 $plannedTotal 站" } else { "今日累计：已处理 $processedTotal/$plannedTotal 站（任务未完成）" }
-        "本轮 $selectedProcessedTotal/$selectedTotal 站：`n$selectedDone 个签到正常`n$selectedNotAvailable 个未开放签到`n$selectedAbandonedCount 个今日放弃`n$dailyHeading`n$done 个签到正常`n$notAvailable 个未开放签到`n$abandonedCount 个今日放弃"
+        "本轮 $selectedProcessedTotal/$selectedTotal 站：`n$selectedDone 个签到正常`n$selectedAvailabilityText`n$selectedAbandonedCount 个今日放弃`n$dailyHeading`n$done 个签到正常`n$availabilityText`n$abandonedCount 个今日放弃"
     }
     else {
         $heading = if ($isCompleteFinalReport) { "共 $plannedTotal 站：" } else { "已处理 $processedTotal/$plannedTotal 站（任务未完成）：" }
-        "$heading`n$done 个签到正常`n$notAvailable 个未开放签到`n$abandonedCount 个今日放弃"
+        "$heading`n$done 个签到正常`n$availabilityText`n$abandonedCount 个今日放弃"
     }
 }
 else { Compress-Text $RunnerMessage 160 }
@@ -350,7 +378,8 @@ $source = if ($notification.source) { [string]$notification.source } else { 'bro
 $stateParts = @($results | Sort-Object origin | ForEach-Object {
     $result = $_
     $projectedStatus = Get-ProjectedResultStatus $result
-    "$([string]$result.origin)=$projectedStatus`:$([string]$result.retryCause)"
+    $availabilitySuffix = if ($projectedStatus -eq 'not_available') { ":$([string]$result.availabilityKind)" } else { '' }
+    "$([string]$result.origin)=$projectedStatus`:$([string]$result.retryCause)$availabilitySuffix"
     if ($projectedStatus -ne 'abandoned') {
         Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
     }
@@ -358,7 +387,8 @@ $stateParts = @($results | Sort-Object origin | ForEach-Object {
 $selectedStateParts = @($selectedResults | Sort-Object origin | ForEach-Object {
     $result = $_
     $projectedStatus = Get-ProjectedResultStatus $result
-    "$([string]$result.origin)=$projectedStatus`:$([string]$result.retryCause)"
+    $availabilitySuffix = if ($projectedStatus -eq 'not_available') { ":$([string]$result.availabilityKind)" } else { '' }
+    "$([string]$result.origin)=$projectedStatus`:$([string]$result.retryCause)$availabilitySuffix"
     if ($projectedStatus -ne 'abandoned') {
         Get-AccountStateParts $result | ForEach-Object { "account:$([string]$result.origin):$_" }
     }
@@ -372,6 +402,8 @@ $payload = [ordered]@{
     status = $status
     summary = $summary
     siteCount = $results.Count
+    availabilitySummary = $availabilitySummary
+    selectedAvailabilitySummary = $selectedAvailabilitySummary
     problemCount = $problems.Count
     abandonedCount = $abandonedCount
     selectedSiteCount = $selectedResults.Count
@@ -415,6 +447,8 @@ $item = [ordered]@{
     schemaVersion = 1
     eventKey = $eventKey
     payloadHash = $payloadHash
+    availabilitySummary = $availabilitySummary
+    selectedAvailabilitySummary = $selectedAvailabilitySummary
     taskId = $taskId
     name = $name
     source = $source

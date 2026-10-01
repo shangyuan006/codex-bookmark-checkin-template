@@ -11,6 +11,24 @@ export function isLinuxDoSsoProviderPage(rawUrl) {
   }
 }
 
+export function isConfiguredLinuxDoSsoFrameClick(config, provider) {
+  if (!/linux\s*do/i.test(String(provider ?? ""))) return false;
+  if (!Array.isArray(config?.autoClickTurnstileOrigins)) return false;
+  return config.autoClickTurnstileOrigins.some((value) => {
+    try {
+      return new URL(value).origin === "https://connect.linux.do";
+    } catch {
+      return false;
+    }
+  });
+}
+
+export function configuredLinuxDoSsoChallengeRule(config, provider) {
+  if (!/linux\s*do/i.test(String(provider ?? ""))) return {};
+  const rule = config?.challengeInteractionRules?.["https://connect.linux.do"];
+  return rule && typeof rule === "object" && !Array.isArray(rule) ? rule : {};
+}
+
 async function visibleEnabledCandidates(locator) {
   const candidates = [];
   const count = Math.min(20, await locator.count().catch(() => 0));
@@ -191,13 +209,18 @@ export async function waitForLinuxDoSsoTransition(page, {
   onChallengeObserved = null,
   allowFrameCoordinateFallback = false,
   frameStableMs = 0,
+  maxChallengeClicks = 2,
+  challengeRetryDelayMs = 5_000,
 } = {}) {
   const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
   const interval = Math.max(50, Number(pollMs) || 500);
   const requiredStableMs = Math.max(0, Math.min(5_000, Number(frameStableMs) || 0));
   let challengeObserved = false;
   let challengeClicked = false;
-  let clickAttempted = false;
+  const clickLimit = Math.max(1, Math.min(3, Number(maxChallengeClicks) || 2));
+  const retryDelay = Math.max(500, Math.min(15_000, Number(challengeRetryDelayMs) || 5_000));
+  let challengeClickCount = 0;
+  let lastChallengeClickAt = 0;
   let challengeOutcome = "not_observed";
   let previousFrameBox = null;
   let frameStableSince = 0;
@@ -247,7 +270,8 @@ export async function waitForLinuxDoSsoTransition(page, {
     }
     const stableEnough = requiredStableMs === 0
       || (frameStableSince > 0 && Date.now() - frameStableSince >= requiredStableMs);
-    if (!clickAttempted
+    if (challengeClickCount < clickLimit
+      && (lastChallengeClickAt === 0 || Date.now() - lastChallengeClickAt >= retryDelay)
       && observation.frameCount === 1
       && ((observation.directCandidateCount + observation.labelCandidateCount) > 0
         || (allowFrameCoordinateFallback && observation.frameClickCandidateCount === 1 && stableEnough))) {
@@ -264,8 +288,9 @@ export async function waitForLinuxDoSsoTransition(page, {
         "challenge_frame_clicked",
         "challenge_frame_click_failed",
       ].includes(result.outcome)) {
-        clickAttempted = true;
-        challengeClicked = result.clicked;
+        challengeClickCount += 1;
+        lastChallengeClickAt = Date.now();
+        challengeClicked ||= result.clicked;
         challengeOutcome = {
           challenge_control_clicked: "semantic_clicked",
           challenge_control_click_failed: "click_failed",
@@ -286,6 +311,7 @@ export async function waitForLinuxDoSsoTransition(page, {
     transitioned,
     challengeObserved,
     challengeClicked,
+    challengeClickCount,
     challengeOutcome,
     timedOut: !page.isClosed?.() && isLinuxDoSsoProviderPage(page.url()),
   };

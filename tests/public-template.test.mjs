@@ -77,7 +77,8 @@ test("Agent Router account login helper does not request or persist secrets", as
   assert.match(accountHelper, /\.accountKey/);
   assert.match(accountHelper, /\.accountId/);
   assert.match(opener, /user-data-dir=/);
-  assert.match(opener, /oauth-provider-session\.mjs/);
+  assert.match(opener, /Invoke-LinuxDoProviderSessionProbe/);
+  assert.match(accountHelper, /oauth-provider-session\.mjs/);
   assert.doesNotMatch(`${opener}\n${accountHelper}`, /password|cookie|token|current_user|username|email/i);
 });
 

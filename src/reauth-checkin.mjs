@@ -9,6 +9,7 @@ import { localRunDate, nextShanghaiTime } from "./retry-policy.mjs";
 import { normalizeAgentRouterAccountKey, normalizeReauthProvider } from "./result-identity.mjs";
 import { atomicWriteJson, safeErrorMessage } from "./security.mjs";
 import { hasCurrentReauthEvidence, reauthRecoveryAction, resetReauthLoginEvidence } from "./reauth-recovery.mjs";
+import { quotaChangeEvidence } from './quota-evidence.mjs';
 
 const execFileAsync = promisify(execFile);
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -108,6 +109,12 @@ export function getConfiguredReauthRule(target, config) {
   const afterMatch = raw.after == null ? null : String(raw.after).match(/^([01]\d|2[0-3]):([0-5]\d)$/);
   if (raw.after != null && !afterMatch) throw new Error("重认证签到时间必须使用 HH:mm");
   const quotaField = String(raw.quotaField || "data.quota");
+  const usedQuotaField = raw.usedQuotaField == null ? null : String(raw.usedQuotaField);
+  const expectedReward = raw.expectedReward == null ? null : Number(raw.expectedReward);
+  if (usedQuotaField && (!/^[_a-z][_a-z0-9]*(?:\.[_a-z][_a-z0-9]*)*$/i.test(usedQuotaField)
+    || !Number.isFinite(expectedReward) || expectedReward <= 0 || !raw.quotaEndpoint || raw.quotaDomEvidence)) {
+    throw new Error('Usage quota evidence requires an API field and a positive reward in raw quota units');
+  }
   if (!/^[_a-z][_a-z0-9]*(?:\.[_a-z][_a-z0-9]*)*$/i.test(quotaField)) {
     throw new Error("重认证额度字段路径无效");
   }
@@ -151,6 +158,8 @@ export function getConfiguredReauthRule(target, config) {
       ? assertSameOriginHttps(raw.quotaEndpoint, origin, "重认证额度接口")
       : null,
     quotaField,
+    usedQuotaField,
+    expectedReward,
     quotaDomEvidence,
     loginSuccessStorageEvidence,
     accountMenuSelector,
@@ -345,6 +354,10 @@ export function aggregateReauthResults(accountResults) {
   return {
     status: "needs_attention",
     reason: "At least one configured account did not produce authoritative check-in evidence",
+    // Successful siblings must not hide a manual-only blocker. An unrelated
+    // recoverable account still permits the existing task-level retry policy.
+    ...(results.filter(result => !["signed", "already_signed"].includes(result.status))
+      .every(result => result.retryable === false) ? { retryable: false } : {}),
     accountResults: results,
   };
 }
@@ -382,8 +395,17 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
     login_challenge: "安全验证完成后仍未找到提供方按钮",
     provider_transition: "登录提供方跳转未完成",
     linuxdo_session: "LinuxDO 会话恢复未完成",
+    linuxdo_session_challenge: "LinuxDO 会话探测被 CF 真人验证阻塞，登录状态尚未确认",
+    linuxdo_session_rate_limited: "LinuxDO 会话探测受到请求频率限制，登录状态尚未确认",
     linuxdo_login_challenge: "LinuxDO 登录页 CF 真人验证未完成",
     provider_session: "登录提供方保存会话恢复未完成",
+    github_autofill_missing: "GitHub 登录态失效，浏览器未自动填充账号密码",
+    github_account_selection: "GitHub 要求选择账号",
+    github_interactive_verification: "GitHub 要求二次验证或设备验证",
+    github_form_not_unique: "GitHub 账号密码登录表单未能唯一确认",
+    github_submit_not_unique: "GitHub 登录表单内的提交按钮未能唯一确认",
+    github_submit_failed: "GitHub 登录表单提交未完成",
+    github_login_not_completed: "提交后仍停留在 GitHub 登录页",
     ["provider_authorization"]: "登录提供方授权未完成",
     target_callback: "登录回调未返回目标站",
     session_verification: "目标站权威会话验证未通过",
@@ -397,7 +419,21 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
 }
 
 export function shouldRetryOAuthFailureStage(oauthStage) {
-  return oauthStage !== "linuxdo_login_challenge";
+  return !['linuxdo_session_challenge', 'linuxdo_session_rate_limited',
+    'linuxdo_login_challenge', 'github_autofill_missing', 'github_account_selection',
+    'github_interactive_verification', 'github_form_not_unique', 'github_submit_not_unique',
+    'github_login_not_completed'].includes(oauthStage);
+}
+
+export function reauthLoginFailureResult(provider, oauthStage, { beforeLogout = false } = {}) {
+  const providerBlocked = ['linuxdo_session_challenge', 'linuxdo_session_rate_limited',
+    'linuxdo_login_challenge'].includes(oauthStage);
+  return {
+    status: "needs_attention",
+    reason: reauthLoginFailureReason(provider, oauthStage)
+      + (beforeLogout ? "；未退出 Agent Router，请先完成提供方会话恢复" : ""),
+    ...(providerBlocked ? { failureCode: `oauth_${oauthStage}`, retryable: false } : {}),
+  };
 }
 
 function normalizeProviderLabel(value) {
@@ -643,6 +679,22 @@ async function readQuotaSnapshot(session, rule) {
   return Number.isFinite(result) ? result : null;
 }
 
+async function readConsumptionSnapshot(session, rule) {
+  if (!rule.usedQuotaField) return null;
+  return session.page.evaluate(async ({ endpoint, quotaField, usedQuotaField }) => {
+    try {
+      const response = await fetch(endpoint, { credentials:'same-origin', cache:'no-store', headers:{Accept:'application/json'} });
+      if (!response.ok) return null;
+      const body = await response.json();
+      const value = key => {
+        const raw = key.split('.').reduce((value, part) => value?.[part], body);
+        return raw == null ? null : Number(raw);
+      };
+      return { quota:value(quotaField), usedQuota:value(usedQuotaField) };
+    } catch { return null; }
+  }, { endpoint:rule.quotaEndpoint, quotaField:rule.quotaField, usedQuotaField:rule.usedQuotaField }).catch(() => null);
+}
+
 export async function readQuotaUntilIncrease(session, rule, before) {
   const baseline = Number(before);
   if (!Number.isFinite(baseline)) throw new Error("登录前未获得可比较的额度");
@@ -742,17 +794,20 @@ async function retryOAuthOperation(rule, config, account, operation) {
   return latest;
 }
 
-async function runProviderOnlyWithRetry(rule, config, account) {
+export async function runProviderOnlyWithRetry(rule, config, account, {
+  runHelper = runOAuthHelper, refreshSession = runNativeProviderSessionRefresh,
+} = {}) {
   const providerResult = await retryOAuthOperation(
     rule,
     config,
     account,
-    () => runOAuthHelper(rule, config, account, ["--provider-only"]),
+    () => runHelper(rule, config, account, ["--provider-only"]),
   );
   if (providerResult.succeeded) return providerResult;
   if (!shouldRetryOAuthFailureStage(providerResult.oauthStage)) return providerResult;
-  if (!await runNativeProviderSessionRefresh(config, account)) return providerResult;
-  const refreshedResult = await runOAuthHelper(rule, config, account, ["--provider-only"]);
+  if (!await refreshSession(config, account)) return providerResult;
+  const refreshedResult = await runHelper(rule, config, account,
+    ["--provider-only", "--diagnostic-stage", "automatic_provider_after_refresh"]);
   return refreshedResult.succeeded ? refreshedResult : {
     succeeded: false,
     oauthStage: preferOAuthFailureStage(providerResult.oauthStage, refreshedResult.oauthStage),
@@ -942,7 +997,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
           date,
         );
         if (confirmed) return confirmed;
-        return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider, oauthResult.oauthStage) };
+        return reauthLoginFailureResult(rule.provider, oauthResult.oauthStage);
       }
       currentLogin = await inspectCurrentLogin(accountConfig, rule);
     }
@@ -961,6 +1016,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
 
   let beforeSession;
   let before;
+  let beforeConsumption;
   try {
     const isLinuxDoProvider = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO";
     if (isLinuxDoProvider) {
@@ -969,11 +1025,12 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
       // closes that context before this function can open Agent Router.
       const providerRecovery = await runProviderOnlyWithRetry(rule, accountConfig, rule);
       if (!providerRecovery.succeeded) {
-        throw new Error(`${rule.provider} 会话恢复未完成，未退出 Agent Router；请先完成提供方登录`);
+        return reauthLoginFailureResult(rule.provider, providerRecovery.oauthStage, { beforeLogout: true });
       }
     }
     beforeSession = await openRulePage(accountConfig, rule);
     before = await readQuota(beforeSession, rule);
+    beforeConsumption = await readConsumptionSnapshot(beforeSession, rule);
     if (await verifyConfiguredProviderBeforeLogout(beforeSession, rule, accountConfig)) {
       throw new Error(`${rule.provider} 登录入口未出现在当前站点登录页，已取消退出`);
     }
@@ -1026,7 +1083,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
       date,
     );
     if (confirmed) return confirmed;
-    return { status: "needs_attention", reason: reauthLoginFailureReason(rule.provider, oauthResult.oauthStage) };
+    return reauthLoginFailureResult(rule.provider, oauthResult.oauthStage);
   }
 
   let afterSession;
@@ -1039,6 +1096,12 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     const result = explicitLoginSuccess
       ? { status: "signed", reason: "重新登录后站点确认额度已到账" }
       : classifyQuotaIncrease(before, after);
+    if (rule.usedQuotaField) {
+      result.quotaEvidence = quotaChangeEvidence(beforeConsumption, await readConsumptionSnapshot(afterSession, rule), rule.expectedReward);
+      if (result.status !== 'signed' && result.quotaEvidence.totalRewardMatched) {
+        result.reason = '总额度变化符合配置奖励且有消费，但缺少明确签到信号，需复核';
+      }
+    }
     if (result.status === "signed") {
       const refreshed = await readState(statePath);
       await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(date, "completed", new Date()));

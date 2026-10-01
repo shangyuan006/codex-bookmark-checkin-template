@@ -2,8 +2,16 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { atomicWriteJson, redactPrivateResultText } from "./security.mjs";
 import { isConfirmedNotAvailable, isTerminalResult } from "./result-contract.mjs";
+import { isCurrentCheckinCycle } from './checkin-cycle.mjs';
 
 const SUCCESSFUL = new Set(["signed", "already_signed"]);
+
+export function reuseCycleSuccess(target, state, config, now=new Date()) {
+  if (!config.siteCycleRules?.[target.origin] || config.reauthCheckinRules?.[target.origin]) return null;
+  const prior=state?.sites?.[target.origin];
+  if (!prior?.lastSuccessResult || !isCurrentCheckinCycle(target.origin,prior.lastSuccessAt,config,now)) return null;
+  return {...prior.lastSuccessResult,origin:target.origin,title:target.title,folderNames:target.folderNames,status:'already_signed',observedAt:prior.lastSuccessAt,cached:true,attempt:0};
+}
 
 export async function loadSiteState(filePath) {
   try {
@@ -15,7 +23,7 @@ export async function loadSiteState(filePath) {
   }
 }
 
-export function applyPreferredCandidates(targets, state) {
+export function applyPreferredCandidates(targets, state, config = {}) {
   return targets.map((target) => {
     const preferredUrl = state?.sites?.[target.origin]?.preferredUrl;
     if (!preferredUrl) return target;
@@ -23,6 +31,10 @@ export function applyPreferredCandidates(targets, state) {
       const preferred = new URL(preferredUrl);
       const allowedOrigins = new Set(target.allowedOrigins ?? [target.origin]);
       if (!/^https?:$/.test(preferred.protocol) || !allowedOrigins.has(preferred.origin)) return target;
+      // Navigation rules need the live bookmark entry point; a prior result URL
+      // can be a login page or a check-in page that cannot be opened directly.
+      if (config.preCheckinNavigationRules?.[target.origin]
+        && !target.candidates.includes(preferred.href)) return target;
       return {
         ...target,
         candidates: [preferred.href, ...target.candidates.filter((candidate) => candidate !== preferred.href)],
@@ -104,7 +116,8 @@ export function updateSiteState(previous, results, finishedAt = new Date()) {
       lastConfirmedEvidence: confirmed && isConfirmedNotAvailable(result)
         ? result.evidence
         : (prior.lastConfirmedEvidence ?? null),
-      lastSuccessAt: successful ? timestamp : (prior.lastSuccessAt ?? null),
+      lastSuccessAt: successful ? (result.observedAt ?? timestamp) : (prior.lastSuccessAt ?? null),
+      lastSuccessResult: successful ? {status:result.status,reason:redactPrivateResultText(result.reason).slice(0,240),evidence:result.evidence,url:reusablePreferredUrl(result)} : prior.lastSuccessResult,
       failureStreak: confirmed ? 0 : Number(prior.failureStreak ?? 0) + 1,
       runCount,
       confirmedCount: Number(prior.confirmedCount ?? 0) + (confirmed ? 1 : 0),

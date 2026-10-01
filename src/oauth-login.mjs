@@ -6,7 +6,8 @@ import { findBookmarkTarget } from "./bookmarks.mjs";
 import { launchAutomationContext, processCandidate } from "./browser.mjs";
 import { connectOverCdpWithRetry } from "./native-cdp.mjs";
 import { selectPreferredOAuthTargetPage } from "./oauth-page-selection.mjs";
-import { probeProviderSessionInContext } from "./oauth-provider-session.mjs";
+import { linuxDoProbeFailureStage, probeProviderSessionInContext } from "./oauth-provider-session.mjs";
+import { writeLinuxDoProbeDiagnostic } from "./linuxdo-probe-diagnostics.mjs";
 import { rewriteConfiguredOAuthCallbackUrl } from "./oauth-callback-rewrite.mjs";
 import {
   authorizeConfiguredOAuthProvider,
@@ -25,13 +26,16 @@ import {
   shouldRetryLinuxDoLoginRecovery,
 } from "./oauth-linuxdo-login.mjs";
 import {
+  configuredLinuxDoSsoChallengeRule,
   isLinuxDoSsoProviderPage,
+  isConfiguredLinuxDoSsoFrameClick,
   waitForLinuxDoSsoTransition,
 } from "./oauth-linuxdo-sso.mjs";
 import { clickConfiguredLoginChallengeControl } from "./protected-login-flow.mjs";
 import { verifyConfiguredSavedLoginSession } from "./saved-login-session.mjs";
 import {
   isGitHubLoginUrl,
+  isGitHubInteractiveVerificationUrl,
   restoreSavedGitHubLogin,
 } from "./github-saved-login.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
@@ -55,6 +59,7 @@ const providerSessionConfirmed = process.argv.includes("--provider-session-confi
 const checkinAfterLogin = process.argv.includes("--checkin-after-login");
 const interactiveAttention = process.argv.includes("--interactive-attention");
 const experimentalSsoFrameClick = process.argv.includes("--experimental-sso-frame-click");
+const diagnosticStageIndex = process.argv.indexOf("--diagnostic-stage");
 if (!requestedOrigin) throw new Error("用法: node src/oauth-login.mjs <origin> [provider]");
 if (providerOnly && agentRouterOnly) throw new Error("--provider-only and --agent-router-only cannot be combined");
 if ((providerOnly || agentRouterOnly) && !/linux\s*do/i.test(provider)) {
@@ -67,11 +72,7 @@ if (experimentalSsoFrameClick && (!agentRouterOnly || !/linux\s*do/i.test(provid
   throw new Error("--experimental-sso-frame-click requires LinuxDO --agent-router-only");
 }
 const origin = new URL(requestedOrigin).origin;
-const configuredLinuxDoSsoFrameClick = /linux\s*do/i.test(provider)
-  && Array.isArray(config.autoClickTurnstileOrigins)
-  && config.autoClickTurnstileOrigins.some((value) => {
-    try { return new URL(value).origin === origin; } catch { return false; }
-  });
+const configuredLinuxDoSsoFrameClick = isConfiguredLinuxDoSsoFrameClick(config, provider);
 const allowLinuxDoSsoFrameClick = experimentalSsoFrameClick || configuredLinuxDoSsoFrameClick;
 const bookmarkTarget = providerOnly
   ? null
@@ -170,6 +171,8 @@ const interactiveAttentionWaitMs = 10 * 60_000;
 let oauthStage = "target_login";
 let authorizationOutcome = null;
 let experimentalSsoChallengeOutcome = experimentalSsoFrameClick ? "not_exercised" : null;
+let providerAuthorizationChallengeOutcome = null;
+let providerAuthorizationChallengeClicks = 0;
 
 function setOAuthStage(value) {
   oauthStage = value;
@@ -183,6 +186,8 @@ function printResult(status, details = {}) {
     oauthStage,
     ...(authorizationOutcome ? { authorizationOutcome } : {}),
     ...(experimentalSsoChallengeOutcome ? { experimentalSsoChallengeOutcome } : {}),
+    ...(providerAuthorizationChallengeOutcome ? { providerAuthorizationChallengeOutcome } : {}),
+    ...(providerAuthorizationChallengeOutcome ? { providerAuthorizationChallengeClicks } : {}),
     ...details,
   }, null, privateResult ? 0 : 2));
 }
@@ -261,15 +266,39 @@ async function probeLinuxDoSession(context, attempts = 3) {
   const boundedAttempts = Math.max(1, Math.min(3, Number(attempts) || 1));
   const retryDelaysMs = Array.from(
     { length: boundedAttempts - 1 },
-    () => Math.min(2_000, providerWaitMs),
+    (_, index) => Math.min(1_500 * (index + 1), 5_000, providerWaitMs),
   );
-  const result = await probeProviderSessionInContext(
-    context,
-    "https://linux.do/session/current.json",
-    config.navigationTimeoutMs,
-    { retryDelaysMs },
-  );
-  return result.status;
+  const observations = [];
+  const started = Date.now();
+  let result;
+  try {
+    result = await probeProviderSessionInContext(
+      context,
+      "https://linux.do/session/current.json",
+      config.navigationTimeoutMs,
+      {
+        retryDelaysMs,
+        // The target-only context starts immediately after the provider
+        // context closes. Give the renderer the same bounded warm-up window as
+        // the standalone provider probe before treating a valid session as
+        // indeterminate.
+        pageRetryDelaysMs: retryDelaysMs,
+        challengeWaitMs: Math.min(20_000, providerWaitMs),
+        onObservation: (item) => observations.push(item),
+      },
+    );
+    const failureStage = linuxDoProbeFailureStage(result);
+    if (failureStage) setOAuthStage(failureStage);
+    return result.status;
+  } finally {
+    if (origin === "https://agentrouter.org") {
+      const stage = diagnosticStageIndex >= 0 ? process.argv[diagnosticStageIndex + 1]
+        : providerOnly ? "automatic_provider" : agentRouterOnly ? "automatic_target" : null;
+      if (stage) await writeLinuxDoProbeDiagnostic({ stage, status: result?.status ?? "unknown",
+        attempts: result?.attempts ?? observations.length, elapsedMs: Date.now() - started, observations },
+      { retentionDays: config.logRetentionDays });
+    }
+  }
 }
 
 async function runProviderOnlyFlow() {
@@ -277,7 +306,7 @@ async function runProviderOnlyFlow() {
   try {
     const providerPage = await providerContext.newPage();
     setOAuthStage("linuxdo_session");
-    const initialSession = await probeLinuxDoSession(providerContext, 2);
+    const initialSession = await probeLinuxDoSession(providerContext, 3);
     if (initialSession === "valid") {
       setOAuthStage("completed");
       return true;
@@ -333,7 +362,7 @@ if (providerOnly) {
     // before opening Agent Router, then close the probe page. This preserves
     // strict provider -> target ordering without showing a parallel window.
     setOAuthStage("linuxdo_session");
-    const providerSession = await probeLinuxDoSession(context, 2);
+    const providerSession = await probeLinuxDoSession(context, 3);
     if (providerSession !== "valid") {
       throw new Error("LinuxDO provider session is not available in the Agent Router context");
     }
@@ -428,12 +457,14 @@ if (providerOnly) {
   for (let flowAttempt = 0; flowAttempt < providerHomeRecoveryAttempts; flowAttempt += 1) {
     page = await startProviderOAuth(page);
     if (/linux\s*do/i.test(provider) && isLinuxDoSsoProviderPage(page.url())) {
-      const ssoChallengeRule = config.challengeInteractionRules?.[origin] ?? {};
+      const ssoChallengeRule = configuredLinuxDoSsoChallengeRule(config, provider);
       const ssoTransition = await waitForLinuxDoSsoTransition(page, {
         timeoutMs: providerWaitMs,
         onChallengeObserved: () => setOAuthStage("linuxdo_login_challenge"),
         allowFrameCoordinateFallback: allowLinuxDoSsoFrameClick,
         frameStableMs: ssoChallengeRule.frameStableMs,
+        maxChallengeClicks: ssoChallengeRule.loginMaxClicks,
+        challengeRetryDelayMs: ssoChallengeRule.loginRetryDelayMs,
       });
       if (experimentalSsoFrameClick) {
         experimentalSsoChallengeOutcome = ssoTransition.challengeOutcome;
@@ -447,10 +478,15 @@ if (providerOnly) {
     } else {
       await page.waitForTimeout(Math.min(1_500, providerWaitMs));
     }
+    if (new URL(page.url()).hostname === 'github.com' && isGitHubInteractiveVerificationUrl(page.url())) {
+      setOAuthStage('github_interactive_verification');
+      throw new Error('GitHub interactive verification requires manual completion');
+    }
     if (isGitHubLoginUrl(page.url())) {
       setOAuthStage("provider_session");
       const recovered = await restoreSavedGitHubLogin(page, githubSavedLoginState);
       if (!recovered || isGitHubLoginUrl(page.url())) {
+        setOAuthStage(githubSavedLoginState.failureStage ?? 'provider_session');
         throw new Error("GitHub saved login recovery did not complete");
       }
     }
@@ -501,6 +537,8 @@ if (providerOnly) {
 
   if (isConfiguredProviderAuthorizationPage(page.url(), provider)) {
     setOAuthStage("provider_authorization");
+    providerAuthorizationChallengeOutcome = "not_observed";
+    providerAuthorizationChallengeClicks = 0;
     const authorizationDeadline = Date.now() + providerWaitMs;
     let authorization = null;
     let authorizationSubmitted = false;
@@ -512,32 +550,41 @@ if (providerOnly) {
       if (!authorizationSubmitted) {
         authorization = await authorizeConfiguredOAuthProvider(page, provider);
         authorizationOutcome = authorization.outcome;
-        if (authorization.outcome === "authorization_not_found") {
-          const authorizationSurface = await describeConfiguredAuthorizationSurface(page, provider);
-          if ((authorizationSurface?.challengeFrameCount ?? 0) > 0) {
-            providerChallengeObserved = true;
-          }
-          if (privateResult && !authorizationSurfaceReported && authorizationSurface) {
-            process.stderr.write(`${JSON.stringify({ oauthStage, authorizationSurface })}\n`);
-            authorizationSurfaceReported = true;
-          }
-        }
         if (authorization.clicked) {
           authorizationSubmitted = true;
           await page.waitForTimeout(500);
           continue;
         }
       }
-      if (!providerChallengeClicked) {
-        const providerOrigin = new URL(page.url()).origin;
-        const remaining = Math.max(1, authorizationDeadline - Date.now());
-        providerChallengeClicked = await clickConfiguredLoginChallengeControl(
-          page,
-          providerOrigin,
-          config,
-          remaining,
-        );
-        if (providerChallengeClicked) authorizationSubmitted = false;
+      const authorizationSurface = await describeConfiguredAuthorizationSurface(page, provider);
+      if ((authorizationSurface?.challengeFrameCount ?? 0) > 0) {
+        providerChallengeObserved = true;
+        if (providerAuthorizationChallengeClicks === 0) {
+          providerAuthorizationChallengeOutcome = "observed_not_clickable";
+        }
+      }
+      if (privateResult && !authorizationSurfaceReported && authorizationSurface
+        && (authorization.outcome === "authorization_not_found"
+          || (authorizationSurface.challengeFrameCount ?? 0) > 0)) {
+        process.stderr.write(`${JSON.stringify({ oauthStage, authorizationSurface })}\n`);
+        authorizationSurfaceReported = true;
+      }
+      const providerOrigin = new URL(page.url()).origin;
+      const remaining = Math.max(1, authorizationDeadline - Date.now());
+      const providerChallengeClick = await clickConfiguredLoginChallengeControl(
+        page,
+        providerOrigin,
+        config,
+        remaining,
+      );
+      if (providerChallengeClick) {
+        providerChallengeClicked = true;
+        providerChallengeObserved = true;
+        providerAuthorizationChallengeClicks += 1;
+        providerAuthorizationChallengeOutcome = providerAuthorizationChallengeClicks === 1
+          ? "clicked_once"
+          : "clicked_twice";
+        authorizationSubmitted = false;
       }
       await page.waitForTimeout(500);
     }
@@ -546,8 +593,16 @@ if (providerOnly) {
         authorizationOutcome = providerChallengeClicked
           ? "provider_challenge_unresolved"
           : "provider_challenge_not_clickable";
+        providerAuthorizationChallengeOutcome = providerChallengeClicked
+          ? "unresolved_after_click"
+          : "observed_not_clickable";
       }
       throw new Error("configured OAuth provider authorization did not complete");
+    }
+    if (providerChallengeObserved) {
+      providerAuthorizationChallengeOutcome = providerChallengeClicked
+        ? "resolved_after_click"
+        : "observed_auto_resolved";
     }
     authorizationOutcome = "authorization_completed";
     await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
@@ -632,7 +687,14 @@ if (providerOnly) {
     ? await waitForInteractiveTargetSession(context)
     : false;
   if (interactivelyRecovered) {
-    if (oauthStage === "provider_authorization") authorizationOutcome = "authorization_completed";
+    if (oauthStage === "provider_authorization") {
+      authorizationOutcome = "authorization_completed";
+      if (providerAuthorizationChallengeClicks > 0) {
+        providerAuthorizationChallengeOutcome = "resolved_after_click";
+      } else if (providerAuthorizationChallengeOutcome === "observed_not_clickable") {
+        providerAuthorizationChallengeOutcome = "observed_auto_resolved";
+      }
+    }
     setOAuthStage("completed");
     printResult("logged_in", {
       finalOriginMatchesTarget: true,

@@ -221,6 +221,28 @@ test("可人工接管明确的站点错误", () => {
   assert.equal(requiresManualAttention({ status: "error", reason: "modal_intercepts_action" }), true);
 });
 
+test("abandonment can select upstream and rate-limit deferrals without opening manual windows", () => {
+  const deferredLatest = { ...latest, results: [
+    { origin: "https://alpha.example", status: "deferred", retryCause: "upstream_unavailable" },
+    { origin: "https://beta.example", status: "deferred", retryCause: "rate_limit" },
+    { origin: "https://done.example", status: "signed" },
+  ] };
+  for (const origin of ["https://alpha.example", "https://beta.example"]) {
+    assert.throws(() => buildAttentionHandoff({ plan, latest: deferredLatest, requestedOrigins: [origin] }));
+    const selected = buildAttentionHandoff({ plan, latest: deferredLatest,
+      requestedOrigins: [origin], forAbandonment: true });
+    assert.equal(selected.targets[0].origin, origin);
+    assert.equal(selected.targets[0].previousStatus, "deferred");
+  }
+  for (const origin of ["https://done.example", "https://new.example"]) {
+    assert.throws(() => buildAttentionHandoff({ plan, latest: deferredLatest,
+      requestedOrigins: [origin], forAbandonment: true }));
+  }
+  assert.deepEqual(parseAttentionArguments(["--for-abandonment", "--origin", "https://alpha.example"]), {
+    requestedOrigins: ["https://alpha.example"], selection: [], forAbandonment: true,
+  });
+});
+
 test("当天定向验证结果可为未终态完整日报补充人工交接证据", () => {
   const baseline = {
     runId: "20260728-120000",

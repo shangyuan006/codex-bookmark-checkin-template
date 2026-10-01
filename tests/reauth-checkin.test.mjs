@@ -172,7 +172,7 @@ test("LinuxDO login-page CF stops account-level OAuth retries", async () => {
   );
   assert.match(
     source,
-    /if \(!shouldRetryOAuthFailureStage\(providerResult\.oauthStage\)\) return providerResult;[\s\S]*?runNativeProviderSessionRefresh/,
+    /if \(!shouldRetryOAuthFailureStage\(providerResult\.oauthStage\)\) return providerResult;[\s\S]*?await refreshSession/,
   );
   assert.match(source, /if \(!oauthResult\.succeeded\) \{[\s\S]*?confirmReauthSessionAfterOAuthFailure/);
 });
@@ -500,12 +500,14 @@ test("Agent Router completes one LinuxDO provider stage before opening the targe
 test("LinuxDO provider recovery uses one bounded native refresh before Agent Router", async () => {
   const source = await fs.readFile(new URL("../src/reauth-checkin.mjs", import.meta.url), "utf8");
   const initialProbe = source.indexOf("const providerResult = await retryOAuthOperation(");
-  const nativeRefresh = source.indexOf("await runNativeProviderSessionRefresh(config, account)", initialProbe);
-  const refreshedProbe = source.indexOf("const refreshedResult = await runOAuthHelper", nativeRefresh);
+  const nativeRefresh = source.indexOf("await refreshSession(config, account)", initialProbe);
+  const refreshedProbe = source.indexOf("const refreshedResult = await runHelper", nativeRefresh);
   const targetOpen = source.indexOf("beforeSession = await openRulePage(accountConfig, rule)");
   assert.ok(initialProbe >= 0 && nativeRefresh > initialProbe && refreshedProbe > nativeRefresh);
   assert.ok(targetOpen > refreshedProbe);
+  assert.match(source, /runHelper = runOAuthHelper, refreshSession = runNativeProviderSessionRefresh/);
   assert.match(source, /Refresh-AgentRouterProviderSession\.ps1/);
+  assert.match(source, /automatic_provider_after_refresh/);
   assert.match(source, /timeout: 70_000/);
 });
 
@@ -527,7 +529,7 @@ test("LinuxDO automatic OAuth recovery runs provider and Agent Router phases seq
   assert.match(oauth, /const providerSessionConfirmed = process\.argv\.includes\("--provider-session-confirmed"\)/);
   assert.match(oauth, /https:\/\/linux\.do\/session\/current\.json/);
   assert.match(oauth, /async function probeLinuxDoSession/);
-  assert.match(oauth, /probeLinuxDoSession\(providerContext, 2\)/);
+  assert.match(oauth, /probeLinuxDoSession\(providerContext, 3\)/);
   assert.match(oauth, /probeProviderSessionInContext\(/);
   assert.match(oauth, /if \(initialSession !== "invalid"\) return false/);
   assert.match(oauth, /await providerPage\.waitForTimeout\(Math\.min\(2_500, providerWaitMs\)\)/);
@@ -536,7 +538,7 @@ test("LinuxDO automatic OAuth recovery runs provider and Agent Router phases seq
   assert.ok(agentRouterWarmup >= 0 && targetPageAcquisition > agentRouterWarmup);
   assert.match(
     oauth.slice(agentRouterWarmup, targetPageAcquisition),
-    /probeLinuxDoSession\(context, 2\)[\s\S]*?providerSession !== "valid"/,
+    /probeLinuxDoSession\(context, 3\)[\s\S]*?providerSession !== "valid"/,
   );
   assert.match(oauth, /strict provider -> target ordering without showing a parallel window/);
   assert.match(source, /"--agent-router-only",\s*"--provider-session-confirmed"/);

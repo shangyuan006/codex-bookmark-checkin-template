@@ -1,4 +1,4 @@
-import { normalizeText } from "./detector.mjs";
+import { classifyPageText, normalizeText } from "./detector.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
 
 const PRE_CHECKIN_NAVIGATION_ROLES = new Set(["button", "link", "menuitem"]);
@@ -21,6 +21,13 @@ export function getConfiguredPreCheckinNavigationRule(target, activeOrigin, conf
   if (normalizedTerminalPaths.some((value) => !value.startsWith("/")
     || value.startsWith("//") || value.includes("?") || value.includes("#"))) {
     throw new Error("pre-check-in navigation terminal paths require exact same-origin paths");
+  }
+  const missingControlPaths = raw.terminalMissingControlPaths ?? ["/", "/index.php"];
+  if (raw.terminalRequireAuthenticatedPage === true && (!Array.isArray(missingControlPaths)
+    || missingControlPaths.length < 1 || missingControlPaths.length > 4
+    || missingControlPaths.some((value) => typeof value !== "string" || !value.startsWith("/")
+      || value.startsWith("//") || value.includes("?") || value.includes("#")))) {
+    throw new Error("missing-control terminal confirmation requires exact home paths");
   }
   if (!Array.isArray(raw.steps) || raw.steps.length < 1 || raw.steps.length > 4) {
     throw new Error("pre-check-in navigation requires 1 to 4 steps");
@@ -55,6 +62,9 @@ export function getConfiguredPreCheckinNavigationRule(target, activeOrigin, conf
     ...(raw.terminalWhenNavigationControlMissing === true
       ? { terminalWhenNavigationControlMissing: true }
       : {}),
+    ...(raw.terminalRequireAuthenticatedPage === true
+      ? { terminalRequireAuthenticatedPage: true, terminalMissingControlPaths: [...new Set(missingControlPaths)] }
+      : {}),
     waitMs: Math.max(500, Math.min(30_000, Number(raw.waitMs) || 3_000)),
     afterClickWaitMs: Math.max(100, Math.min(3_000, Number(raw.afterClickWaitMs) || 500)),
   };
@@ -70,13 +80,68 @@ export function getConfiguredPreCheckinTerminalPath(pageUrl, target, activeOrigi
 }
 
 function isLoginPath(pathname) {
-  return /\/(?:user(?:[-_/])?)?(?:log[-_]?in|sign[-_]?in)(?:\/|$)/i.test(pathname);
+  return /\/(?:user(?:[-_/])?)?(?:log[-_]?in|sign[-_]?in)(?:\.php|\/|$)/i.test(pathname);
+}
+
+function navigationLocator(page, step) {
+  return step.selector
+    ? page.locator(step.selector)
+    : page.getByRole(step.role, { name: step.name, exact: true });
+}
+
+export async function verifyMissingNavigationControl(page, target, activeOrigin, config, stepIndex = 0) {
+  const rule = getConfiguredPreCheckinNavigationRule(target, activeOrigin, config);
+  if (!rule?.terminalRequireAuthenticatedPage) return { terminalNoAction: true };
+  const allowedOrigins = target.allowedOrigins ?? [target.origin];
+  let previousUrl = null;
+  for (let observation = 0; observation < 2; observation += 1) {
+    const url = assertBookmarkNavigation(page.url(), allowedOrigins);
+    if (!rule.terminalMissingControlPaths.includes(new URL(url).pathname)) {
+      return { terminalUnconfirmed: { status: "unconfirmed", reason: "签到入口消失，但当前页面不是配置的首页", failureCode: "terminal_home_unconfirmed" } };
+    }
+    const snapshot = await page.evaluate(() => {
+      const visible = (element) => {
+        const box = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return box.width > 0 && box.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      const bodyText = String(document.body?.innerText ?? "");
+      const controls = [...document.querySelectorAll('a,button,input[type="submit"],[role="button"]')].filter(visible);
+      return {
+        bodyText,
+        loaded: document.readyState === "complete" && bodyText.trim().length > 100,
+        authenticated: controls.some((element) => /log[-_]?out|exit\.php/i.test(element.getAttribute("href") ?? "")
+          || /^(?:退出|登出|注销|退出登录|Log out|Logout)$/i.test(String(element.innerText ?? "").trim())),
+        hasPassword: [...document.querySelectorAll('input[type="password"]')].some(visible),
+        challengeSelectors: [...document.querySelectorAll('#sl-check,iframe[src*="captcha" i],iframe[src*="challenge" i],iframe[src*="turnstile" i],.cf-turnstile,.h-captcha,.g-recaptcha,altcha-widget')].some(visible),
+      };
+    });
+    const state = classifyPageText({ url, ...snapshot });
+    if (["login_required", "interactive_challenge", "managed_challenge", "deferred"].includes(state.status)) {
+      return { terminalUnconfirmed: state };
+    }
+    if (!snapshot.loaded || !snapshot.authenticated || snapshot.hasPassword) {
+      return { terminalUnconfirmed: { status: "unconfirmed", reason: "签到入口消失，但首页加载或有效登录尚未确认", failureCode: "terminal_session_unconfirmed" } };
+    }
+    const locator = navigationLocator(page, rule.steps[stepIndex]);
+    const count = await locator.count();
+    if (count > 20) throw new Error("pre-check-in navigation candidate set is too large");
+    for (let index = 0; index < count; index += 1) {
+      if (await locator.nth(index).isVisible().catch(() => false)) {
+        return { terminalUnconfirmed: { status: "unconfirmed", reason: "签到入口重新出现，不能按入口消失确认完成", failureCode: "terminal_control_reappeared" } };
+      }
+    }
+    if (page.url() !== url || (previousUrl && previousUrl !== url)) {
+      return { terminalUnconfirmed: { status: "unconfirmed", reason: "首页仍在跳转，签到入口消失信号尚不稳定", failureCode: "terminal_page_unstable" } };
+    }
+    previousUrl = url;
+    if (observation === 0) await page.waitForTimeout(500);
+  }
+  return { terminalNoAction: true };
 }
 
 async function waitForUniqueNavigationCandidate(page, step, waitMs, allowedOrigins, terminalPaths = []) {
-  const locator = step.selector
-    ? page.locator(step.selector)
-    : page.getByRole(step.role, { name: step.name, exact: true });
+  const locator = navigationLocator(page, step);
   const deadline = Date.now() + waitMs;
   do {
     const currentUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
@@ -133,7 +198,7 @@ export async function navigateConfiguredPreCheckinPage(
     || initialPath === rule.expectedPath
     || isLoginPath(initialPath)) return false;
 
-  for (const step of rule.steps) {
+  for (const [stepIndex, step] of rule.steps.entries()) {
     let selected;
     try {
       selected = await waitForUniqueNavigationCandidate(
@@ -147,7 +212,7 @@ export async function navigateConfiguredPreCheckinPage(
       if (rule.terminalWhenNavigationControlMissing
         && error instanceof Error
         && error.message === "pre-check-in navigation control was not found") {
-        return { terminalNoAction: true };
+        return verifyMissingNavigationControl(page, target, activeOrigin, config, stepIndex);
       }
       throw error;
     }

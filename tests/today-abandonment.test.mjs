@@ -24,6 +24,7 @@ function localDateKey() {
 }
 
 const attentionStub = String.raw`const origins = [];
+if (!process.argv.includes("--for-abandonment")) throw new Error("Missing abandonment selection mode");
 for (let index = 2; index < process.argv.length; index += 1) {
   if (process.argv[index] === "--origin") origins.push(process.argv[++index]);
 }
@@ -31,11 +32,12 @@ const now = new Date();
 const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("");
 process.stdout.write(JSON.stringify({
   sourceRunId: date + "-120000",
-  targets: origins.map((origin) => ({ origin, previousStatus: "no_action" })),
+  targets: origins.map((origin) => ({ origin, previousStatus: "deferred" })),
 }));
 `;
 
-async function createFixture({ activeSession = false, pendingVerificationOrigins = [] } = {}) {
+async function createFixture({ activeSession = false, pendingVerificationOrigins = [],
+  completedVerificationOrigins = [], completedVerificationStatus = "signed" } = {}) {
   const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "today-abandonment-"));
   const scriptsDirectory = path.join(fixtureRoot, "scripts");
   const configDirectory = path.join(fixtureRoot, "config");
@@ -89,6 +91,15 @@ async function createFixture({ activeSession = false, pendingVerificationOrigins
           origin,
           previousStatus: "no_action",
           verificationStatus: "no_action",
+        })),
+      }), "utf8")]
+      : []),
+    ...(completedVerificationOrigins.length > 0
+      ? [fs.writeFile(path.join(tmpDirectory, "manual-verification.json"), JSON.stringify({
+        schemaVersion: 1, state: "verification_complete", authoritativeEvidenceRequired: false,
+        sourceRunId: "20260101-120000", createdAt: "2026-01-01T04:00:00.000Z",
+        targets: completedVerificationOrigins.map((origin) => ({
+          origin, verificationStatus: completedVerificationStatus,
         })),
       }), "utf8")]
       : []),
@@ -185,6 +196,38 @@ test("direct today abandonment refuses to race an active manual browser session"
       path.join(fixtureRoot, "tmp", "manual-abandon.json"),
       "utf8",
     ));
+    assert.deepEqual(abandonment.origins, ["https://one.example"]);
+  } finally {
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("completed verification history does not block a later upstream-failure abandonment", async () => {
+  const fixtureRoot = await createFixture({ completedVerificationOrigins: ["https://done.example"] });
+  try {
+    const verificationPath = path.join(fixtureRoot, "tmp", "manual-verification.json");
+    const before = await fs.readFile(verificationPath, "utf8");
+    const result = spawnSync(powershellExecutable, ["-NoProfile", "-NonInteractive", "-File",
+      path.join(fixtureRoot, "scripts", "Set-TodayAbandonment.ps1"), "-Origins", "https://two.example"],
+    { cwd: fixtureRoot, encoding: "utf8", timeout: 30_000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await fs.readFile(verificationPath, "utf8"), before);
+    const abandonment = JSON.parse(await fs.readFile(path.join(fixtureRoot, "tmp", "manual-abandon.json"), "utf8"));
+    assert.deepEqual(abandonment.origins, ["https://one.example", "https://two.example"]);
+  } finally {
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("a fake completed record containing unresolved targets still blocks abandonment", async () => {
+  const fixtureRoot = await createFixture({ completedVerificationOrigins: ["https://done.example"],
+    completedVerificationStatus: "no_action" });
+  try {
+    const result = spawnSync(powershellExecutable, ["-NoProfile", "-NonInteractive", "-File",
+      path.join(fixtureRoot, "scripts", "Set-TodayAbandonment.ps1"), "-Origins", "https://two.example"],
+    { cwd: fixtureRoot, encoding: "utf8", timeout: 30_000 });
+    assert.notEqual(result.status, 0);
+    const abandonment = JSON.parse(await fs.readFile(path.join(fixtureRoot, "tmp", "manual-abandon.json"), "utf8"));
     assert.deepEqual(abandonment.origins, ["https://one.example"]);
   } finally {
     await fs.rm(fixtureRoot, { recursive: true, force: true });

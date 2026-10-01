@@ -40,6 +40,18 @@ test("续跑只为配置了重认证的 needs_attention 站点放行", () => {
   assert.equal(isResumeRetryEligible(result, new Set(["https://other.test"])), false);
 });
 
+test("不可自动重试的超时和人工验证结果不会进入恢复轮次", () => {
+  const targets = [
+    { origin: "https://timeout.example" },
+    { origin: "https://manual.example" },
+  ];
+  const results = [
+    { ...targets[0], status: "error", failureCode: "target_timeout", retryable: false },
+    { ...targets[1], status: "interactive_challenge", failureCode: "manual_challenge_required", retryable: false },
+  ];
+  assert.deepEqual(recoveryEntriesForResults(results, targets), []);
+});
+
 test("频率限制会获得有界的下次执行时间", () => {
   const now = new Date("2026-07-23T05:00:00Z");
   const result = withRetrySchedule(

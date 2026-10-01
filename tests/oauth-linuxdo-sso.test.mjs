@@ -1,11 +1,39 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  configuredLinuxDoSsoChallengeRule,
   clickUniqueLinuxDoSsoChallengeControl,
+  isConfiguredLinuxDoSsoFrameClick,
   inspectLinuxDoSsoChallenge,
   isLinuxDoSsoProviderPage,
   waitForLinuxDoSsoTransition,
 } from "../src/oauth-linuxdo-sso.mjs";
+
+test("LinuxDO SSO frame fallback is configured by the provider challenge origin", () => {
+  assert.equal(isConfiguredLinuxDoSsoFrameClick({
+    autoClickTurnstileOrigins: ["https://connect.linux.do"],
+  }, "LinuxDO"), true);
+  assert.equal(isConfiguredLinuxDoSsoFrameClick({
+    autoClickTurnstileOrigins: ["https://agentrouter.org"],
+  }, "LinuxDO"), false);
+  assert.equal(isConfiguredLinuxDoSsoFrameClick({
+    autoClickTurnstileOrigins: ["https://connect.linux.do"],
+  }, "GitHub"), false);
+});
+
+test("LinuxDO SSO timing uses the provider challenge rule, not the target origin", () => {
+  const config = {
+    challengeInteractionRules: {
+      "https://agentrouter.org": { frameStableMs: 0 },
+      "https://connect.linux.do": { frameStableMs: 4000, loginMaxClicks: 2 },
+    },
+  };
+  assert.deepEqual(configuredLinuxDoSsoChallengeRule(config, "LinuxDO"), {
+    frameStableMs: 4000,
+    loginMaxClicks: 2,
+  });
+  assert.deepEqual(configuredLinuxDoSsoChallengeRule(config, "GitHub"), {});
+});
 
 function locator(candidates = []) {
   return {
@@ -174,6 +202,7 @@ test("LinuxDO SSO waits in the same page until the provider advances", async () 
     transitioned: true,
     challengeObserved: true,
     challengeClicked: false,
+    challengeClickCount: 0,
     challengeOutcome: "observed_auto_resolved",
     timedOut: false,
   });
@@ -193,6 +222,7 @@ test("LinuxDO SSO clicks a unique semantic control at most once while waiting", 
   assert.equal(result.transitioned, true);
   assert.equal(result.challengeObserved, true);
   assert.equal(result.challengeClicked, true);
+  assert.equal(result.challengeClickCount, 1);
   assert.equal(result.challengeOutcome, "semantic_clicked");
   assert.equal(clicks, 1);
 });
@@ -216,6 +246,7 @@ test("LinuxDO SSO experimental wait reports a bounded frame click", async () => 
   });
   assert.equal(result.transitioned, true);
   assert.equal(result.challengeClicked, true);
+  assert.equal(result.challengeClickCount, 1);
   assert.equal(result.challengeOutcome, "frame_clicked");
   assert.equal(clicks, 1);
 });
@@ -244,6 +275,32 @@ test("LinuxDO SSO ignores a transient detached-frame evaluation", async () => {
   assert.equal(result.transitioned, true);
   assert.equal(result.challengeObserved, true);
   assert.equal(result.challengeOutcome, "observed_auto_resolved");
+  assert.equal(result.challengeClickCount, 0);
+});
+
+test("LinuxDO SSO rechecks a rebuilt frame with a bounded retry", async () => {
+  let clicks = 0;
+  const page = ssoPage([
+    challengeFrame({ box: { x: 40, y: 60, width: 300, height: 80 } }),
+  ], {
+    onMouseClick: () => {
+      clicks += 1;
+      if (clicks === 2) page.setUrl("https://connect.linux.do/oauth2/authorize");
+    },
+  });
+
+  const result = await waitForLinuxDoSsoTransition(page, {
+    timeoutMs: 1_000,
+    pollMs: 20,
+    allowFrameCoordinateFallback: true,
+    challengeRetryDelayMs: 50,
+    maxChallengeClicks: 2,
+  });
+  assert.equal(result.transitioned, true);
+  assert.equal(result.challengeClicked, true);
+  assert.equal(result.challengeClickCount, 2);
+  assert.equal(result.challengeOutcome, "frame_clicked");
+  assert.equal(clicks, 2);
 });
 
 test("LinuxDO SSO waits for a configured stable frame before coordinate fallback", async () => {
@@ -266,6 +323,7 @@ test("LinuxDO SSO waits for a configured stable frame before coordinate fallback
   });
   assert.equal(result.transitioned, true);
   assert.equal(result.challengeClicked, true);
+  assert.equal(result.challengeClickCount, 1);
   assert.equal(result.challengeOutcome, "frame_clicked");
   assert.equal(clicks, 1);
 });

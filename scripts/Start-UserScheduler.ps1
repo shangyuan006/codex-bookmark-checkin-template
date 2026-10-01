@@ -8,15 +8,20 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'ManualVerification.ps1')
 . (Join-Path $PSScriptRoot 'ResultContract.ps1')
 . (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
+. (Join-Path $PSScriptRoot 'CheckinCycle.ps1')
+. (Join-Path $PSScriptRoot 'AgentRouterAccount.ps1')
 $configPath = Join-Path $root 'config\config.json'
 $initialConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $statePath = Join-Path $root 'data\scheduler-state.json'
 $heartbeatPath = Join-Path $root 'data\scheduler-heartbeat.json'
 $schedulerLogPath = Join-Path $root 'logs\scheduler.log'
 $manualSessionPath = Join-Path $root 'tmp\manual-session.json'
+$manualLaunchPath = Join-Path $root 'tmp\manual-handoff-launch.json'
 $manualVerificationPath = Join-Path $root 'tmp\manual-verification.json'
 $manualHandoffPath = Join-Path $root 'tmp\manual-handoff.json'
 $manualAbandonPath = Join-Path $root 'tmp\manual-abandon.json'
+$agentRouterManualStatePath = Join-Path $root 'tmp\agentrouter-manual-state.json'
+$agentRouterProviderStagePath = Join-Path $root 'tmp\agentrouter-linuxdo-provider-state.json'
 $outboxScript = Join-Path $PSScriptRoot 'Invoke-CheckinNotificationOutbox.ps1'
 $mutexCreated = $false
 $mutexName = if ($initialConfig.schedulerMutexName) { [string]$initialConfig.schedulerMutexName } else { 'Local\CodexBookmarkDailyCheckinScheduler' }
@@ -110,8 +115,7 @@ function Get-LatestReportState([datetime]$now, $config, [Nullable[datetime]]$not
         $abandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now $now
         $problems = @($results | Where-Object {
             $resultOrigin = ConvertTo-ManualAbandonmentOrigin $_.origin
-            -not (Test-CheckinResultTerminal $_) `
-                -and (-not $resultOrigin -or -not $abandonedOrigins.ContainsKey($resultOrigin))
+            ((-not (Test-CheckinResultTerminal $_)) -or (-not (Test-CheckinCycleCurrent $_ $config ([datetimeoffset]$now) $latest.finishedAt))) -and (-not $resultOrigin -or -not $abandonedOrigins.ContainsKey($resultOrigin))
         })
         $dueOrigins = @($problems | Where-Object {
             if ([string]$_.status -ne 'deferred' -or -not $_.nextEligibleAt) { return $true }
@@ -141,12 +145,13 @@ function Get-ManualHandoffState([datetime]$Now) {
         Mode = 'none'
         SourceRunId = $null
         ChangedAt = $null
+        Targets = @()
     }
-    if (Test-Path -LiteralPath $manualSessionPath) {
+    if ((Test-Path -LiteralPath $manualSessionPath) -or (Test-ManualHandoffLaunchActive -Path $manualLaunchPath)) {
         return [pscustomobject]@{
             Mode = 'manual_session'
             SourceRunId = $null
-            ChangedAt = (Get-Item -LiteralPath $manualSessionPath).LastWriteTimeUtc.ToString('o')
+            ChangedAt = $null
         }
     }
     $todayPrefix = $Now.ToString('yyyyMMdd') + '-'
@@ -160,10 +165,23 @@ function Get-ManualHandoffState([datetime]$Now) {
                 -and $verification.authoritativeEvidenceRequired -eq $true `
                 -and (Test-ManualVerificationCurrentDayDocument $verification $Now) `
                 -and $pendingCount -gt 0) {
+                $handoffTargets = @()
+                if (Test-Path -LiteralPath $manualHandoffPath) {
+                    try {
+                        $handoff = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualHandoffPath | ConvertFrom-Json
+                        if ([string]$handoff.state -eq 'awaiting_manual_handoff' `
+                            -and [string]$handoff.sourceRunId -like "$todayPrefix*" `
+                            -and $handoff.authoritativeEvidenceRequired -eq $true) {
+                            $handoffTargets = @($handoff.targets)
+                        }
+                    }
+                    catch { $handoffTargets = @() }
+                }
                 return [pscustomobject]@{
                     Mode = 'verification_ready'
                     SourceRunId = [string]$verification.sourceRunId
                     ChangedAt = (Get-Item -LiteralPath $manualVerificationPath).LastWriteTimeUtc.ToString('o')
+                    Targets = $handoffTargets
                 }
             }
         }
@@ -181,12 +199,193 @@ function Get-ManualHandoffState([datetime]$Now) {
                     Mode = 'awaiting_manual_handoff'
                     SourceRunId = [string]$handoff.sourceRunId
                     ChangedAt = (Get-Item -LiteralPath $manualHandoffPath).LastWriteTimeUtc.ToString('o')
+                    Targets = @($handoff.targets)
                 }
             }
         }
         catch { }
     }
     return $empty
+}
+
+function Get-AgentRouterOrigins($Config) {
+    return @($Config.agentrouterAccounts | ForEach-Object {
+        try {
+            $uri = [uri]([string]$_.origin)
+            if ($uri.Scheme -eq 'https' -and $uri.Host) {
+                $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/').ToLowerInvariant()
+            }
+        }
+        catch { }
+    } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Test-AgentRouterHelperRunning {
+    $scripts = @('Open-AgentRouterLogin.ps1', 'Close-AgentRouterLogin.ps1', 'Complete-AgentRouterLogin.ps1')
+    $queryErrors = @()
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue -ErrorVariable queryErrors)
+    if ($queryErrors.Count -gt 0) {
+        Write-SchedulerLog '无法读取进程列表，跳过 Agent Router 人工窗口启动以避免重复打开。'
+        return $true
+    }
+    return @($processes | Where-Object {
+        $commandLine = [string]$_.CommandLine
+        $scripts | Where-Object { $commandLine -like "*$_*" }
+    }).Count -gt 0
+}
+
+function Get-AgentRouterManualAction($ManualHandoff, $Config) {
+    if ([string]$ManualHandoff.Mode -notin @('awaiting_manual_handoff', 'verification_ready')) { return $null }
+    $agentOrigins = @(Get-AgentRouterOrigins $Config)
+    $targets = @($ManualHandoff.Targets | Where-Object {
+        $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
+        $origin -and $agentOrigins -contains $origin.ToLowerInvariant()
+    })
+    if ($targets.Count -eq 0) { return $null }
+
+    if (Test-Path -LiteralPath $agentRouterManualStatePath) {
+        try {
+            $manualState = Get-Content -Raw -Encoding UTF8 -LiteralPath $agentRouterManualStatePath | ConvertFrom-Json
+            $manualKey = [string]$manualState.accountKey
+            $manualTarget = @($targets | Where-Object { @($_.accountKeys) -contains $manualKey }) | Select-Object -First 1
+            $profileProcesses = @(Get-CheckinProfileBrowserProcesses -Config $Config -ProfilePath ([string]$manualState.profile))
+            if ($manualTarget -and $profileProcesses.Count -eq 0) {
+                $closedAction = if ([string]$manualState.stage -eq 'provider') { 'provider_closed' } else { 'complete' }
+                return [pscustomobject]@{ Action = $closedAction; AccountKey = $manualKey; Target = $manualTarget }
+            }
+        }
+        catch { }
+        return [pscustomobject]@{ Action = 'active'; AccountKey = $null; Target = $targets[0] }
+    }
+
+    $stage = $null
+    $waitingAccountKey = $null
+    if (Test-Path -LiteralPath $agentRouterProviderStagePath) {
+        try { $stage = Get-Content -Raw -Encoding UTF8 -LiteralPath $agentRouterProviderStagePath | ConvertFrom-Json }
+        catch { return [pscustomobject]@{ Action = 'waiting'; AccountKey = $null; Target = $targets[0] } }
+    }
+    if ($stage) {
+        $stageKey = [string]$stage.accountKey
+        $stageTarget = @($targets | Where-Object { @($_.accountKeys) -contains $stageKey }) | Select-Object -First 1
+        if ($stageTarget) {
+            $stageAccount = Resolve-AgentRouterAccountConfig -Accounts @($Config.agentrouterAccounts) `
+                -AccountKey $stageKey -Origin ([string]$stageTarget.origin)
+            if ([string]$stageAccount.provider -ne 'LinuxDO') { return $null }
+            if ([string]$stage.stage -eq 'provider_pending') {
+                if (Test-AgentRouterProviderProbeDue $stage) {
+                    return [pscustomobject]@{ Action = 'provider_recheck'; AccountKey = $stageKey; Target = $stageTarget }
+                }
+                $waitingAccountKey = $stageKey
+            }
+            elseif ([string]$stage.stage -eq 'agentrouter') {
+                return [pscustomobject]@{ Action = 'complete'; AccountKey = $stageKey; Target = $stageTarget }
+            }
+            else {
+                return [pscustomobject]@{ Action = 'agentrouter'; AccountKey = $stageKey; Target = $stageTarget }
+            }
+        }
+    }
+
+    # Do not guess an account when an older handoff lacks nested accountKeys;
+    # opening another account could mix encrypted sessions.
+    foreach ($target in $targets) {
+        foreach ($accountKey in @($target.accountKeys | Where-Object { $_ })) {
+            if ([string]$accountKey -eq $waitingAccountKey) { continue }
+            $account = Resolve-AgentRouterAccountConfig -Accounts @($Config.agentrouterAccounts) `
+                -AccountKey ([string]$accountKey) -Origin ([string]$target.origin)
+            $action = switch ([string]$account.provider) {
+                'LinuxDO' { 'provider' }
+                'GitHub' { 'github' }
+                default { return $null }
+            }
+            return [pscustomobject]@{ Action = $action; AccountKey = [string]$accountKey; Target = $target }
+        }
+    }
+    if ($waitingAccountKey) {
+        return [pscustomobject]@{ Action = 'waiting'; AccountKey = $waitingAccountKey; Target = $stageTarget }
+    }
+    return $null
+}
+
+function Start-AgentRouterManualAction($Action, $SourceRunId) {
+    if ($Action.Action -in @('active', 'waiting') -or (Test-AgentRouterHelperRunning)) { return $false }
+    $shell = (Get-Command pwsh,powershell -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $shell) { throw '未找到 PowerShell 可执行文件，无法启动 Agent Router 专用交接。' }
+    $script = if ($Action.Action -eq 'complete') {
+        Join-Path $PSScriptRoot 'Complete-AgentRouterLogin.ps1'
+    }
+    elseif ($Action.Action -in @('provider_closed', 'provider_recheck')) {
+        Join-Path $PSScriptRoot 'Close-AgentRouterLogin.ps1'
+    }
+    else {
+        Join-Path $PSScriptRoot 'Open-AgentRouterLogin.ps1'
+    }
+    $arguments = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script, '-AccountKey', [string]$Action.AccountKey)
+    if ($Action.Action -eq 'provider') {
+        # Continue immediately after a valid probe, including one-shot dispatch.
+        $arguments += @('-ProviderOnly', '-ContinueToAgentRouter')
+    }
+    elseif ($Action.Action -in @('provider_closed', 'provider_recheck')) {
+        $arguments += '-ContinueToAgentRouter'
+    }
+    elseif ($Action.Action -eq 'agentrouter') {
+        $arguments += '-AgentRouterOnly'
+    }
+    Start-Process -FilePath $shell -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    Write-SchedulerLog "检测到 Agent Router 专用人工交接，已启动阶段=$($Action.Action)、accountKey=$($Action.AccountKey)（来源运行=$SourceRunId）。"
+    return $true
+}
+
+function Test-ManualHandoffHasNonAgentTargets($ManualHandoff, $Config) {
+    if ([string]$ManualHandoff.Mode -notin @('awaiting_manual_handoff', 'verification_ready')) { return $false }
+    $agentOrigins = @(Get-AgentRouterOrigins $Config)
+    return @($ManualHandoff.Targets | Where-Object {
+        $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
+        $origin -and $agentOrigins -notcontains $origin.ToLowerInvariant()
+    }).Count -gt 0
+}
+
+function Start-ManualHandoffActions($ManualHandoff, $Config) {
+    if ([string]$ManualHandoff.Mode -notin @('awaiting_manual_handoff', 'verification_ready')) { return }
+    $runMutexName = if ($Config.runMutexName) { [string]$Config.runMutexName } else { 'Local\CodexBookmarkCheckinRun' }
+    $handoffMutex = [System.Threading.Mutex]::new($false, $runMutexName)
+    $handoffMutexOwned = $false
+    try {
+        try { $handoffMutexOwned = $handoffMutex.WaitOne(0) }
+        catch [System.Threading.AbandonedMutexException] { $handoffMutexOwned = $true }
+        if (-not $handoffMutexOwned) { return }
+        $agentRouterAction = Get-AgentRouterManualAction $ManualHandoff $Config
+        if ($null -ne $agentRouterAction -and $agentRouterAction.Action -notin @('active', 'waiting')) {
+            [void](Start-AgentRouterManualAction $agentRouterAction $ManualHandoff.SourceRunId)
+        }
+        if ((Test-ManualHandoffHasNonAgentTargets $ManualHandoff $Config) `
+            -and -not (Test-Path -LiteralPath $manualSessionPath) `
+            -and -not (Test-ManualHandoffLaunchActive -Path $manualLaunchPath)) {
+            $manualLoginScript = Join-Path $PSScriptRoot 'Open-ManualLogin.ps1'
+            if (Test-Path -LiteralPath $manualLoginScript) {
+                $manualLaunchId = [guid]::NewGuid().ToString('N')
+                $manualProcess = $null
+                Write-ManualHandoffLaunch -Path $manualLaunchPath -LaunchId $manualLaunchId
+                try {
+                    $manualProcess = Start-Process -FilePath (Get-Command pwsh,powershell | Select-Object -First 1).Source `
+                        -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $manualLoginScript, '-HandoffLaunchId', $manualLaunchId) `
+                        -WindowStyle Hidden -PassThru
+                    Write-ManualHandoffLaunch -Path $manualLaunchPath -LaunchId $manualLaunchId -Process $manualProcess
+                }
+                catch {
+                    if ($null -eq $manualProcess -or $manualProcess.HasExited) {
+                        Remove-ManualHandoffLaunch -Path $manualLaunchPath -LaunchId $manualLaunchId
+                    }
+                    throw
+                }
+                Write-SchedulerLog "检测到人工交接，已自动打开原生 Edge 手动处理入口（来源运行=$($ManualHandoff.SourceRunId)）。"
+            }
+        }
+    }
+    finally {
+        if ($handoffMutexOwned) { [void]$handoffMutex.ReleaseMutex() }
+        $handoffMutex.Dispose()
+    }
 }
 
 function Test-SchedulerWaiting($state, [datetime]$now, $config, $manualHandoff, $latestReportState = $null) {
@@ -199,7 +398,8 @@ function Test-SchedulerWaiting($state, [datetime]$now, $config, $manualHandoff, 
         return $false
     }
     $today = $now.ToString('yyyy-MM-dd')
-    if ([string]$state.lastRunDate -eq $today -and $state.reportComplete -eq $true) { return $true }
+    if ([string]$state.lastRunDate -eq $today -and $state.reportComplete -eq $true `
+        -and (-not $latestReportState.Valid -or @($latestReportState.DueOrigins).Count -eq 0)) { return $true }
     $maxAttempts = if ($null -ne $config.schedulerMaxDailyAttempts) { [int]$config.schedulerMaxDailyAttempts } else { 3 }
     $maxAttempts = [Math]::Max(1, [Math]::Min(6, $maxAttempts))
     if ([string]$state.lastAttemptDate -eq $today -and [int]$state.attemptsToday -ge $maxAttempts) { return $true }
@@ -332,15 +532,8 @@ try {
             }
             $manualHandoff = Get-ManualHandoffState $now
             $latestReportState = Get-LatestReportState $now $config $null $currentPlanFingerprint
-            if ([string]$manualHandoff.Mode -eq 'awaiting_manual_handoff' -and -not (Test-Path -LiteralPath $manualSessionPath)) {
-                $manualLoginScript = Join-Path $PSScriptRoot 'Open-ManualLogin.ps1'
-                if (Test-Path -LiteralPath $manualLoginScript) {
-                    Start-Process -FilePath (Get-Command pwsh,powershell | Select-Object -First 1).Source `
-                        -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $manualLoginScript) `
-                        -WindowStyle Hidden | Out-Null
-                    Write-SchedulerLog "检测到人工交接，已自动打开原生 Edge 手动处理入口（来源运行=$($manualHandoff.SourceRunId)）。"
-                }
-            }
+            Start-ManualHandoffActions $manualHandoff $config
+            $manualHandoff = Get-ManualHandoffState $now
             if ($now -ge $scheduledToday -and -not (Test-SchedulerWaiting $state $now $config $manualHandoff $latestReportState)) {
                 Write-SchedulerHeartbeat 'running_checkin'
                 Write-SchedulerLog "开始第 $([int]$state.attemptsToday + 1) 次签到尝试。"
@@ -369,6 +562,11 @@ try {
                 Write-SchedulerLog "签到结束：退出码=$($process.ExitCode)，报告有效=$($reportState.Valid)，完整=$($reportState.Complete)，进度=$($reportState.ProcessedTotal)/$($reportState.PlannedTotal)，异常=$($reportState.ProblemCount)。"
                 if ([string]$manualHandoffAfter.Mode -ne 'none') {
                     Write-SchedulerLog "人工交接状态：$($manualHandoffAfter.Mode)，来源运行=$($manualHandoffAfter.SourceRunId)。"
+                    # Consume the handoff in the same scheduler iteration. The
+                    # next 60-second poll is only a fallback for external state
+                    # changes; it must not be the first point at which the user
+                    # sees the manual window.
+                    Start-ManualHandoffActions $manualHandoffAfter $config
                 }
             }
         }

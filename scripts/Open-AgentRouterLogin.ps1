@@ -5,6 +5,7 @@ param(
     [string]$AccountKey,
     [switch]$ProviderOnly,
     [switch]$AgentRouterOnly,
+    [switch]$ContinueToAgentRouter,
     [switch]$OpenProviderWhenIndeterminate,
     [switch]$ExperimentalTurnstileFrameClick
 )
@@ -32,6 +33,9 @@ if ($provider -ne 'LinuxDO' -and ($ProviderOnly -or $AgentRouterOnly)) {
 if ($OpenProviderWhenIndeterminate -and ($provider -ne 'LinuxDO' -or -not $ProviderOnly)) {
     throw 'OpenProviderWhenIndeterminate is only valid with LinuxDO ProviderOnly recovery.'
 }
+if ($ContinueToAgentRouter -and ($provider -ne 'LinuxDO' -or -not $ProviderOnly)) {
+    throw 'ContinueToAgentRouter is only valid with LinuxDO ProviderOnly recovery.'
+}
 if ($ExperimentalTurnstileFrameClick -and ($provider -ne 'LinuxDO' -or -not $AgentRouterOnly)) {
     throw 'ExperimentalTurnstileFrameClick is only valid with LinuxDO AgentRouterOnly recovery.'
 }
@@ -52,47 +56,52 @@ $statePath = Join-Path $root 'tmp\agentrouter-manual-state.json'
 $providerStagePath = Join-Path $root 'tmp\agentrouter-linuxdo-provider-state.json'
 $providerProbeLogPath = Join-Path $root 'tmp\agentrouter-linuxdo-provider-probe.json'
 if (Test-Path -LiteralPath $statePath) {
-    throw 'An Agent Router manual login state is already tracked. Close or complete it first.'
+    $trackedState = try {
+        Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json
+    }
+    catch {
+        throw 'The tracked Agent Router manual login state is unreadable; refusing to replace it.'
+    }
+    $trackedProfile = try { [System.IO.Path]::GetFullPath([string]$trackedState.profile) } catch { $null }
+    $trackedStateMatches = [string]$trackedState.accountKey -eq $requestedAccountKey `
+        -and $trackedProfile `
+        -and [string]::Equals($trackedProfile, $profile, [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $trackedStateMatches) {
+        throw 'The tracked Agent Router manual login state belongs to a different account or profile.'
+    }
+    $trackedProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profile*"
+    })
+    if ($trackedProcesses.Count -gt 0) {
+        throw 'An Agent Router manual login state is already tracked. Close or complete it first.'
+    }
+    # A crashed or externally closed dedicated window can leave only this
+    # transient marker behind. Reconcile that marker before starting a new
+    # stage; the encrypted browser profile remains untouched.
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction Stop
 }
 $existingProfileProcesses = @(Get-CimInstance Win32_Process | Where-Object {
     $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profile*"
 })
 if ($existingProfileProcesses.Count -gt 0) { throw 'The selected Agent Router profile is already in use.' }
 
+if ($provider -eq 'LinuxDO' -and (Test-Path -LiteralPath $providerStagePath)) {
+    $pendingProviderStage = Get-Content -Raw -Encoding UTF8 -LiteralPath $providerStagePath | ConvertFrom-Json
+    if ([string]$pendingProviderStage.stage -eq 'provider_pending') {
+        # A closed native window is pending verification, not another login.
+        & (Join-Path $PSScriptRoot 'Close-AgentRouterLogin.ps1') -AccountKey $requestedAccountKey `
+            -ContinueToAgentRouter:($ContinueToAgentRouter -or $AgentRouterOnly)
+        return
+    }
+}
+
 $profilePreparer = Join-Path $root 'src\prepare-native-browser-profile.mjs'
 & $node $profilePreparer $profile 'Default' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Unable to prepare the isolated Agent Router profile.' }
 
 function Get-LinuxDoProviderSessionProbe {
-    $probeScript = Join-Path $root 'src\oauth-provider-session.mjs'
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        # The probe intentionally exits nonzero for an indeterminate session;
-        # its final JSON status must still be parsed before deciding the UI path.
-        $ErrorActionPreference = 'Continue'
-        $probeOutput = @(& $node $probeScript 'https://agentrouter.org' $provider `
-            '--automation-user-data-dir' $profile 2>$null)
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    for ($index = $probeOutput.Count - 1; $index -ge 0; $index--) {
-        try {
-            $probe = [string]$probeOutput[$index] | ConvertFrom-Json
-            if ([string]$probe.status -in @('valid', 'invalid', 'unknown', 'not_supported')) {
-                $attempts = 0
-                if (-not [int]::TryParse([string]$probe.attempts, [ref]$attempts) -or $attempts -lt 1) {
-                    $attempts = 1
-                }
-                return [pscustomobject]@{
-                    Status = [string]$probe.status
-                    Attempts = $attempts
-                }
-            }
-        }
-        catch { }
-    }
-    return [pscustomobject]@{ Status = 'unknown'; Attempts = 0 }
+    $diagnosticStage = if ($ProviderOnly) { 'manual_provider' } else { 'manual_target' }
+    return Invoke-LinuxDoProviderSessionProbe -Root $root -Node $node -Profile $profile -DiagnosticStage $diagnosticStage
 }
 
 function Write-LinuxDoProviderProbeLog($Probe, [string]$Stage) {
@@ -101,6 +110,8 @@ function Write-LinuxDoProviderProbeLog($Probe, [string]$Stage) {
         stage = $Stage
         status = [string]$Probe.Status
         attempts = [int]$Probe.Attempts
+        challengeObserved = $Probe.ChallengeObserved -eq $true
+        rateLimited = $Probe.RateLimited -eq $true
         checkedAt = (Get-Date).ToUniversalTime().ToString('o')
     }
     [System.IO.Directory]::CreateDirectory((Split-Path -Parent $providerProbeLogPath)) | Out-Null
@@ -114,13 +125,26 @@ function Write-LinuxDoProviderProbeLog($Probe, [string]$Stage) {
 function Write-LinuxDoProviderStage($Probe) {
     $providerStage = [ordered]@{
         schemaVersion = 2
+        stage = 'provider'
         accountKey = $requestedAccountKey
         profile = $profile
         probeStatus = [string]$Probe.Status
         probeAttempts = [int]$Probe.Attempts
         closedAt = (Get-Date).ToUniversalTime().ToString('o')
     }
-    [System.IO.Directory]::CreateDirectory((Split-Path -Parent $providerStagePath)) | Out-Null
+    Write-AgentRouterProviderState -Path $providerStagePath -State $providerStage
+}
+
+function Mark-LinuxDoProviderStageForAgentRouter {
+    if (-not (Test-Path -LiteralPath $providerStagePath)) { return }
+    $providerStage = try { Get-Content -Raw -Encoding UTF8 -LiteralPath $providerStagePath | ConvertFrom-Json } catch { $null }
+    if (-not $providerStage -or [string]$providerStage.accountKey -ne $requestedAccountKey) {
+        throw 'The recorded LinuxDO provider stage does not match this accountKey.'
+    }
+    # ConvertFrom-Json returns a PSCustomObject whose shape may come from an
+    # older provider-stage file without a stage property. Add/replace the
+    # bounded marker explicitly so old state can be upgraded in place.
+    $providerStage | Add-Member -MemberType NoteProperty -Name stage -Value 'agentrouter' -Force
     [System.IO.File]::WriteAllText(
         $providerStagePath,
         ($providerStage | ConvertTo-Json -Depth 4),
@@ -182,12 +206,21 @@ if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
     if ([string]$existingProviderProbe.Status -eq 'valid') {
         Write-LinuxDoProviderStage $existingProviderProbe
         Write-Output "The LinuxDO provider session is already valid after $($existingProviderProbe.Attempts) bounded probe attempt(s); no visible provider page was opened. Continue with -AgentRouterOnly."
+        if ($ContinueToAgentRouter) {
+            & $PSCommandPath -AccountKey $requestedAccountKey -AgentRouterOnly
+        }
         return
     }
-    if ([string]$existingProviderProbe.Status -ne 'invalid' -and -not $OpenProviderWhenIndeterminate) {
+    $providerChallengeHandoff = [string]$existingProviderProbe.Status -eq 'unknown' `
+        -and $existingProviderProbe.ChallengeObserved -eq $true
+    if ([string]$existingProviderProbe.Status -ne 'invalid' `
+        -and -not $providerChallengeHandoff -and -not $OpenProviderWhenIndeterminate) {
         throw "The LinuxDO provider session is indeterminate after $($existingProviderProbe.Attempts) bounded probe attempt(s). No visible provider page was opened; retry later instead of logging in again."
     }
-    if ([string]$existingProviderProbe.Status -ne 'invalid') {
+    if ($providerChallengeHandoff) {
+        Write-Warning 'Cloudflare blocked the LinuxDO session probe; login expiry is not confirmed. Opening one native no-CDP provider window for verification, not an assumed re-login.'
+    }
+    elseif ([string]$existingProviderProbe.Status -ne 'invalid') {
         Write-Warning "The LinuxDO provider session is indeterminate after $($existingProviderProbe.Attempts) bounded probe attempt(s). Opening one native no-CDP provider window because OpenProviderWhenIndeterminate was explicitly requested."
     }
 }
@@ -218,20 +251,41 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     )) {
         throw 'The recorded LinuxDO provider stage does not match the account profile.'
     }
+    $recordedProviderClosedAt = [datetimeoffset]::MinValue
+    $recordedProviderClosedAtParsed = $false
+    if ($providerStage.closedAt -is [datetime]) {
+        $recordedProviderClosedAt = [datetimeoffset]([datetime]$providerStage.closedAt).ToUniversalTime()
+        $recordedProviderClosedAtParsed = $true
+    }
+    elseif ($providerStage.closedAt -is [datetimeoffset]) {
+        $recordedProviderClosedAt = ([datetimeoffset]$providerStage.closedAt).ToUniversalTime()
+        $recordedProviderClosedAtParsed = $true
+    }
+    else {
+        $recordedProviderClosedAtParsed = [datetimeoffset]::TryParse(
+            [string]$providerStage.closedAt,
+            [ref]$recordedProviderClosedAt
+        )
+    }
+    $recordedProviderStageIsFresh = [string]$providerStage.probeStatus -eq 'valid' `
+        -and $recordedProviderClosedAtParsed `
+        -and ([datetimeoffset]::UtcNow - $recordedProviderClosedAt.ToUniversalTime()).TotalSeconds -ge -60 `
+        -and ([datetimeoffset]::UtcNow - $recordedProviderClosedAt.ToUniversalTime()).TotalMinutes -le 5
     $providerSessionProbe = Get-LinuxDoProviderSessionProbe
     Write-LinuxDoProviderProbeLog $providerSessionProbe 'agentrouter'
     if ([string]$providerSessionProbe.Status -eq 'unknown' -or [string]$providerSessionProbe.Status -eq 'not_supported') {
-        throw "The LinuxDO provider session is indeterminate after $($providerSessionProbe.Attempts) bounded probe attempt(s). No Agent Router page was opened; retry later."
+        if (-not $recordedProviderStageIsFresh) {
+            throw "The LinuxDO provider session is indeterminate after $($providerSessionProbe.Attempts) bounded probe attempt(s). No Agent Router page was opened; retry later."
+        }
+        Write-Warning "The immediate LinuxDO provider recheck is indeterminate after $($providerSessionProbe.Attempts) bounded probe attempt(s); continuing from the fresh explicit valid provider stage."
     }
-    if ([string]$providerSessionProbe.Status -ne 'valid') {
+    elseif ([string]$providerSessionProbe.Status -ne 'valid') {
         throw "The LinuxDO provider session is invalid after $($providerSessionProbe.Attempts) bounded probe attempt(s). Run -ProviderOnly again and complete LinuxDO login first."
     }
 
-    $ranFullCheckin = $false
     if ($recoveryAction -eq 'restart') {
         # The automatic run may have stopped BEFORE target logout. Let the
         # daily state machine establish that boundary before any login-only helper.
-        $ranFullCheckin = $true
         $checkinExitCode = Invoke-AgentRouterAccountCheckin
         if ($checkinExitCode -eq 0) {
             Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
@@ -245,47 +299,47 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     }
 
     $automaticResult = $null
-    if (-not $ranFullCheckin) {
-        $oauthArguments = @(
-            (Join-Path $root 'src\oauth-login.mjs'),
-            'https://agentrouter.org',
-            $provider,
-            '--login-url',
-            'https://agentrouter.org/login',
-            '--automation-user-data-dir',
-            $profile,
-            '--account-id',
-            $requestedAccountKey,
-            '--agent-router-only',
-            '--provider-session-confirmed',
-            '--private-result'
-        )
-        if ($null -ne $account.oauthWaitMs) {
-            $oauthArguments += @('--wait-ms', [string]$account.oauthWaitMs)
-        }
-        if ($ExperimentalTurnstileFrameClick) {
-            $oauthArguments += '--experimental-sso-frame-click'
-        }
-        $previousErrorActionPreference = $ErrorActionPreference
+    $oauthArguments = @(
+        (Join-Path $root 'src\oauth-login.mjs'),
+        'https://agentrouter.org',
+        $provider,
+        '--login-url',
+        'https://agentrouter.org/login',
+        '--automation-user-data-dir',
+        $profile,
+        '--account-id',
+        $requestedAccountKey,
+        '--agent-router-only',
+        '--provider-session-confirmed',
+        '--diagnostic-stage',
+        'manual_target_oauth',
+        '--private-result'
+    )
+    if ($null -ne $account.oauthWaitMs) {
+        $oauthArguments += @('--wait-ms', [string]$account.oauthWaitMs)
+    }
+    if ($ExperimentalTurnstileFrameClick) {
+        $oauthArguments += '--experimental-sso-frame-click'
+    }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # oauth-login emits private stage markers on stderr; they are progress,
+        # not PowerShell failures. The final JSON status remains authoritative.
+        $ErrorActionPreference = 'Continue'
+        $automaticOutput = @(& $node @oauthArguments 2>$null)
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    for ($index = $automaticOutput.Count - 1; $index -ge 0; $index--) {
         try {
-            # oauth-login emits private stage markers on stderr; they are progress,
-            # not PowerShell failures. The final JSON status remains authoritative.
-            $ErrorActionPreference = 'Continue'
-            $automaticOutput = @(& $node @oauthArguments 2>$null)
-        }
-        finally {
-            $ErrorActionPreference = $previousErrorActionPreference
-        }
-        for ($index = $automaticOutput.Count - 1; $index -ge 0; $index--) {
-            try {
-                $candidate = [string]$automaticOutput[$index] | ConvertFrom-Json
-                if ([string]$candidate.status -in @('logged_in', 'needs_attention')) {
-                    $automaticResult = $candidate
-                    break
-                }
+            $candidate = [string]$automaticOutput[$index] | ConvertFrom-Json
+            if ([string]$candidate.status -in @('logged_in', 'needs_attention')) {
+                $automaticResult = $candidate
+                break
             }
-            catch { }
         }
+        catch { }
     }
     if ($ExperimentalTurnstileFrameClick) {
         $safeExperimentalOutcomes = @(
@@ -297,6 +351,26 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         }
         else { 'not_exercised' }
         Write-Output "Experimental LinuxDO SSO Turnstile outcome: $experimentalOutcome."
+    }
+    if ($provider -eq 'LinuxDO') {
+        $safeProviderAuthorizationChallengeOutcomes = @(
+            'not_observed', 'observed_not_clickable', 'observed_auto_resolved',
+            'clicked_once', 'clicked_twice', 'resolved_after_click', 'unresolved_after_click'
+        )
+        $providerAuthorizationChallengeOutcome = if (
+            [string]$automaticResult.providerAuthorizationChallengeOutcome -in $safeProviderAuthorizationChallengeOutcomes
+        ) {
+            [string]$automaticResult.providerAuthorizationChallengeOutcome
+        }
+        else { 'not_exercised' }
+        $providerAuthorizationChallengeClicks = 0
+        if ($null -ne $automaticResult.providerAuthorizationChallengeClicks) {
+            $candidateClicks = [int]$automaticResult.providerAuthorizationChallengeClicks
+            if ($candidateClicks -ge 0 -and $candidateClicks -le 10) {
+                $providerAuthorizationChallengeClicks = $candidateClicks
+            }
+        }
+        Write-Output "LinuxDO authorization Turnstile outcome: $providerAuthorizationChallengeOutcome (clicks=$providerAuthorizationChallengeClicks)."
     }
     if ([string]$automaticResult.status -eq 'logged_in') {
         if (@(Get-CimInstance Win32_Process | Where-Object {
@@ -353,7 +427,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
 $launchMarker = [guid]::NewGuid().ToString('N')
 $loginUrls = @('https://agentrouter.org/login')
 if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
-    $loginUrls = @('https://linux.do/login')
+    $loginUrls = if ($providerChallengeHandoff) { @('https://linux.do/') } else { @('https://linux.do/login') }
 }
 $arguments = @(
     "--user-data-dir=$profile",
@@ -396,14 +470,33 @@ $state = [ordered]@{
     processStartedAt = $processStartedAt
     launchMarker = $launchMarker
     stage = if ($ProviderOnly) { 'provider' } else { 'agentrouter' }
+    continueToAgentRouter = $ContinueToAgentRouter.IsPresent
 }
 [System.IO.File]::WriteAllText(
     $statePath,
     ($state | ConvertTo-Json -Depth 4),
     [System.Text.UTF8Encoding]::new($false)
 )
+if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
+    Mark-LinuxDoProviderStageForAgentRouter
+}
 if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
-    Write-Output "Opened only the LinuxDO provider login for accountKey '$requestedAccountKey' (PID $processId) after confirming and foregrounding one stable window. Close this window after LinuxDO login, then run with -AgentRouterOnly."
+    $providerPurpose = if ($providerChallengeHandoff) { 'verification (session probe blocked by Cloudflare)' } else { 'login' }
+    Write-Output "Opened only the LinuxDO provider $providerPurpose for accountKey '$requestedAccountKey' (PID $processId) after confirming and foregrounding one stable window. Close this window after provider verification, then run with -AgentRouterOnly."
+    if ($ContinueToAgentRouter) {
+        $closureDeadline = (Get-Date).AddMinutes(10)
+        do {
+            $running = @(Get-CheckinManualSessionBrowserProcesses -Config $config -ProfilePath $profile -State $state)
+            if ($running.Count -eq 0) { break }
+            Start-Sleep -Seconds 1
+        } while ((Get-Date) -lt $closureDeadline)
+        if ($running.Count -eq 0 -and (Test-Path -LiteralPath $statePath)) {
+            & (Join-Path $PSScriptRoot 'Close-AgentRouterLogin.ps1') -AccountKey $requestedAccountKey -ContinueToAgentRouter
+        }
+        elseif ($running.Count -gt 0) {
+            Write-Warning 'The native LinuxDO window is still open; its pending stage was retained without assuming login success.'
+        }
+    }
 }
 else {
     Write-Output "Opened the isolated Agent Router login profile for accountKey '$requestedAccountKey' (PID $processId) after confirming and foregrounding one stable window."

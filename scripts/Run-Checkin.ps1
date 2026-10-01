@@ -7,7 +7,8 @@ param(
     [string]$ReauthAccountKey,
     [switch]$ForceReauth,
     [switch]$PostOAuthVerify,
-    [switch]$OverrideTodayAbandonment
+    [switch]$OverrideTodayAbandonment,
+    [switch]$DispatchManualHandoff
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +20,7 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 . (Join-Path $PSScriptRoot 'NativeFallbackPolicy.ps1')
 . (Join-Path $PSScriptRoot 'PreflightScope.ps1')
+. (Join-Path $PSScriptRoot 'CheckinCycle.ps1')
 . (Join-Path $PSScriptRoot 'TaskRetryPolicy.ps1')
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
 $reporterScript = Join-Path $PSScriptRoot 'Submit-UnifiedCheckinReport.ps1'
@@ -27,6 +29,7 @@ $timeoutFinalizerScript = Join-Path $root 'src\finalize-timeout-report.mjs'
 $runLockPath = Join-Path $root 'tmp\run.lock'
 $manualVerificationPath = Join-Path $root 'tmp\manual-verification.json'
 $manualSessionPath = Join-Path $root 'tmp\manual-session.json'
+$manualLaunchPath = Join-Path $root 'tmp\manual-handoff-launch.json'
 $manualHandoffPath = Join-Path $root 'tmp\manual-handoff.json'
 $manualAbandonPath = Join-Path $root 'tmp\manual-abandon.json'
 $startedAt = Get-Date
@@ -38,6 +41,8 @@ $resumeCandidate = $null
 $wrapperMutex = $null
 $wrapperMutexOwned = $false
 $manualVerification = $null
+$manualHandoffCandidate = $null
+$manualHandoffReady = $false
 $currentPlanFingerprint = ''
 
 function Get-CurrentPlanFingerprint {
@@ -265,6 +270,23 @@ function Write-ManualHandoff($Report, [datetime]$Now = (Get-Date)) {
     return $true
 }
 
+function Start-ManualHandoffDispatcher {
+    if (-not $DispatchManualHandoff -or -not (Test-Path -LiteralPath $manualHandoffPath)) {
+        return
+    }
+    $schedulerScript = Join-Path $PSScriptRoot 'Start-UserScheduler.ps1'
+    $shell = (Get-Command pwsh,powershell -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $shell -or -not (Test-Path -LiteralPath $schedulerScript)) {
+        Write-Warning '已生成人工交接记录，但找不到调度器入口，无法自动消费。'
+        return
+    }
+    Start-Process -FilePath $shell -ArgumentList @(
+        '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+        '-File', $schedulerScript, '-Once'
+    ) -WindowStyle Hidden | Out-Null
+    Write-Output '已启动一次人工交接调度；不会重新执行完整签到。'
+}
+
 try {
     Push-Location $root
     $locationPushed = $true
@@ -272,7 +294,6 @@ try {
     if (-not (Test-Path -LiteralPath $configPath)) { throw '尚未初始化，请先运行 scripts\Initialize-Checkin.ps1。' }
     $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
     $node = Resolve-CheckinNode $config
-    $currentPlanFingerprint = Get-CurrentPlanFingerprint
     $requestedOrigins = @(Resolve-RequestedCheckinOrigins $Origins)
     if ($ReauthAccountKey -and $requestedOrigins.Count -gt 0) {
         throw 'Origins 不能与 Agent Router 的 ReauthAccountKey 同时使用。'
@@ -310,6 +331,16 @@ try {
         $SuppressReport = $true
         return
     }
+    if (-not $DryRun -and ((Test-Path -LiteralPath $manualSessionPath) `
+        -or (Test-ManualHandoffLaunchActive -Path $manualLaunchPath))) {
+        $runnerStatus = 'busy'
+        $runnerMessage = '人工浏览器正在启动或处理，暂不启动自动签到；关闭窗口并保存状态后再定向复核。'
+        $nodeExitCode = 0
+        $SuppressReport = $true
+        Write-Warning $runnerMessage
+        return
+    }
+    $currentPlanFingerprint = Get-CurrentPlanFingerprint
 
     $timeoutMinutes = Get-CheckinTaskTimeoutMinutes $config
     $runAttempts = Get-CheckinTaskRunAttempts $config $Attempts
@@ -426,7 +457,7 @@ try {
                         # Explicit/manual first attempts may reread a changed session.
                         # Automatic continuation must honor a non-retryable blocker.
                         $explicitFirstAttempt = $attempt -eq 1 -and ($requestedOrigins.Count -gt 0 -or $null -ne $manualVerification)
-                        if (-not (Test-CheckinResultTerminal $result) -and ($explicitFirstAttempt `
+                        if ((-not (Test-CheckinResultTerminal $result) -or -not (Test-CheckinCycleCurrent $result $config ([datetimeoffset]::Now) $resumeCandidate.Report.finishedAt)) -and ($explicitFirstAttempt `
                             -or ($result.retryable -ne $false -and $result.submissionAttempted -ne $true))) {
                             $pendingOriginSet[$resultOrigin] = $true
                         }
@@ -512,7 +543,10 @@ try {
                 $runnerMessage = "任务级尝试 $attempt/$runAttempts 已结束，退出码 $nodeExitCode。"
             }
             $freshCandidate = Get-FreshResumeReport $attemptStartedAt
-            if ($null -ne $freshCandidate) { $resumeCandidate = $freshCandidate }
+            if ($null -ne $freshCandidate) {
+                $resumeCandidate = $freshCandidate
+                $manualHandoffCandidate = $freshCandidate
+            }
             if ($requestedOrigins.Count -gt 0 `
                 -and $null -ne $freshCandidate `
                 -and (Test-RequestedOriginsAuthoritativelyComplete $freshCandidate.Report $requestedOrigins)) {
@@ -562,12 +596,6 @@ try {
                     }
                 }
             }
-            if ($null -ne $freshCandidate `
-                -and $null -ne $freshCandidate.Report `
-                -and [string]$freshCandidate.Report.runState -in @('final', 'in_progress') `
-                -and @($freshCandidate.Report.results).Count -gt 0) {
-                [void](Write-ManualHandoff $freshCandidate.Report (Get-Date))
-            }
             if ($nodeExitCode -eq 0 -and ($null -eq $freshCandidate -or -not (Test-IsCompleteFinalReport $freshCandidate.Report))) {
                 $nodeExitCode = 2
                 $runnerMessage = "签到程序已结束，但第 $attempt 次尝试未生成完整的 final 报告。"
@@ -611,6 +639,12 @@ try {
                 }
             }
         }
+        if ($runnerStatus -ne 'timeout_process_alive' `
+            -and $null -ne $manualHandoffCandidate `
+            -and [string]$manualHandoffCandidate.Report.runState -in @('final', 'in_progress') `
+            -and @($manualHandoffCandidate.Report.results).Count -gt 0) {
+            $manualHandoffReady = Write-ManualHandoff $manualHandoffCandidate.Report (Get-Date)
+        }
     }
 }
 catch {
@@ -640,4 +674,8 @@ finally {
     if ($null -ne $wrapperMutex) { $wrapperMutex.Dispose() }
 }
 
+if ($manualHandoffReady) {
+    try { Start-ManualHandoffDispatcher }
+    catch { Write-Warning "人工交接已落盘，但自动打开入口失败：$($_.Exception.Message)" }
+}
 exit $nodeExitCode

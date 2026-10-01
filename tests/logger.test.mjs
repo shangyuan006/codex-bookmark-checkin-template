@@ -10,6 +10,10 @@ import {
   writeRunResult,
 } from "../src/logger.mjs";
 
+const pageEvidence = (confirmedAt = "2026-07-29T04:00:00.000Z") => ({
+  source: "page_text", outcome: "page_completion_text", authoritative: true, confirmedAt,
+});
+
 test("进度和嵌套候选历史中的奖励额度在落盘前统一脱敏", () => {
   const safe = sanitizeForPersistence({
     results: [{
@@ -68,7 +72,7 @@ test("同日定向运行只把权威终态提升进完整 latest 报告", async 
       selectedTotal: 1,
       selectedProcessedTotal: 1,
       scopeComplete: true,
-      results: [{ origin: "https://one.test", status: "signed", reason: "奖励额度 12345" }],
+      results: [{ origin: "https://one.test", status: "signed", reason: "奖励额度 12345", evidence: pageEvidence() }],
     };
 
     await writeRunResult(root, { directory: runDirectory }, targeted, {
@@ -129,7 +133,7 @@ test("新增书签的定向权威终态会安全扩充当天完整日报", () =>
     selectedProcessedTotal: 1,
     scopeComplete: true,
     bookmarkSummary,
-    results: [{ origin: "https://new.test", status: "already_signed" }],
+    results: [{ origin: "https://new.test", status: "already_signed", evidence: pageEvidence("2026-07-29T06:00:00.000Z") }],
   };
 
   const reconciled = mergeAuthoritativeDailyResults(latest, incoming, new Date("2026-07-29T06:05:00.000Z"));
@@ -205,6 +209,92 @@ test("定向非终态、跨日结果和已确认结果都不会降级 latest", (
   }), null);
 });
 
+test("相同成功状态的页面证据会替换人工确认且不改变日报完成度", () => {
+  const now = new Date("2026-09-29T03:00:00.000Z");
+  const current = {
+    origin: "https://one.test", status: "already_signed", confirmationSource: "operator_confirmation",
+    evidence: { source: "user_rule", outcome: "operator_confirmed", authoritative: false, confirmedAt: "2026-09-29T02:00:00.000Z" },
+  };
+  const latest = { runId: "20260929-100000", runState: "final", isComplete: true,
+    plannedTotal: 1, processedTotal: 1, results: [current] };
+  const incoming = { runId: "20260929-110000", runState: "final", results: [{ ...current,
+    confirmationSource: undefined,
+    evidence: { source: "page_text", outcome: "page_completion_text", authoritative: true, confirmedAt: now.toISOString() } }] };
+  for (const withPlan of [false, true]) {
+    const report = withPlan ? { ...incoming, scopeComplete: true, plannedTotal: 1,
+      bookmarkSummary: { targetCount: 1, targets: [{ origin: current.origin }] } } : incoming;
+    const merged = mergeAuthoritativeDailyResults(latest, report, now);
+    assert.equal(merged.results[0].evidence.source, "page_text");
+    assert.equal(merged.results[0].confirmationSource, undefined);
+    assert.equal(merged.results[0].status, "already_signed");
+    assert.equal(merged.isComplete, true);
+    assert.equal(merged.plannedTotal, 1);
+    assert.deepEqual(merged.summary, { already_signed: 1 });
+  }
+  const signed = mergeAuthoritativeDailyResults({ ...latest, results: [{ ...current, status: "signed" }] }, incoming, now);
+  assert.equal(signed.results[0].status, "signed");
+  assert.equal(signed.results[0].evidence.source, "page_text");
+  const observedRule = mergeAuthoritativeDailyResults(latest, { ...incoming, results: [{ ...current,
+    confirmationSource: undefined,
+    evidence: { source: "user_rule", outcome: "missing_navigation_control", authoritative: false, confirmedAt: now.toISOString() } }] }, now);
+  assert.equal(observedRule.results[0].evidence.outcome, "missing_navigation_control");
+  assert.equal(observedRule.results[0].evidence.authoritative, false);
+  assert.equal(observedRule.results[0].confirmationSource, undefined);
+});
+
+test("无效、较旧、弱证据和非成功结果不能覆盖已有页面成功证据", () => {
+  const now = new Date("2026-09-29T03:00:00.000Z");
+  const current = { origin: "https://one.test", status: "already_signed",
+    evidence: { source: "user_rule", outcome: "operator_confirmed", authoritative: false, confirmedAt: "2026-09-29T02:00:00.000Z" } };
+  const latest = { runId: "20260929-100000", runState: "final", isComplete: true,
+    plannedTotal: 1, processedTotal: 1, results: [current] };
+  const evidence = { source: "page_text", outcome: "page_completion_text", authoritative: true, confirmedAt: now.toISOString() };
+  for (const invalid of [
+    { ...evidence, source: "unknown" }, { ...evidence, authoritative: false },
+    { ...evidence, confirmedAt: "invalid" }, { ...evidence, confirmedAt: "2026-09-29T04:00:00Z" },
+    { ...evidence, confirmedAt: "2026-09-29T01:00:00Z" },
+  ]) {
+    assert.equal(mergeAuthoritativeDailyResults(latest, { runId: "20260929-110000", runState: "final",
+      results: [{ ...current, evidence: invalid }] }, now), null);
+  }
+  const strongLatest = { ...latest, results: [{ ...current, evidence }] };
+  assert.equal(mergeAuthoritativeDailyResults(strongLatest, { runId: "20260929-110000", runState: "final",
+    results: [current] }, now), null);
+  const promotedStatus = mergeAuthoritativeDailyResults(strongLatest, { runId: "20260929-110001", runState: "final",
+    results: [{ ...current, status: "signed" }] }, now);
+  assert.equal(promotedStatus.results[0].status, "signed");
+  assert.deepEqual(promotedStatus.results[0].evidence, evidence);
+});
+
+test("invalid completion evidence cannot promote unresolved or already-completed daily results", () => {
+  const now = new Date("2026-09-29T03:00:00.000Z");
+  const valid = pageEvidence(now.toISOString());
+  const invalidEvidence = [undefined, { ...valid, source: "unknown" }, { ...valid, authoritative: false },
+    { ...valid, confirmedAt: "invalid" }, { ...valid, confirmedAt: "2026-09-29T04:00:00Z" }];
+  for (const status of ["unconfirmed", "no_action", "already_signed"]) {
+    const latest = { runId: "20260929-100000", runState: "final", isComplete: true,
+      plannedTotal: 1, processedTotal: 1, results: [{ origin: "https://one.test", status, evidence: valid }] };
+    for (const evidence of invalidEvidence) {
+      for (const incomingStatus of ["signed", "already_signed"]) {
+        assert.equal(mergeAuthoritativeDailyResults(latest, { runId: "20260929-110000", runState: "final",
+          results: [{ origin: "https://one.test", status: incomingStatus, evidence }] }, now), null);
+      }
+    }
+  }
+  const latest = { runId: "20260929-100000", runState: "final", isComplete: true,
+    plannedTotal: 1, processedTotal: 1, results: [{ origin: "https://old.test", status: "signed", evidence: valid }] };
+  for (const evidence of invalidEvidence) {
+    assert.equal(mergeAuthoritativeDailyResults(latest, { runId: "20260929-110000", runState: "final",
+      scopeComplete: true, plannedTotal: 2,
+      bookmarkSummary: { targetCount: 2, targets: [{ origin: "https://old.test" }, { origin: "https://new.test" }] },
+      results: [{ origin: "https://new.test", status: "signed", evidence }] }, now), null);
+  }
+  const success = mergeAuthoritativeDailyResults({ ...latest,
+    results: [{ origin: "https://old.test", status: "unconfirmed" }] },
+  { runId: "20260929-110000", runState: "final", results: [{ origin: "https://old.test", status: "signed", evidence: valid }] }, now);
+  assert.equal(success.results[0].status, "signed");
+});
+
 test("本地历史修复会脱敏旧结果并合并同日权威补跑", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "checkin-history-repair-"));
   const siteStatePath = path.join(root, "site-state.json");
@@ -229,7 +319,7 @@ test("本地历史修复会脱敏旧结果并合并同日权威补跑", async ()
     await fs.writeFile(path.join(targetedDirectory, "result.json"), JSON.stringify({
       runId: "20260729-120000",
       runState: "final",
-      results: [{ origin: "https://one.test", status: "already_signed" }],
+      results: [{ origin: "https://one.test", status: "already_signed", evidence: pageEvidence() }],
     }));
     await fs.writeFile(siteStatePath, JSON.stringify({
       sites: { "https://two.test": { lastReason: "奖励额度：999" } },

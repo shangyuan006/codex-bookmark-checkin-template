@@ -278,6 +278,24 @@ test("sign-in maps an authoritative 401 to login_required", async () => {
   assert.equal(requests, 1);
 });
 
+test('sign-in recognizes a corroborated reward during simultaneous consumption without persisting amounts',async()=>{
+  for(const responseSuccess of [true,false]){
+    let posted=false;
+    const page=executablePage(async raw=>{
+      const pathname=new URL(String(raw)).pathname;
+      if(pathname==='/api/user/self')return jsonResponse({success:true,data:{id:42,quota:100,used_quota:posted?30:20}});
+      if(pathname==='/api/log/self')return jsonResponse({success:true,data:{items:[]}});
+      if(pathname==='/api/status')return jsonResponse({success:true,data:{quota_per_unit:10}});
+      if(pathname==='/api/user/sign_in'){posted=true;return jsonResponse({success:responseSuccess});}
+      throw new Error('unexpected request');
+    },{local:{user:{id:42}}});
+    const result=await tryNewApiSignIn(page,ORIGIN,signInConfig({quotaIncludesUsage:true,verificationAttempts:1}));
+    assert.equal(result.status,responseSuccess?'signed':'unconfirmed');
+    if(responseSuccess)assert.deepEqual(result.evidence.sources,['total_quota_with_signin_response']);
+    assert.equal('quotaDelta' in result,false);assert.equal('used_quota' in result,false);
+  }
+});
+
 test("explicit user identity failures stop requests", () => {
   assert.equal(classifyNewApiSignInObservation({ state: "user_id_missing" }, {}).status, "login_required");
   assert.equal(classifyNewApiSignInObservation({ state: "user_id_ambiguous" }, {}).status, "unconfirmed");

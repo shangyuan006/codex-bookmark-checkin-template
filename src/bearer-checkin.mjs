@@ -95,12 +95,16 @@ export function classifyBearerCheckinObservation(observed) {
 export async function runBearerCheckinInBrowser({ activeRule, sessionOnly = false }) {
   const maxAccessTokenLength = 16 * 1024;
   const fetchJson = async (url, options = {}) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
     try {
-      const response = await fetch(url, { credentials: "include", ...options });
+      const response = await fetch(url, { credentials: "include", ...options, signal: controller.signal });
       const body = await response.json().catch(() => null);
       return { ok: response.ok, status: response.status, body };
     } catch {
       return { ok: false, status: 0, body: null };
+    } finally {
+      clearTimeout(timeout);
     }
   };
   const unauthorizedMessage = (message) => /not logged|login required|unauthori[sz]ed|forbidden|\u672a\u767b\u5f55|\u672a\u767b\u9304|\u672a\u6388\u6743|\u7121\u6b0a/i.test(String(message || ""));

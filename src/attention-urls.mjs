@@ -151,6 +151,7 @@ export function buildAttentionHandoff({
   selection = [],
   excludedOrigins = [],
   bookmarkLastModifiedAt = null,
+  forAbandonment = false,
 }) {
   if (requestedOrigins.length > 0 && selection.length > 0) {
     throw new Error("Origins 和 Selection 不能同时使用");
@@ -159,9 +160,13 @@ export function buildAttentionHandoff({
   const targetByOrigin = new Map(plan.targets.map((target) => [target.origin, target]));
   const resultByOrigin = new Map((latest.results ?? []).map((result) => [result.origin, result]));
   const excludedOriginSet = new Set(excludedOrigins.map(normalizeRequestedOrigin));
+  const canSelectExplicitly = forAbandonment
+    ? (result) => Boolean(result) && !isTerminalResult(result) && result.status !== "not_available"
+    : canExplicitlyRequestManualAttention;
+  const shouldInclude = forAbandonment ? canSelectExplicitly : requiresManualAttention;
   const pending = sortAttentionItems(
     [...resultByOrigin.values()]
-      .filter((result) => requiresManualAttention(result) && !excludedOriginSet.has(result.origin))
+      .filter((result) => shouldInclude(result) && !excludedOriginSet.has(result.origin))
       .map((result) => {
         const target = targetByOrigin.get(result.origin);
         if (!target?.candidates?.length) return null;
@@ -185,7 +190,7 @@ export function buildAttentionHandoff({
       const previous = resultByOrigin.get(origin);
       if (!target?.candidates?.length) return null;
       if (excludedOriginSet.has(origin)) return null;
-      if (!canExplicitlyRequestManualAttention(previous)) return null;
+      if (!canSelectExplicitly(previous)) return null;
       return {
         origin,
         url: target.candidates[0],
@@ -210,7 +215,7 @@ export function buildAttentionHandoff({
         const target = targetByOrigin.get(origin);
         const previous = resultByOrigin.get(origin);
         if (!target?.candidates?.length || excludedOriginSet.has(origin)) return null;
-        if (!canExplicitlyRequestManualAttention(previous)) return null;
+        if (!canSelectExplicitly(previous)) return null;
         return {
           origin,
           url: target.candidates[0],
@@ -242,12 +247,14 @@ export function buildAttentionHandoff({
 export function parseAttentionArguments(argv) {
   const requestedOrigins = [];
   const selection = [];
+  let forAbandonment = false;
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--origin") requestedOrigins.push(argv[++index] ?? "");
     else if (argv[index] === "--selection") selection.push(argv[++index] ?? "");
+    else if (argv[index] === "--for-abandonment") forAbandonment = true;
     else throw new Error(`未知参数：${argv[index]}`);
   }
-  return { requestedOrigins, selection };
+  return { requestedOrigins, selection, ...(forAbandonment ? { forAbandonment: true } : {}) };
 }
 
 export async function loadAttentionHandoff(rootDirectory, argv = []) {
@@ -272,8 +279,8 @@ export async function loadAttentionHandoff(rootDirectory, argv = []) {
     latest,
     await loadCurrentDayRunReports(logsDirectory, latest),
   );
-  const { requestedOrigins, selection } = parseAttentionArguments(argv);
-  const handoffOrigins = requestedOrigins.length === 0 && selection.length === 0
+  const { requestedOrigins, selection, forAbandonment = false } = parseAttentionArguments(argv);
+  const handoffOrigins = !forAbandonment && requestedOrigins.length === 0 && selection.length === 0
     ? await loadCurrentManualHandoffOrigins(rootDirectory, attentionLatest)
     : null;
   return buildAttentionHandoff({
@@ -283,6 +290,7 @@ export async function loadAttentionHandoff(rootDirectory, argv = []) {
     requestedOrigins,
     handoffOrigins,
     selection,
+    forAbandonment,
     excludedOrigins: await loadCurrentAbandonedOrigins(rootDirectory, attentionLatest),
     bookmarkLastModifiedAt,
   });

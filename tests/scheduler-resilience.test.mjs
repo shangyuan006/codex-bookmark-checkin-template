@@ -6,6 +6,22 @@ import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
+test("manual dispatch shares the automatic wrapper mutex and releases it on every path", async () => {
+  const scheduler = await fs.readFile(path.join(root, "scripts", "Start-UserScheduler.ps1"), "utf8");
+  const start = scheduler.indexOf("function Start-ManualHandoffActions");
+  const end = scheduler.indexOf("function Test-SchedulerWaiting", start);
+  const dispatcher = scheduler.slice(start, end);
+  assert.match(dispatcher, /\$Config\.runMutexName/);
+  assert.match(dispatcher, /\$handoffMutex\.WaitOne\(0\)/);
+  const lockGuard = dispatcher.indexOf("if (-not $handoffMutexOwned) { return }");
+  assert.ok(lockGuard > 0);
+  assert.ok(dispatcher.indexOf("Get-AgentRouterManualAction") > lockGuard);
+  assert.ok(dispatcher.indexOf("Start-Process") > lockGuard);
+  assert.ok(dispatcher.indexOf("Write-ManualHandoffLaunch") < dispatcher.indexOf("Start-Process"));
+  assert.match(dispatcher, /-HandoffLaunchId/);
+  assert.match(dispatcher, /finally[\s\S]*ReleaseMutex\(\)[\s\S]*Dispose\(\)/);
+});
+
 test("Windows 计划任务回退前停用遗留任务", async () => {
   const installer = await fs.readFile(path.join(root, "scripts", "Install-ScheduledTask.ps1"), "utf8");
   assert.match(installer, /Disable-ScheduledTask\s+-TaskName\s+\$taskName/);

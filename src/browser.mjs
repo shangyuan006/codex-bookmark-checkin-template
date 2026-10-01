@@ -11,7 +11,14 @@ import { withRetrySchedule } from "./retry-policy.mjs";
 import { configuredNoCheckinResult, normalizeResultContract } from "./result-contract.mjs";
 import { tryNewApiCaptchaCheckin, tryNewApiSignIn } from "./new-api-signin.mjs";
 import { tryBearerCheckin } from "./bearer-checkin.mjs";
+import { tryNewApiCheckin } from "./new-api-browser.mjs";
+export { runNewApiCheckinInBrowser, tryNewApiCheckin } from "./new-api-browser.mjs";
+import { stopAtConfiguredTerminal, successEvidence, verifyVisitCheckin } from "./checkin-evidence.mjs";
+import { tryNewApiHttpFirst } from "./new-api-http.mjs";
+import { verifyConfiguredSavedLoginSession } from "./saved-login-session.mjs";
+import { readAfterNavigation } from "./page-state-read.mjs";
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
+import { readCloudflareFrameEvidence } from "./challenge-frame-state.mjs";
 import {
   getConfiguredPreCheckinNavigationRule,
   getConfiguredPreCheckinTerminalPath,
@@ -71,6 +78,16 @@ export class TargetTimeoutError extends Error {
     this.name = "TargetTimeoutError";
     this.timeoutMs = timeoutMs;
   }
+}
+
+export function targetTimeoutResult(timeoutMs, url = "") {
+  return {
+    status: "error",
+    failureCode: "target_timeout",
+    retryable: false,
+    reason: `单站处理超过 ${Math.ceil(timeoutMs / 1000)} 秒，已终止并继续后续站点`,
+    url: safeLogUrl(url),
+  };
 }
 
 // page.evaluate() has no Playwright timeout option. Race every target against
@@ -180,15 +197,21 @@ function configuredPreCheckinTerminalResult(page, target, config) {
     config,
   );
   if (!terminalPath) return null;
-  return {
-    status: "already_signed",
-    reason: `站点进入终止页面 ${terminalPath}，停止后续签到重试`,
-    url: safeLogUrl(activeUrl),
-  };
+  return stopAtConfiguredTerminal(activeUrl, config, 'terminal_path');
 }
 
 export function targetNeedsManualChallenge(target, activeOrigin, config) {
   return targetUsesConfiguredActiveOrigin(target, activeOrigin, config?.manualChallengeOrigins);
+}
+
+export function manualChallengeHandoffResult(target, activeOrigin, config, result) {
+  if (result?.status !== "interactive_challenge"
+    || !targetNeedsManualChallenge(target, activeOrigin, config)) return result;
+  return {
+    ...result,
+    failureCode: "manual_challenge_required",
+    retryable: false,
+  };
 }
 
 export function challengeEvidenceIsUnresolved(evidence) {
@@ -537,6 +560,10 @@ export function reconcileConfiguredGrowthCheckinState(target, activeUrl, config,
 }
 
 async function snapshotState(page) {
+  return readAfterNavigation(page, () => snapshotStateOnce(page));
+}
+
+async function snapshotStateOnce(page) {
   const state = await page.evaluate((challengeSelector) => {
     const bodyText = String(document.body?.innerText ?? "").slice(0, 30000);
     const passwordInputs = [...document.querySelectorAll('input[type="password"]')]
@@ -581,7 +608,13 @@ async function snapshotState(page) {
       const challengeLike = explicitWidget || responseElements.length > 0 || roots.some((root) => root.querySelector(
         'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], img[src*="captcha" i], img[alt*="captcha" i], canvas, input[type="checkbox"], [role="checkbox"], input[type="text"][name*="captcha" i], input[type="text"][id*="captcha" i], [data-sitekey]',
       ));
-      return { visible, challengeLike, resolvedState, responsePresent };
+      let cloudflare = element.matches('.cf-turnstile');
+      try {
+        const url = new URL(element.getAttribute('src'));
+        cloudflare ||= url.protocol === 'https:' && (url.hostname === 'challenges.cloudflare.com'
+          || url.hostname.endsWith('.challenges.cloudflare.com'));
+      } catch { /* Non-frame widgets keep their existing evidence. */ }
+      return { visible, challengeLike, resolvedState, responsePresent, cloudflare };
     });
     const confirmedCheckinControl = [...document.querySelectorAll(
       'button, [role="button"], input[type="button"], input[type="submit"]',
@@ -596,7 +629,14 @@ async function snapshotState(page) {
     });
     return { bodyText, passwordInputs, challengeEvidence, confirmedCheckinControl };
   }, CHALLENGE_SELECTOR);
-  const challengeEvidence = Array.isArray(state.challengeEvidence) ? state.challengeEvidence : [];
+  const frameEvidence = await readCloudflareFrameEvidence(page, new URL(page.url()).origin);
+  const frameResolved = frameEvidence.length === 1 && (frameEvidence[0].resolvedState || frameEvidence[0].responsePresent);
+  const challengeEvidence = [
+    ...(Array.isArray(state.challengeEvidence) ? state.challengeEvidence : []).map(evidence => (
+      frameResolved && evidence.cloudflare ? { ...evidence, responsePresent: true } : evidence
+    )),
+    ...frameEvidence,
+  ];
   const unresolvedChallenge = challengeEvidence.some(challengeEvidenceIsUnresolved);
   const resolvedChallenge = challengeEvidence.some((evidence) => (
     evidence.visible && !challengeEvidenceIsUnresolved(evidence)
@@ -610,6 +650,16 @@ async function snapshotState(page) {
     resolvedChallengeSelectors: resolvedChallenge && !unresolvedChallenge,
     confirmedCheckinControl: state.confirmedCheckinControl,
   });
+  if (["signed", "already_signed"].includes(classification.status)) {
+    const bodyClassification = classifyPageText({
+      url: page.url(), bodyText: state.bodyText, hasPassword: state.passwordInputs,
+      challengeSelectors: unresolvedChallenge,
+      resolvedChallengeSelectors: resolvedChallenge && !unresolvedChallenge,
+      confirmedCheckinControl: state.confirmedCheckinControl,
+    });
+    if (!["signed", "already_signed"].includes(bodyClassification.status)) return bodyClassification;
+    classification.evidence = successEvidence("page_text", "page_completion_text");
+  }
   return unresolvedChallenge ? { ...classification, unresolvedChallenge: true } : classification;
 }
 
@@ -887,7 +937,7 @@ export async function clickConfiguredChallengeControl(page, rule, expectedOrigin
 }
 
 async function inspectConfiguredSlider(page) {
-  return page.evaluate(() => {
+  return readAfterNavigation(page, () => page.evaluate(() => {
     const selector = 'input[type="range"], [role="slider"], [class*="slider" i], [class*="slide" i], [class*="verify" i], [class*="drag" i], [id*="slider" i], [id*="slide" i], [id*="verify" i], [id*="drag" i]';
     const visible = (element) => {
       const style = getComputedStyle(element);
@@ -938,7 +988,7 @@ async function inspectConfiguredSlider(page) {
         parentCandidateIndex: elements.findIndex((candidate) => candidate !== element && candidate.contains(element)),
       };
     });
-  });
+  }));
 }
 
 export async function waitForOptionalChallengeAppearance(
@@ -2078,180 +2128,6 @@ async function tryQaFlow(page, rules, origin, config) {
   return null;
 }
 
-export async function runNewApiCheckinInBrowser() {
-    const normalizeUserId = (value) => {
-      const text = String(value ?? "").trim();
-      return /^\d{1,20}$/.test(text) ? text : null;
-    };
-    const extractUserId = (value, key = "") => {
-      if (/^(?:uid|user[_-]?id)$/i.test(key)) {
-        const direct = normalizeUserId(value);
-        if (direct) return direct;
-      }
-      if (!value || typeof value !== "object") return normalizeUserId(value?.id);
-      return normalizeUserId(
-        value.id
-          ?? value.user?.id
-          ?? value.state?.user?.id
-          ?? value.data?.id
-          ?? value.data?.user?.id,
-      );
-    };
-    const hasVisibleCheckinControl = () => [...(document?.querySelectorAll?.("button, [role=button], input[type=submit], a") ?? [])]
-      .some((element) => {
-        const style = getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return false;
-        return /立即签到|立即簽到|每日签到|每日簽到|check.?in|attendance/i.test(
-          String(element.innerText || element.value || element.getAttribute("aria-label") || ""),
-        );
-      });
-    const hasVisibleCompletedCheckinControl = () => [...(document?.querySelectorAll?.("button, [role=button], input[type=button], input[type=submit], a") ?? [])]
-      .some((element) => {
-        const style = getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return false;
-        const text = String(element.innerText || element.value || element.getAttribute("aria-label") || element.title || "")
-          .replace(/\s+/g, " ").trim();
-        return /^(?:(?:今日|今天|当日|當日)\s*)?已\s*(?:签到|簽到)$|签到成功|簽到成功/i.test(text);
-      });
-    const sessionFailure = () => {
-      if (hasVisibleCompletedCheckinControl()) {
-        return { status: "already_signed", reason: "页面签到控件确认已签到，接口登录探测不可用" };
-      }
-      const passwordVisible = [...(document?.querySelectorAll?.('input[type="password"]') ?? [])]
-        .some(element => {
-          const rect = element.getBoundingClientRect();
-          const style = getComputedStyle(element);
-          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-        });
-      if (!passwordVisible && hasVisibleCheckinControl()) return null;
-      return { status: "login_required", reason: "签到接口显示登录状态无效" };
-    };
-    const disabledFeature = (source) => ({
-      status: "not_available", reason: "站点签到功能未启用", availabilityKind: "feature_disabled",
-      evidence: { authoritative: true, source, outcome: "message_not_enabled", confirmedAt: new Date().toISOString() },
-    });
-    let userId = null;
-    const storages = [localStorage, sessionStorage];
-    for (const storage of storages) {
-      for (let index = 0; index < storage.length; index += 1) {
-        try {
-          const key = storage.key(index) || "";
-          const raw = storage.getItem(key) || "";
-          let value = null;
-          try { value = JSON.parse(raw); } catch { value = raw; }
-          userId = extractUserId(value, key);
-          if (userId != null) break;
-        } catch { /* continue */ }
-      }
-      if (userId != null) break;
-    }
-    if (userId == null) {
-      const visibleId = String(document.body?.innerText || "").match(/(?:用户|使用者)?\s*ID\s*[:：]?\s*(\d+)/i);
-      userId = normalizeUserId(visibleId?.[1]);
-    }
-    if (userId == null) {
-      try {
-        const response = await fetch("/api/user/self", { credentials: "include", headers: { Accept: "application/json" } });
-        if ([401, 403].includes(response.status)) {
-          return sessionFailure();
-        }
-        const body = await response.json();
-        userId = body?.data?.id ?? body?.data?.user?.id ?? null;
-      } catch { /* not a compatible API */ }
-    }
-    if (userId == null) return null;
-
-    const headers = { Accept: "application/json", "New-Api-User": String(userId) };
-    const currentDate = new Date();
-    const month = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, "0")}`;
-    const readStatus = async () => {
-      let response;
-      try {
-        response = await fetch(`/api/user/checkin?month=${month}`, { credentials: "include", headers });
-      } catch {
-        return null;
-      }
-      if (response.status === 404) return { unavailable: true };
-      if ([401, 403].includes(response.status)) return { loginRequired: true };
-      let body;
-      try { body = await response.json(); } catch { return null; }
-      return { body };
-    };
-    const initialStatus = await readStatus();
-    if (!initialStatus || initialStatus.unavailable) return null;
-    if (initialStatus.loginRequired) {
-      return sessionFailure();
-    }
-    const statusBody = initialStatus.body;
-    const message = String(statusBody?.message || "");
-    if (!statusBody?.success) {
-      if (/未启用|未啟用|not enabled/i.test(message)) {
-        return disabledFeature("new_api_checkin_status");
-      }
-      if (/turnstile|captcha|人机|人機/i.test(message)) {
-        return { status: "interactive_challenge", reason: "站点签到接口要求人机验证" };
-      }
-      return null;
-    }
-    const checked = Boolean(
-      statusBody?.data?.stats?.checked_in_today
-      ?? statusBody?.data?.checked_in_today
-      ?? statusBody?.data?.checkedInToday
-    );
-    if (checked) return { status: "already_signed", reason: "签到接口显示今日已签到" };
-
-    let checkinResponse;
-    try {
-      checkinResponse = await fetch("/api/user/checkin", { method: "POST", credentials: "include", headers });
-    } catch {
-      return null;
-    }
-    if ([401, 403].includes(checkinResponse.status)) {
-      return sessionFailure();
-    }
-    let checkinBody;
-    try { checkinBody = await checkinResponse.json(); } catch { return null; }
-    const checkinMessage = String(checkinBody?.message || "");
-    if (/turnstile|captcha|人机|人機/i.test(checkinMessage)) {
-      return { status: "interactive_challenge", reason: "站点签到接口要求人机验证" };
-    }
-    if (/未启用|未啟用|not enabled/i.test(checkinMessage)) {
-      return disabledFeature("new_api_checkin_action");
-    }
-    const submitted = checkinBody?.success || /已签到|已簽到|already/i.test(checkinMessage);
-    if (!submitted) return null;
-
-    for (let attempt = 1; attempt <= 4; attempt += 1) {
-      const verifiedStatus = await readStatus();
-      if (verifiedStatus?.loginRequired) {
-        const pageResult = sessionFailure();
-        return pageResult?.status === "already_signed" ? pageResult : {
-          status: "needs_attention", reason: "签到请求已提交，但复核接口不可用，需核对页面完成状态",
-          submissionAttempted: true,
-        };
-      }
-      const verifiedBody = verifiedStatus?.body;
-      const verified = verifiedBody?.success && Boolean(
-        verifiedBody?.data?.stats?.checked_in_today
-        ?? verifiedBody?.data?.checked_in_today
-        ?? verifiedBody?.data?.checkedInToday
-      );
-      if (verified) {
-        return {
-          status: checkinBody?.success ? "signed" : "already_signed",
-          reason: "站点状态接口确认今日已签到",
-        };
-      }
-      if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 750));
-    }
-    return null;
-}
-
-export async function tryNewApiCheckin(page) {
-  return page.evaluate(runNewApiCheckinInBrowser);
-}
 
 async function tryOpenCdCaptcha(page, expectedOrigin) {
   if (expectedOrigin !== "https://open.cd") return null;
@@ -2397,11 +2273,7 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
     config,
   );
   if (destinationTerminalPath) {
-    return {
-      status: "already_signed",
-      reason: `拒绝直接打开终止页面 ${destinationTerminalPath}，按站点规则停止重试`,
-      url: safeLogUrl(destination),
-    };
+    return stopAtConfiguredTerminal(destination, config, 'terminal_path');
   }
   await page.goto(destination, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
   if (useExtendedDiscovery) {
@@ -2443,18 +2315,13 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
     { hasCheckinAction: Boolean(directCheckinAction) },
   );
   if (preCheckinNavigated?.terminalPath) {
-    return {
-      status: "already_signed",
-      reason: `站点进入终止页面 ${preCheckinNavigated.terminalPath}，停止后续签到重试`,
-      url: safeLogUrl(page.url()),
-    };
+    return stopAtConfiguredTerminal(page.url(), config, 'terminal_path');
   }
   if (preCheckinNavigated?.terminalNoAction) {
-    return {
-      status: "already_signed",
-      reason: "站点首页签到入口已消失，按站点规则确认今日已签到",
-      url: safeLogUrl(page.url()),
-    };
+    return stopAtConfiguredTerminal(page.url(), config, 'missing_navigation_control');
+  }
+  if (preCheckinNavigated?.terminalUnconfirmed) {
+    return { ...preCheckinNavigated.terminalUnconfirmed, url: safeLogUrl(page.url()) };
   }
   ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
   const navigatedTerminalResult = configuredPreCheckinTerminalResult(page, target, config);
@@ -2517,23 +2384,11 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
 
   const visitRule = (config.visitCheckinRules ?? {})[activeOrigin];
   if (visitRule?.after) {
-    const match = String(visitRule.after).match(/^([01]\d|2[0-3]):([0-5]\d)$/);
-    if (!match) throw new Error(`访问签到时间配置无效：${activeOrigin}`);
-    const current = new Date();
-    const currentMinutes = current.getHours() * 60 + current.getMinutes();
-    const requiredMinutes = Number(match[1]) * 60 + Number(match[2]);
-    if (currentMinutes >= requiredMinutes) {
-      return {
-        status: "signed",
-        reason: `${visitRule.after} 后已登录访问，按站点规则完成签到`,
-        url: safeLogUrl(page.url()),
-      };
-    }
-    return {
-      status: "deferred",
-      reason: `站点要求 ${visitRule.after} 后访问，当前尚未到签到时间`,
-      url: safeLogUrl(page.url()),
-    };
+    return verifyVisitCheckin(visitRule, {
+      url: page.url(),
+      readState: () => waitForConfirmedCheckinState(page, config, config.visitCheckinWaitMs),
+      verifySession: () => verifyConfiguredSavedLoginSession(page, activeOrigin, config),
+    });
   }
 
   const qaResult = await tryQaFlow(page, qaRules, activeOrigin, config);
@@ -2594,12 +2449,12 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
     }
   }
   if (action && shouldBlockManualChallengeAction(target, activeOrigin, config, state)) {
-    return {
+    return manualChallengeHandoffResult(target, activeOrigin, config, {
       status: "interactive_challenge",
       reason: "站点签到需要人工完成安全验证",
       action: action.text,
       url: safeLogUrl(page.url()),
-    };
+    });
   }
   if (!action && (pendingConfiguredNewApiRetry || pendingNewApiRetry)) {
     return {
@@ -2639,6 +2494,13 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
       state = await waitForManagedChallenge(page, config);
     }
     state = await acceptConfiguredTerms(page, state, activeOrigin, config);
+    if (state.status === "interactive_challenge") {
+      return {
+        ...manualChallengeHandoffResult(target, activeOrigin, config, state),
+        action: action.text,
+        url: safeLogUrl(page.url()),
+      };
+    }
     let retryActionText = null;
     const pendingApiPageRetry = pendingConfiguredNewApiRetry || pendingNewApiRetry;
     if (shouldRetryConfiguredCheckinPageAction(
@@ -2724,10 +2586,12 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
         return { ...retryConfiguredResult, action: retryActionText ? `${action.text} → ${retryActionText}` : action.text, url: safeLogUrl(page.url()) };
       }
       return {
-        status: retryConfiguredResult?.status === "interactive_challenge" ? "interactive_challenge" : "needs_attention",
-        reason: retryConfiguredResult?.status === "interactive_challenge"
-          ? "页面验证完成后，配置化签到接口仍要求人机验证"
-          : "页面验证完成后，配置化签到接口未确认今日已签到",
+        ...manualChallengeHandoffResult(target, activeOrigin, config, {
+          status: retryConfiguredResult?.status === "interactive_challenge" ? "interactive_challenge" : "needs_attention",
+          reason: retryConfiguredResult?.status === "interactive_challenge"
+            ? "页面验证完成后，配置化签到接口仍要求人机验证"
+            : "页面验证完成后，配置化签到接口未确认今日已签到",
+        }),
         action: action.text,
         url: safeLogUrl(page.url()),
       };
@@ -2747,10 +2611,12 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
         return { ...retryApiResult, action: action.text, url: safeLogUrl(page.url()) };
       }
       return {
-        status: retryApiResult?.status === "interactive_challenge" ? "interactive_challenge" : "needs_attention",
-        reason: retryApiResult?.status === "interactive_challenge"
-          ? "页面验证完成后，签到接口仍要求人机验证"
-          : "页面验证完成后，签到接口未确认今日已签到",
+        ...manualChallengeHandoffResult(target, activeOrigin, config, {
+          status: retryApiResult?.status === "interactive_challenge" ? "interactive_challenge" : "needs_attention",
+          reason: retryApiResult?.status === "interactive_challenge"
+            ? "页面验证完成后，签到接口仍要求人机验证"
+            : "页面验证完成后，签到接口未确认今日已签到",
+        }),
         action: action.text,
         url: safeLogUrl(page.url()),
       };
@@ -2777,7 +2643,11 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
         assertBookmarkNavigation(page.url(), allowedOrigins);
         state = await snapshotState(page);
         if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "deferred", "unconfirmed"].includes(state.status)) {
-          return { ...state, action: action.text, url: safeLogUrl(page.url()) };
+          return {
+            ...manualChallengeHandoffResult(target, activeOrigin, config, state),
+            action: action.text,
+            url: safeLogUrl(page.url()),
+          };
         }
         secondAction = await findCheckinAction(page, allowedOrigins, null);
       } while (!secondAction && Date.now() < retryDeadline);
@@ -2792,6 +2662,13 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
         state = await waitForManagedChallenge(page, config);
       }
       state = await acceptConfiguredTerms(page, state, activeOrigin, config);
+      if (state.status === "interactive_challenge") {
+        return {
+          ...manualChallengeHandoffResult(target, activeOrigin, config, state),
+          action: `${action.text} → ${secondAction.text}`,
+          url: safeLogUrl(page.url()),
+        };
+      }
       if (["signed", "already_signed", "login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred", "unconfirmed"].includes(state.status)) {
         return { ...state, action: `${action.text} → ${secondAction.text}`, url: safeLogUrl(page.url()) };
       }
@@ -2895,6 +2772,10 @@ export async function launchAutomationContext(config) {
 export async function processTarget(context, target, config, qaRules, logDirectory) {
   const configuredUnavailable = configuredNoCheckinResult(target, config);
   if (configuredUnavailable) return configuredUnavailable;
+  const fast = await tryNewApiHttpFirst(context, target, config);
+  if (fast && !fast.fallback && fast.result) {
+    return { ...fast.result, origin: target.origin, metrics: fast.metrics, attempt: 1, candidateHistory: [] };
+  }
   let lastResult = null;
   const candidateHistory = [];
   const targetTimeoutMs = getTargetTimeoutMs(config);
@@ -2918,11 +2799,7 @@ export async function processTarget(context, target, config, qaRules, logDirecto
           ));
         } catch (error) {
           if (error instanceof TargetTimeoutError) {
-            result = {
-              status: "error",
-              reason: `单站处理超过 ${Math.ceil(targetTimeoutMs / 1000)} 秒，已终止并继续后续站点`,
-              url: safeLogUrl(page.url()),
-            };
+            result = targetTimeoutResult(targetTimeoutMs, page.url());
             candidateHistory.push(candidateHistoryEntry(candidateUrl, result, attempt + 1));
             return { ...result, attempt: attempt + 1, candidateHistory };
           }
@@ -2935,7 +2812,7 @@ export async function processTarget(context, target, config, qaRules, logDirecto
         candidateHistory.push(candidateHistoryEntry(candidateUrl, result, attempt + 1));
         // A blocked verification must not be reopened through a second bookmark
         // candidate or a local retry. The caller still hands it to the user.
-        if (result.retryable === false) return { ...result, attempt: attempt + 1, candidateHistory };
+        if (result.retryable === false || result.submissionAttempted === true) return { ...result, attempt: attempt + 1, candidateHistory };
         attemptResult = preferCandidateResult(attemptResult, result);
         lastResult = preferCandidateResult(lastResult, result);
         // A logical bookmark target can contain multiple related URLs.  One

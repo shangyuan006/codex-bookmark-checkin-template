@@ -1,15 +1,15 @@
 import { createRequire } from "node:module";
+import fs from "node:fs/promises";
 import { runNewApiCheckinInBrowser } from "./browser.mjs";
-import { classifyPageText } from "./detector.mjs";
+import { readNativeCheckinState } from "./native-checkin-state.mjs";
 import { connectOverCdpWithRetry, evaluateOverRawCdp } from "./native-cdp.mjs";
 import {
   clickVisibleNativeChallengeControl,
-  matchesNativeCompletedControlText,
+  clickVisibleNativeSafeLineControl,
   normalizeNativeCheckinActionRule,
   waitForNativeCheckinAction,
 } from "./native-checkin-action.mjs";
 import { pagesForOrigin, selectNewestOriginPage } from "./native-page-selection.mjs";
-import { assertBookmarkNavigation } from "./security.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
@@ -24,6 +24,10 @@ const encodedActionRule = process.argv[6] || "";
 const actionRule = executeCheckin
   ? normalizeNativeCheckinActionRule(JSON.parse(Buffer.from(encodedActionRule, "base64").toString("utf8")))
   : null;
+const config = await fs.readFile(new URL('../config/config.json',import.meta.url),'utf8').then(JSON.parse).catch(error=>{
+  if(error.code==='ENOENT') return {};
+  throw error;
+});
 const retryableChallengeOutcomes = new Set([
   "pending",
   "challenge_not_found",
@@ -38,38 +42,7 @@ if (!new Set(["require-confirmed", "allow-endpoint", "execute-checkin", "execute
 }
 
 async function readPageState(page) {
-  assertBookmarkNavigation(page.url(), [expectedOrigin]);
-  const snapshot = await page.evaluate(() => {
-    const visible = (element) => {
-      const style = getComputedStyle(element);
-      const rect = element.getBoundingClientRect();
-      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-    };
-    const controls = [...document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]')]
-      .filter(visible)
-      .map((element) => String(element.innerText || element.value || element.getAttribute("aria-label") || "")
-        .replace(/\s+/g, " ").trim());
-    return {
-      bodyText: String(document.body?.innerText || "").slice(0, 30000),
-      hasPassword: [...document.querySelectorAll('input[type="password"]')].some(visible),
-      challengeSelectors: [...document.querySelectorAll('iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, altcha-widget')]
-        .some(visible),
-      controlTexts: controls,
-    };
-  });
-  const state = classifyPageText({
-    url: page.url(),
-    title: await page.title(),
-    bodyText: snapshot.bodyText,
-    hasPassword: snapshot.hasPassword,
-    challengeSelectors: snapshot.challengeSelectors,
-    confirmedCheckinControl: snapshot.controlTexts.some(matchesNativeCompletedControlText),
-  });
-  return {
-    state,
-    siteBodyLoaded: snapshot.bodyText.trim().length > 80,
-    attendanceEndpoint: /\/(?:attendance|check[-_]?in|showup)(?:\.php)?(?:[/?#]|$)/i.test(page.url()),
-  };
+  return readNativeCheckinState(page,expectedOrigin,config);
 }
 
 async function inspectNewApiWithRawCdp() {
@@ -132,6 +105,7 @@ async function inspectWithPlaywright() {
   let actionOutcome = executeCheckin ? "not_attempted" : "not_configured";
   let challengeOutcome = executeCheckin && actionRule.clickChallenge ? "pending" : "not_configured";
   let challengeDetails = null;
+  let safeLineAttempted = false;
   let confirmationDeadline = pageDeadline;
   let current = await readPageState(page);
   if (executeCheckin && !["signed", "already_signed"].includes(current.state.status)) {
@@ -148,15 +122,37 @@ async function inspectWithPlaywright() {
   do {
     try {
       await page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+      current = await readPageState(page);
+      const canInteract = !["signed", "already_signed", "login_required"].includes(current.state.status);
+      if (executeCheckin && canInteract && !safeLineAttempted) {
+        const safeLine = await clickVisibleNativeSafeLineControl(page, expectedOrigin, {
+          waitMs: Math.min(30_000, Math.max(5_000, confirmationDeadline - Date.now())),
+        });
+        if (safeLine.attempted) {
+          safeLineAttempted = true;
+          challengeDetails = safeLine;
+          challengeOutcome = safeLine.outcome;
+        }
+      }
       // Cloudflare may render its checkbox several seconds after the sign-in
       // click. Keep polling boundedly after an empty or failed probe so a late
       // challenge can still be clicked, while ambiguous controls remain fail-closed.
-      if (executeCheckin && actionAttempted && retryableChallengeOutcomes.has(challengeOutcome)) {
+      if (executeCheckin && canInteract && retryableChallengeOutcomes.has(challengeOutcome)) {
         const challenge = await clickVisibleNativeChallengeControl(page, expectedOrigin, actionRule);
         challengeDetails = challenge.details ?? challengeDetails;
         challengeOutcome = challenge.outcome;
       }
       current = await readPageState(page);
+      if (executeCheckin && !actionAttempted && current.state.status === "ready") {
+        const action = await waitForNativeCheckinAction(page, expectedOrigin, actionRule, {
+          readState: async activePage => (await readPageState(activePage)).state,
+          timeoutMs: Math.max(0, confirmationDeadline - Date.now()),
+        });
+        actionAttempted = action.clicked;
+        actionOutcome = action.outcome;
+        if (actionAttempted) confirmationDeadline = Date.now() + maxWaitSeconds * 1000;
+        current = await readPageState(page);
+      }
       output = {
         status: current.state.status,
         failureCode: current.state.failureCode,

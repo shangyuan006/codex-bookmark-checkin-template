@@ -144,7 +144,7 @@ foreach ($configuredProfile in @($items.profilePath | Select-Object -Unique)) {
     }
 }
 
-$preflightResults = @(Read-NativePreflightConfirmations -Path $preflightPath)
+$preflightResults = @(Read-NativePreflightConfirmations -Path $preflightPath -Config $config)
 
 function Close-AutomationBrowser([string]$ProfilePath) {
     $targets = @(Get-AutomationBrowserProcesses $ProfilePath)
@@ -208,7 +208,7 @@ foreach ($item in $items) {
             }
             inspectionStatus = if ($passivePrepared) { 'passive_wait' } else { 'unavailable' }
         }
-        Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults
+        Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults -Config $config
         continue
     }
 
@@ -248,7 +248,7 @@ foreach ($item in $items) {
                 $confirmedResult = [pscustomobject]@{
                     origin = $origin
                     url = $url
-                    status = 'signed'
+                    status = Get-NativePreflightConfirmationStatus $inspection $attemptExplicit $attemptEndpoint
                     reason = if ($attemptExplicit) { '原生页面或接口明确确认今天已签到' } else { '原生验证已确认配置的签到端点完整加载' }
                     inspectionStatus = [string]$inspection.status
                     actionAttempted = [bool]$inspection.actionAttempted
@@ -256,7 +256,7 @@ foreach ($item in $items) {
                     challengeOutcome = [string]$inspection.challengeOutcome
                     newApiConfirmed = [bool]$inspection.newApiConfirmed
                 }
-                Write-NativePreflightCheckpoint -Path $preflightPath -Results @($preflightResults + @($confirmedResult))
+                Write-NativePreflightCheckpoint -Path $preflightPath -Results @($preflightResults + @($confirmedResult)) -Config $config
             }
         }
         catch { $attemptFailure = $_; throw }
@@ -282,7 +282,7 @@ foreach ($item in $items) {
     $preflightResults += [pscustomobject]@{
         origin = $origin
         url = $url
-        status = if ($explicitlyConfirmed -or $endpointConfirmed) { 'signed' } elseif ($requiresHandoff) { 'interactive_challenge' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
+        status = if ($explicitlyConfirmed -or $endpointConfirmed) { Get-NativePreflightConfirmationStatus $inspection $explicitlyConfirmed $endpointConfirmed } elseif ($requiresHandoff) { 'interactive_challenge' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
         failureCode = if ($requiresHandoff) { 'safeline_client_challenge' } else { $null }
         retryable = if ($requiresHandoff) { $false } else { $null }
         preflightAttemptId = $AttemptId
@@ -329,7 +329,7 @@ foreach ($item in $items) {
         newApiAttempted = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiAttempted
         newApiConfirmed = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiConfirmed
     }
-    Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults
+    Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults -Config $config
 }
 
 Write-Output "已离屏预热 $($items.Count) 个原生验证会话。"

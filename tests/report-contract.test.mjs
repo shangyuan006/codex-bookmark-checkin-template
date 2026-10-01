@@ -84,6 +84,46 @@ test("today's abandonment is projected into report counts without hiding real pr
   assert.doesNotMatch(report.summary, /abandoned\.test：登录失效/);
 });
 
+test("reports separate feature closure, temporary outages, configured skips, and daily abandonment", async () => {
+  const confirmedAt = new Date().toISOString();
+  const feature = { origin: "https://disabled.test", status: "not_available", availabilityKind: "feature_disabled",
+    evidence: { source: "configuration", outcome: "known_no_checkin_feature", authoritative: true, confirmedAt } };
+  const outage = { origin: "https://outage.test", status: "not_available", availabilityKind: "temporary_unavailable",
+    temporarilyUnavailable: true, evidence: { source: "operator_confirmation", outcome: "http_502", authoritative: true, confirmedAt } };
+  const skipped = { origin: "https://skipped.test", status: "not_available", availabilityKind: "task_disabled",
+    disabledByConfig: true, evidence: { source: "configuration", authoritative: true, confirmedAt } };
+  const report = await previewReport({ runId: "20260928-120000", runState: "final", isComplete: true,
+    plannedTotal: 5, processedTotal: 5, selectedOrigins: [outage.origin], selectedTotal: 1, selectedProcessedTotal: 1,
+    results: [{ origin: "https://signed.test", status: "signed" }, feature, outage, skipped,
+      { origin: "https://abandoned.test", status: "error" }] }, "completed", ["https://abandoned.test"]);
+  assert.deepEqual(report.availabilitySummary, { feature_disabled: 1, temporary_unavailable: 1, task_disabled: 1 });
+  assert.deepEqual(report.selectedAvailabilitySummary, { feature_disabled: 0, temporary_unavailable: 1, task_disabled: 0 });
+  assert.deepEqual(report.selectedSummary, { not_available: 1 });
+  assert.equal(report.problemCount, 0);
+  assert.match(report.summary, /1 个未开放签到（功能关闭）/);
+  assert.match(report.summary, /1 个今日暂不可用/);
+  assert.match(report.summary, /1 个配置停用/);
+  assert.match(report.summary, /1 个今日放弃/);
+  assert.doesNotMatch(report.summary, /3 个未开放签到/);
+});
+
+test("availability category changes update notification event keys without exposing evidence contents", async () => {
+  const confirmedAt = new Date().toISOString();
+  const base = { runId: "20260928-120000", runState: "final", isComplete: true, plannedTotal: 1, processedTotal: 1 };
+  const temporary = { origin: "https://one.test", status: "not_available", availabilityKind: "temporary_unavailable",
+    temporarilyUnavailable: true, evidence: { source: "operator_confirmation", authoritative: true, confirmedAt } };
+  const feature = { origin: "https://one.test", status: "not_available", availabilityKind: "feature_disabled",
+    evidence: { source: "configuration", outcome: "known_no_checkin_feature", authoritative: true, confirmedAt } };
+  const first = await previewReport({ ...base, results: [temporary] });
+  const repeated = await previewReport({ ...base, results: [temporary] });
+  const changed = await previewReport({ ...base, results: [feature] });
+  assert.equal(first.eventKey, repeated.eventKey);
+  assert.notEqual(first.eventKey, changed.eventKey);
+  assert.deepEqual(first.availabilitySummary, { feature_disabled: 0, temporary_unavailable: 1, task_disabled: 0 });
+  assert.equal(first.status, "skipped");
+  assert.doesNotMatch(JSON.stringify(first), /operator_confirmation|confirmedAt/);
+});
+
 test("部分进度即使全部已签到也不会报告成功", async () => {
   const report = await previewReport({
     runId: "20260723-120000",

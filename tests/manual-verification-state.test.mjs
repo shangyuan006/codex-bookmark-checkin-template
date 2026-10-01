@@ -123,7 +123,7 @@ async function invokeCurrentDayCheck(state, now = "2026-08-26T04:00:00Z") {
   }
 }
 
-async function invokePartialAbandonment() {
+async function invokePartialAbandonment({ handoffTargets = [] } = {}) {
   const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "manual-partial-abandon-"));
   const scriptsDirectory = path.join(fixtureRoot, "scripts");
   const tmpDirectory = path.join(fixtureRoot, "tmp");
@@ -135,7 +135,16 @@ async function invokePartialAbandonment() {
     await Promise.all([
       fs.copyFile(closerPath, path.join(scriptsDirectory, "Close-ManualLogin.ps1")),
       fs.copyFile(abandonmentHelperPath, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
-      fs.writeFile(path.join(tmpDirectory, "manual-handoff.json"), "{}", "utf8"),
+      fs.writeFile(path.join(tmpDirectory, "manual-handoff.json"), JSON.stringify(
+        handoffTargets.length > 0
+          ? {
+            state: "awaiting_manual_handoff",
+            sourceRunId: "20260825-090000",
+            authoritativeEvidenceRequired: true,
+            targets: handoffTargets,
+          }
+          : {},
+      ), "utf8"),
       fs.writeFile(path.join(tmpDirectory, "manual-session.json"), JSON.stringify({
         schemaVersion: 2,
         mode: "legacy",
@@ -299,6 +308,30 @@ test("人工交接包含交互挑战和嵌套账号汇总的 needs_attention", a
   );
 });
 
+test("Agent Router 人工交接只保留未完成账号的匿名 accountKey", async () => {
+  const result = await invokeStateMachine(
+    pendingState(["https://done.example"]),
+    finalReport([
+      {
+        origin: "https://agentrouter.example",
+        status: "needs_attention",
+        accountResults: [
+          { accountKey: "github", status: "already_signed" },
+          { accountKey: "linuxdo", status: "needs_attention" },
+          { accountKey: "private user", status: "needs_attention" },
+        ],
+      },
+    ]),
+  );
+  assert.deepEqual(result.handoffTargets, [
+    {
+      origin: "https://agentrouter.example",
+      previousStatus: "needs_attention",
+      accountKeys: ["linuxdo"],
+    },
+  ]);
+});
+
 test("登录类 deferred 即使尚未到自动重试时间也会立即进入人工交接", async () => {
   const result = await invokeStateMachine(
     pendingState(["https://done.example"]),
@@ -377,7 +410,9 @@ test("automatic phase leaves a durable manual handoff and the scheduler consumes
   const scheduler = await fs.readFile(schedulerPath, "utf8");
   assert.match(helper, /function Get-ManualHandoffTargets\(\$Report/);
   assert.match(runner, /manual-handoff\.json/);
-  assert.match(runner, /Write-ManualHandoff \$freshCandidate\.Report/);
+  assert.match(runner, /Write-ManualHandoff \$manualHandoffCandidate\.Report/);
+  assert.match(runner, /\[switch\]\$DispatchManualHandoff/);
+  assert.match(runner, /Start-ManualHandoffDispatcher/);
   assert.match(runner, /state = 'awaiting_manual_handoff'/);
   assert.match(runner, /if \(Test-Path -LiteralPath \$manualSessionPath\)/);
   assert.doesNotMatch(runner, /Test-PendingManualVerificationFile/);
@@ -387,8 +422,13 @@ test("automatic phase leaves a durable manual handoff and the scheduler consumes
   assert.match(scheduler, /ManualVerification\.ps1/);
   assert.match(scheduler, /Test-ManualVerificationCurrentDayDocument \$verification \$Now/);
   assert.match(scheduler, /Mode = 'verification_ready'/);
+  assert.match(scheduler, /handoffTargets = @\(\)/);
+  assert.match(scheduler, /Targets = \$handoffTargets/);
+  assert.match(scheduler, /verification_ready'\)/);
   assert.match(scheduler, /Test-SchedulerWaiting \$state \$now \$config \$manualHandoff/);
   assert.match(scheduler, /lastManualVerificationChangedAt/);
+  assert.match(scheduler, /function Start-ManualHandoffActions\(\$ManualHandoff, \$Config\)/);
+  assert.match(scheduler, /Consume the handoff in the same scheduler iteration/);
 });
 
 test("manual abandonment closes without verification and suppresses only today's scheduled retry", async () => {
@@ -414,6 +454,17 @@ test("partial abandonment keeps unselected manual targets pending verification",
     ["https://one.example", "https://three.example"],
   );
   assert.equal(result.handoffPresent, false);
+});
+
+test("closing a manual window preserves unrelated Agent Router handoff targets", async () => {
+  const result = await invokePartialAbandonment({
+    handoffTargets: [
+      { origin: "https://agentrouter.example", previousStatus: "needs_attention", accountKeys: ["linuxdo"] },
+    ],
+  });
+  assert.equal(result.abandonment.origins[0], "https://two.example");
+  assert.equal(result.verification.state, "pending_verification");
+  assert.equal(result.handoffPresent, true);
 });
 
 test("Run-Checkin 不会在人工复核目标已移出书签时静默成功", async () => {

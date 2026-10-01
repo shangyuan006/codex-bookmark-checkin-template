@@ -58,3 +58,80 @@ function Resolve-AgentRouterAccountConfig {
     }
     return $matches[0]
 }
+
+function Invoke-LinuxDoProviderSessionProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Node,
+        [Parameter(Mandatory = $true)][string]$Profile,
+        [Parameter(Mandatory = $true)][string]$DiagnosticStage
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $probeOutput = @(& $Node (Join-Path $Root 'src\oauth-provider-session.mjs') `
+            'https://agentrouter.org' 'LinuxDO' '--automation-user-data-dir' $Profile `
+            '--diagnostic-stage' $DiagnosticStage 2>$null)
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    for ($index = $probeOutput.Count - 1; $index -ge 0; $index--) {
+        try {
+            $probe = [string]$probeOutput[$index] | ConvertFrom-Json
+            if ([string]$probe.status -in @('valid', 'invalid', 'unknown', 'not_supported')) {
+                $attempts = 0
+                if (-not [int]::TryParse([string]$probe.attempts, [ref]$attempts) -or $attempts -lt 1) {
+                    $attempts = 1
+                }
+                return [pscustomobject]@{
+                    Status = [string]$probe.status
+                    Attempts = $attempts
+                    ChallengeObserved = $probe.challengeObserved -eq $true
+                    RateLimited = $probe.rateLimited -eq $true
+                }
+            }
+        }
+        catch { }
+    }
+    return [pscustomobject]@{ Status = 'unknown'; Attempts = 0; ChallengeObserved = $false; RateLimited = $false }
+}
+
+function Write-AgentRouterProviderState([string]$Path, $State) {
+    [System.IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
+    $temporary = "$Path.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporary,
+            ($State | ConvertTo-Json -Depth 4),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary -Destination $Path -Force -ErrorAction Stop
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-AgentRouterProviderProbeBackoffMinutes([int]$FailureCount, [bool]$RateLimited = $false) {
+    $boundedCount = [Math]::Max(1, [Math]::Min(5, $FailureCount))
+    $minutes = [int][Math]::Min(30, 2 * [Math]::Pow(2, $boundedCount - 1))
+    if ($RateLimited) { $minutes = [Math]::Max(10, $minutes) }
+    return $minutes
+}
+
+function Test-AgentRouterProviderProbeDue($State, [datetimeoffset]$Now = [datetimeoffset]::UtcNow) {
+    $eligibleAt = [datetimeoffset]::MinValue
+    if ($State.nextProbeAt -is [datetime]) {
+        $eligibleAt = [datetimeoffset]([datetime]$State.nextProbeAt).ToUniversalTime()
+    }
+    elseif ($State.nextProbeAt -is [datetimeoffset]) {
+        $eligibleAt = ([datetimeoffset]$State.nextProbeAt).ToUniversalTime()
+    }
+    elseif (-not [datetimeoffset]::TryParse([string]$State.nextProbeAt, [ref]$eligibleAt)) {
+        return $false
+    }
+    return $eligibleAt -le $Now
+}

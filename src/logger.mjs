@@ -6,6 +6,7 @@ import {
   redactPrivateResultText,
 } from "./security.mjs";
 import { isTerminalResult } from "./result-contract.mjs";
+import { reconcileCheckinResult } from "./checkin-evidence.mjs";
 
 export function sanitizeForPersistence(value) {
   if (typeof value === "string") return redactPrivateResultText(value);
@@ -32,10 +33,33 @@ export function summarizeResults(results) {
   );
 }
 
-function shouldPromote(current, incoming) {
-  if (!isTerminalResult(incoming)) return false;
-  if (!isTerminalResult(current)) return true;
-  return incoming.status === "signed" && current.status !== "signed";
+function completionEvidenceStrength(result, now) {
+  if (!["signed", "already_signed"].includes(result?.status)
+    || reconcileCheckinResult(result, result.evidence, now).status === "unconfirmed") return 0;
+  if (result.evidence.source === "user_rule") return result.confirmationSource === "operator_confirmation" ? 1 : 2;
+  return 3;
+}
+
+function promoteResult(current, incoming, now) {
+  if (!incoming || !isTerminalResult(incoming)) return current;
+  const incomingStrength = completionEvidenceStrength(incoming, now);
+  if (["signed", "already_signed"].includes(incoming.status) && incomingStrength === 0) return current;
+  const statusPromotion = !isTerminalResult(current)
+    || (incoming.status === "signed" && current.status !== "signed");
+  const currentStrength = completionEvidenceStrength(current, now);
+  const strongerEvidence = incomingStrength > currentStrength
+    && ["signed", "already_signed"].includes(current.status)
+    && (!currentStrength || Date.parse(incoming.evidence.confirmedAt) >= Date.parse(current.evidence.confirmedAt));
+  if (!statusPromotion && !strongerEvidence) return current;
+  const promoted = { ...current, ...incoming };
+  if (currentStrength > incomingStrength || (currentStrength && incomingStrength
+    && Date.parse(incoming.evidence.confirmedAt) < Date.parse(current.evidence.confirmedAt))) {
+    promoted.evidence = current.evidence;
+  }
+  if (current.status === "signed" && incoming.status === "already_signed") promoted.status = "signed";
+  if ((promoted.evidence?.authoritative === true || strongerEvidence) && !incoming.confirmationSource
+    && promoted.confirmationSource === "operator_confirmation") delete promoted.confirmationSource;
+  return promoted;
 }
 
 function currentBookmarkPlan(incoming) {
@@ -60,7 +84,9 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
     || runDate(incoming.runId) !== latestDate) return null;
 
   const incomingByOrigin = new Map(incoming.results
-    .filter((result) => result?.origin && isTerminalResult(result))
+    .filter((result) => result?.origin && isTerminalResult(result)
+      && (!["signed", "already_signed"].includes(result.status)
+        || completionEvidenceStrength(result, reconciledAt) > 0))
     .map((result) => [result.origin, result]));
   const bookmarkPlan = currentBookmarkPlan(incoming);
   if (bookmarkPlan) {
@@ -76,7 +102,7 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
       const current = latestByOrigin.get(origin);
       const candidate = incomingByOrigin.get(origin);
       if (!current) return candidate;
-      return candidate && shouldPromote(current, candidate) ? { ...current, ...candidate } : current;
+      return promoteResult(current, candidate, reconciledAt);
     });
     const changed = newOrigins.length > 0
       || results.some((result, index) => result !== latestByOrigin.get(bookmarkPlan.origins[index]));
@@ -115,9 +141,9 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
   let changed = false;
   const results = latest.results.map((current) => {
     const candidate = incomingByOrigin.get(current.origin);
-    if (!candidate || !shouldPromote(current, candidate)) return current;
-    changed = true;
-    return { ...current, ...candidate };
+    const promoted = promoteResult(current, candidate, reconciledAt);
+    if (promoted !== current) changed = true;
+    return promoted;
   });
   if (!changed) return null;
 

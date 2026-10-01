@@ -18,6 +18,7 @@ const indexPath = path.join(root, "src", "index.mjs");
 const manualPath = path.join(root, "scripts", "Open-ManualLogin.ps1");
 const nativeLauncherPath = path.join(root, "scripts", "Open-PlainLoginChrome.ps1");
 const turnstileExperimentPath = path.join(root, "scripts", "Test-AgentRouterLinuxDoTurnstile.ps1");
+const schedulerPath = path.join(root, "scripts", "Start-UserScheduler.ps1");
 
 function quotePowerShell(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
@@ -96,6 +97,9 @@ test("Agent Router manual login scripts track, verify, close, and resume one acc
   assert.match(open, /Wait-CheckinVisibleBrowserWindow/);
   assert.match(open, /did not expose one stable visible window/);
   assert.doesNotMatch(open, /about:blank/i);
+  assert.match(open, /trackedState/);
+  assert.match(open, /trackedProcesses/);
+  assert.match(open, /transient marker/);
   assert.match(close, /processStartedAt/);
   assert.match(close, /Get-CheckinManualSessionBrowserProcesses/);
   assert.match(close, /rebound/);
@@ -120,13 +124,15 @@ test("Agent Router manual login scripts track, verify, close, and resume one acc
 
 test("LinuxDO manual recovery uses explicit provider and Agent Router stages", async () => {
   const fs = await import("node:fs/promises");
-  const [open, close, readme] = await Promise.all([
+  const [open, close, readme, helper] = await Promise.all([
     fs.readFile(openPath, "utf8"),
     fs.readFile(closePath, "utf8"),
     fs.readFile(path.join(root, "README.md"), "utf8"),
+    fs.readFile(helperPath, "utf8"),
   ]);
   assert.match(open, /\$provider -eq 'LinuxDO'/);
-  assert.match(open, /oauth-provider-session\.mjs/);
+  assert.match(helper, /oauth-provider-session\.mjs/);
+  assert.match(open, /Invoke-LinuxDoProviderSessionProbe/);
   assert.match(open, /function Get-LinuxDoProviderSessionProbe/);
   assert.match(open, /function Write-LinuxDoProviderProbeLog/);
   assert.match(open, /function Write-LinuxDoProviderStage/);
@@ -173,6 +179,71 @@ test("LinuxDO manual recovery uses explicit provider and Agent Router stages", a
   assert.match(readme, /-ProviderOnly/);
   assert.match(readme, /-AgentRouterOnly/);
   assert.match(readme, /Test-AgentRouterLinuxDoTurnstile\.ps1/);
+});
+
+test("provider handoff distinguishes CF verification, rate limits, and confirmed login expiry", async () => {
+  for (const [probe, opensWindow, purpose] of [
+    [{ status: "unknown", attempts: 2, challengeObserved: true, rateLimited: true }, true, "verification"],
+    [{ status: "unknown", attempts: 2, rateLimited: true }, false, null],
+    [{ status: "unknown", attempts: 2 }, false, null],
+    [{ status: "invalid", attempts: 2 }, true, "login"],
+    [{ status: "valid", attempts: 1 }, false, null],
+  ]) {
+    const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "provider-handoff-"));
+    const scriptsDirectory = path.join(fixtureRoot, "scripts");
+    const sourceDirectory = path.join(fixtureRoot, "src");
+    const configDirectory = path.join(fixtureRoot, "config");
+    try {
+      for (const directory of [scriptsDirectory, sourceDirectory, configDirectory]) {
+        await fs.mkdir(directory, { recursive: true });
+      }
+      await Promise.all([
+        fs.copyFile(openPath, path.join(scriptsDirectory, "Open-AgentRouterLogin.ps1")),
+        fs.copyFile(helperPath, path.join(scriptsDirectory, "AgentRouterAccount.ps1")),
+        fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
+          `function Resolve-CheckinNode { param($Config) return ${quotePowerShell(process.execPath)} }`,
+          "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'unused.exe'; ProcessName = 'fixture-never.exe' } }",
+          "function Get-CimInstance { param($ClassName) return @() }",
+          "function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru) return [pscustomobject]@{ Id = 123 } }",
+          "function Wait-CheckinVisibleBrowserWindow { param($Config, $ProfilePath, $LaunchMarker) return [pscustomobject]@{ ProcessId = 123; ProcessStartedAt = (Get-Date).ToUniversalTime().ToString('o') } }",
+        ].join("\r\n"), "utf8"),
+        fs.writeFile(path.join(sourceDirectory, "prepare-native-browser-profile.mjs"), "process.exitCode = 0;\n", "utf8"),
+        fs.writeFile(path.join(sourceDirectory, "oauth-provider-session.mjs"),
+          `console.log(${JSON.stringify(JSON.stringify(probe))}); process.exitCode = ${probe.status === "unknown" ? 2 : 0};\n`, "utf8"),
+        fs.writeFile(path.join(configDirectory, "config.json"), JSON.stringify({ agentrouterAccounts: [{
+          origin: "https://agentrouter.org", accountKey: "linuxdo", provider: "LinuxDO",
+          automationUserDataDir: "data/fixture-provider",
+        }] }), "utf8"),
+      ]);
+      const result = spawnSync(powershellExecutable, ["-NoProfile", "-NonInteractive", "-File",
+        path.join(scriptsDirectory, "Open-AgentRouterLogin.ps1"), "-AccountKey", "linuxdo", "-ProviderOnly"],
+      { cwd: fixtureRoot, encoding: "utf8", timeout: 30_000 });
+      const statePath = path.join(fixtureRoot, "tmp", "agentrouter-manual-state.json");
+      assert.equal(await fs.access(statePath).then(() => true).catch(() => false), opensWindow);
+      if (opensWindow) {
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, new RegExp(`provider ${purpose}`));
+        const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+        assert.equal(state.stage, "provider");
+        assert.match(result.stdout, /then run with -AgentRouterOnly/);
+      } else if (probe.status === "valid") {
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /no visible provider page was opened/);
+      } else {
+        assert.notEqual(result.status, 0);
+        assert.match(`${result.stdout}\n${result.stderr}`, /indeterminate/);
+      }
+      const providerStatePath = path.join(fixtureRoot, "tmp", "agentrouter-linuxdo-provider-state.json");
+      if (probe.status === "valid") {
+        const providerState = JSON.parse(await fs.readFile(providerStatePath, "utf8"));
+        assert.equal(providerState.probeStatus, "valid");
+      } else {
+        await assert.rejects(fs.access(providerStatePath), { code: "ENOENT" });
+      }
+    } finally {
+      await fs.rm(fixtureRoot, { recursive: true, force: true });
+    }
+  }
 });
 
 test("LinuxDO Turnstile coordinate fallback is isolated behind an explicit experiment", async () => {
@@ -230,7 +301,8 @@ test("LinuxDO Agent Router stage tolerates private OAuth progress on stderr", as
       fs.writeFile(path.join(sourceDirectory, "prepare-native-browser-profile.mjs"), "process.exitCode = 0;\n", "utf8"),
       fs.writeFile(path.join(sourceDirectory, "probe-agentrouter-session.mjs"), "console.log(JSON.stringify({ action: 'resume' }));\n", "utf8"),
       fs.writeFile(path.join(sourceDirectory, "oauth-provider-session.mjs"), [
-        "process.stdout.write(JSON.stringify({ status: 'valid' }) + '\\n');",
+        "process.stdout.write(JSON.stringify({ status: 'unknown', attempts: 6 }) + '\\n');",
+        "process.exitCode = 2;",
       ].join("\n"), "utf8"),
       fs.writeFile(path.join(sourceDirectory, "oauth-login.mjs"), [
         "process.stderr.write(JSON.stringify({ oauthStage: 'target_login' }) + '\\n');",
@@ -245,8 +317,11 @@ test("LinuxDO Agent Router stage tolerates private OAuth progress on stderr", as
         }],
       }), "utf8"),
       fs.writeFile(path.join(tmpDirectory, "agentrouter-linuxdo-provider-state.json"), JSON.stringify({
+        schemaVersion: 2,
         accountKey: "linuxdo",
         profile,
+        probeStatus: "valid",
+        closedAt: new Date().toISOString(),
       }), "utf8"),
     ]);
 
@@ -257,6 +332,7 @@ test("LinuxDO Agent Router stage tolerates private OAuth progress on stderr", as
     ], { cwd: fixtureRoot, encoding: "utf8", timeout: 30_000 });
 
     assert.equal(result.status, 0, result.stderr);
+    assert.match(`${result.stdout}\n${result.stderr}`, /continuing from the fresh explicit valid provider stage/);
     assert.match(result.stdout, /Executed one Agent Router OAuth for accountKey 'linuxdo'/);
     await assert.rejects(
       fs.access(path.join(tmpDirectory, "agentrouter-linuxdo-provider-state.json")),
@@ -269,6 +345,28 @@ test("LinuxDO Agent Router stage tolerates private OAuth progress on stderr", as
   } finally {
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   }
+});
+
+test("LinuxDO restart recovery continues into OAuth after the logout boundary is established", async () => {
+  const source = await fs.readFile(openPath, "utf8");
+  const restartBlock = source.match(/if \(\$recoveryAction -eq 'restart'\) \{[\s\S]*?\n    \}/)?.[0] ?? "";
+  const oauthIndex = source.indexOf("$oauthArguments = @(");
+  const restartIndex = source.indexOf("if ($recoveryAction -eq 'restart')");
+
+  assert.ok(restartIndex >= 0);
+  assert.ok(oauthIndex > restartIndex);
+  assert.match(restartBlock, /\$recoveryAction = Get-AgentRouterRecoveryAction/);
+  assert.match(restartBlock, /\$recoveryAction -ne 'resume'/);
+  assert.doesNotMatch(source, /\$ranFullCheckin/);
+  assert.doesNotMatch(source, /if \(-not \$ranFullCheckin\)/);
+});
+
+test("LinuxDO helper reports SSO and authorization Turnstile outcomes separately", async () => {
+  const source = await fs.readFile(openPath, "utf8");
+  assert.match(source, /Experimental LinuxDO SSO Turnstile outcome/);
+  assert.match(source, /LinuxDO authorization Turnstile outcome/);
+  assert.match(source, /providerAuthorizationChallengeOutcome/);
+  assert.match(source, /providerAuthorizationChallengeClicks/);
 });
 
 test("Agent Router OAuth failure rechecks the isolated target before opening a manual window", async () => {
@@ -397,6 +495,183 @@ test("LinuxDO provider helper skips the visible page when the existing session i
       fs.access(path.join(tmpDirectory, "agentrouter-manual-state.json")),
       { code: "ENOENT" },
     );
+  } finally {
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("LinuxDO one-shot handoff continues automatically after a valid probe or native window closure", async () => {
+  for (const nativeHandoff of [false, true]) {
+    const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "linuxdo-continuation-"));
+    const scriptsDirectory = path.join(fixtureRoot, "scripts");
+    const sourceDirectory = path.join(fixtureRoot, "src");
+    const tmpDirectory = path.join(fixtureRoot, "tmp");
+    const configDirectory = path.join(fixtureRoot, "config");
+    const verifiedPath = path.join(tmpDirectory, "verified.txt");
+    const launchesPath = path.join(tmpDirectory, "launches.json");
+    try {
+      for (const directory of [scriptsDirectory, sourceDirectory, tmpDirectory, configDirectory]) {
+        await fs.mkdir(directory, { recursive: true });
+      }
+      await Promise.all([
+        fs.copyFile(openPath, path.join(scriptsDirectory, "Open-AgentRouterLogin.ps1")),
+        fs.copyFile(closePath, path.join(scriptsDirectory, "Close-AgentRouterLogin.ps1")),
+        fs.copyFile(helperPath, path.join(scriptsDirectory, "AgentRouterAccount.ps1")),
+        fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
+          `function Resolve-CheckinNode { param($Config) return ${quotePowerShell(process.execPath)} }`,
+          "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'fixture-never.exe'; ProcessName = 'fixture-never.exe' } }",
+          "function Get-CimInstance { param($ClassName) return @() }",
+          "function Get-CheckinManualSessionBrowserProcesses { param($Config, $ProfilePath, $State) return @() }",
+          "function Get-CheckinProfileBrowserProcesses { param($Config, $ProfilePath) return @() }",
+          "function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru) [System.IO.File]::WriteAllText(" + quotePowerShell(launchesPath) + ", ($ArgumentList | ConvertTo-Json)); return [pscustomobject]@{ Id = 123 } }",
+          "function Wait-CheckinVisibleBrowserWindow { param($Config, $ProfilePath, $LaunchMarker) return [pscustomobject]@{ ProcessId = 123; ProcessStartedAt = [datetime]::UtcNow.ToString('o') } }",
+        ].join("\r\n"), "utf8"),
+        fs.writeFile(path.join(sourceDirectory, "prepare-native-browser-profile.mjs"), "process.exitCode = 0;\n", "utf8"),
+        fs.writeFile(path.join(sourceDirectory, "oauth-provider-session.mjs"), [
+          "import fs from 'node:fs';",
+          `const file = ${JSON.stringify(path.join(tmpDirectory, "probe-count.txt"))};`,
+          "const count = Number(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : 0) + 1; fs.writeFileSync(file, String(count));",
+          `const blocked = ${nativeHandoff} && count === 1;`,
+          "console.log(JSON.stringify({ status: blocked ? 'unknown' : 'valid', attempts: 1, challengeObserved: blocked })); process.exitCode = blocked ? 2 : 0;",
+        ].join("\n"), "utf8"),
+        fs.writeFile(path.join(sourceDirectory, "probe-agentrouter-session.mjs"), "console.log(JSON.stringify({ action: 'resume' }));\n", "utf8"),
+        fs.writeFile(path.join(sourceDirectory, "oauth-login.mjs"), "console.log(JSON.stringify({ status: 'logged_in', oauthStage: 'completed' }));\n", "utf8"),
+        fs.writeFile(path.join(scriptsDirectory, "Run-Checkin.ps1"), [
+          "param([string]$ReauthAccountKey, [switch]$PostOAuthVerify, [int]$Attempts, [switch]$SuppressReport)",
+          "if ($ReauthAccountKey -ne 'linuxdo' -or -not $PostOAuthVerify -or $Attempts -ne 1) { exit 9 }",
+          "[System.IO.File]::WriteAllText(" + quotePowerShell(verifiedPath) + ", 'verified')",
+          "exit 0",
+        ].join("\r\n"), "utf8"),
+        fs.writeFile(path.join(configDirectory, "config.json"), JSON.stringify({ agentrouterAccounts: [{
+          origin: "https://agentrouter.org", accountKey: "linuxdo", provider: "LinuxDO",
+          automationUserDataDir: "data/fixture-provider",
+        }] }), "utf8"),
+      ]);
+      const result = spawnSync(powershellExecutable, ["-NoProfile", "-NonInteractive", "-File",
+        path.join(scriptsDirectory, "Open-AgentRouterLogin.ps1"), "-AccountKey", "linuxdo", "-ProviderOnly",
+        "-ContinueToAgentRouter"], { cwd: fixtureRoot, encoding: "utf8", timeout: 30_000 });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(await fs.readFile(verifiedPath, "utf8"), "verified");
+      assert.match(result.stdout, /Executed one Agent Router OAuth/);
+      for (const file of ["agentrouter-manual-state.json", "agentrouter-linuxdo-provider-state.json"]) {
+        await assert.rejects(fs.access(path.join(tmpDirectory, file)), { code: "ENOENT" });
+      }
+      if (nativeHandoff) {
+        assert.match(result.stdout, /recorded its verified session/);
+        const argumentsUsed = JSON.parse(await fs.readFile(launchesPath, "utf8"));
+        assert.ok(argumentsUsed.includes("https://linux.do/"));
+        assert.ok(!argumentsUsed.includes("https://agentrouter.org/login"));
+      } else {
+        await assert.rejects(fs.access(launchesPath), { code: "ENOENT" });
+      }
+    } finally {
+      await fs.rm(fixtureRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("closing LinuxDO requires valid evidence and retains indeterminate stages with backoff", async () => {
+  for (const status of ["valid", "unknown", "invalid", "not_supported"]) {
+    const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "linuxdo-close-proof-"));
+    const scriptsDirectory = path.join(fixtureRoot, "scripts");
+    const sourceDirectory = path.join(fixtureRoot, "src");
+    const tmpDirectory = path.join(fixtureRoot, "tmp");
+    const configDirectory = path.join(fixtureRoot, "config");
+    const profile = path.join(fixtureRoot, "data", "fixture-provider");
+    const continuedPath = path.join(tmpDirectory, "continued.txt");
+    try {
+      for (const directory of [scriptsDirectory, sourceDirectory, tmpDirectory, configDirectory]) {
+        await fs.mkdir(directory, { recursive: true });
+      }
+      await Promise.all([
+        fs.copyFile(closePath, path.join(scriptsDirectory, "Close-AgentRouterLogin.ps1")),
+        fs.copyFile(helperPath, path.join(scriptsDirectory, "AgentRouterAccount.ps1")),
+        fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
+          `function Resolve-CheckinNode { param($Config) return ${quotePowerShell(process.execPath)} }`,
+          "function Get-CheckinManualSessionBrowserProcesses { param($Config, $ProfilePath, $State) return @() }",
+          "function Get-CheckinProfileBrowserProcesses { param($Config, $ProfilePath) return @() }",
+        ].join("\r\n"), "utf8"),
+        fs.writeFile(path.join(scriptsDirectory, "Open-AgentRouterLogin.ps1"), [
+          "param([string]$AccountKey, [switch]$AgentRouterOnly)",
+          "if ($AccountKey -ne 'linuxdo' -or -not $AgentRouterOnly) { exit 9 }",
+          "[System.IO.File]::WriteAllText(" + quotePowerShell(continuedPath) + ", 'continued')",
+        ].join("\r\n"), "utf8"),
+        fs.writeFile(path.join(sourceDirectory, "oauth-provider-session.mjs"),
+          `console.log(JSON.stringify({ status: '${status}', attempts: 2 })); process.exitCode = ${status === "unknown" ? 2 : 0};\n`, "utf8"),
+        fs.writeFile(path.join(configDirectory, "config.json"), JSON.stringify({ agentrouterAccounts: [{
+          origin: "https://agentrouter.org", accountKey: "linuxdo", provider: "LinuxDO",
+          automationUserDataDir: "data/fixture-provider",
+        }] }), "utf8"),
+        fs.writeFile(path.join(tmpDirectory, "agentrouter-manual-state.json"), JSON.stringify({
+          accountKey: "linuxdo", profile, pid: 123, stage: "provider", continueToAgentRouter: true,
+        }), "utf8"),
+        fs.writeFile(path.join(tmpDirectory, "agentrouter-linuxdo-provider-state.json"), JSON.stringify({
+          accountKey: "linuxdo", profile, probeStatus: "valid", closedAt: new Date().toISOString(),
+        }), "utf8"),
+      ]);
+      const result = spawnSync(powershellExecutable, ["-NoProfile", "-NonInteractive", "-File",
+        path.join(scriptsDirectory, "Close-AgentRouterLogin.ps1"), "-AccountKey", "linuxdo"],
+      { cwd: fixtureRoot, encoding: "utf8", timeout: 30_000 });
+      await assert.rejects(fs.access(path.join(tmpDirectory, "agentrouter-manual-state.json")), { code: "ENOENT" });
+      if (status === "valid") {
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(await fs.readFile(continuedPath, "utf8"), "continued");
+        const stage = JSON.parse(await fs.readFile(path.join(tmpDirectory, "agentrouter-linuxdo-provider-state.json"), "utf8"));
+        assert.equal(stage.probeStatus, "valid");
+        assert.equal(stage.probeAttempts, 2);
+      } else if (status === "invalid") {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /No valid stage or Agent Router login was assumed/);
+        await assert.rejects(fs.access(continuedPath), { code: "ENOENT" });
+        await assert.rejects(fs.access(path.join(tmpDirectory, "agentrouter-linuxdo-provider-state.json")), { code: "ENOENT" });
+      } else {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /closed stage is retained/);
+        await assert.rejects(fs.access(continuedPath), { code: "ENOENT" });
+        const pending = JSON.parse(await fs.readFile(path.join(tmpDirectory, "agentrouter-linuxdo-provider-state.json"), "utf8"));
+        assert.equal(pending.stage, "provider_pending");
+        assert.equal(pending.probeStatus, status);
+        assert.equal(pending.verificationFailures, 1);
+        assert.equal(pending.continueToAgentRouter, true);
+        assert.ok(Date.parse(pending.nextProbeAt) >= Date.parse(pending.checkedAt) + 120_000);
+      }
+    } finally {
+      await fs.rm(fixtureRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("scheduler resumes closed dedicated stages but leaves active or unverifiable windows alone", async () => {
+  const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "linuxdo-closed-stage-"));
+  try {
+    const command = [
+      "$ErrorActionPreference = 'Stop'",
+      `. ${quotePowerShell(helperPath)}`,
+      `$agentRouterManualStatePath = ${quotePowerShell(path.join(fixtureRoot, "manual.json"))}`,
+      `$agentRouterProviderStagePath = ${quotePowerShell(path.join(fixtureRoot, "provider.json"))}`,
+      `$ast = [System.Management.Automation.Language.Parser]::ParseFile(${quotePowerShell(schedulerPath)}, [ref]$null, [ref]$null)`,
+      "foreach ($name in @('Get-AgentRouterOrigins', 'Get-AgentRouterManualAction')) {",
+      "    $definition = $ast.Find({ param($entry) $entry -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $entry.Name -eq $name }, $false)",
+      "    Invoke-Expression $definition.Extent.Text",
+      "}",
+      "function ConvertTo-ManualAbandonmentOrigin($Value) { return [string]$Value }",
+      "function Get-CheckinProfileBrowserProcesses { param($Config, $ProfilePath) if ($script:fixtureQueryFails) { throw 'query failed' }; if ($script:fixtureRunning) { return [pscustomobject]@{ ProcessId = 123 } }; return @() }",
+      "$handoff = [pscustomobject]@{ Mode = 'awaiting_manual_handoff'; Targets = @([pscustomobject]@{ origin = 'https://agentrouter.org'; accountKeys = @('linuxdo') }) }",
+      "$config = [pscustomobject]@{ agentrouterAccounts = @([pscustomobject]@{ origin = 'https://agentrouter.org' }) }",
+      "$actions = @()",
+      "foreach ($scenario in @('provider', 'agentrouter', 'running', 'unverifiable')) {",
+      "    $stage = if ($scenario -eq 'agentrouter') { 'agentrouter' } else { 'provider' }",
+      "    [System.IO.File]::WriteAllText($agentRouterManualStatePath, ([ordered]@{ accountKey = 'linuxdo'; profile = 'fixture'; stage = $stage } | ConvertTo-Json))",
+      "    $script:fixtureRunning = $scenario -eq 'running'",
+      "    $script:fixtureQueryFails = $scenario -eq 'unverifiable'",
+      "    $actions += [string](Get-AgentRouterManualAction $handoff $config).Action",
+      "}",
+      "ConvertTo-Json -InputObject $actions -Compress",
+    ].join("\r\n");
+    const result = spawnSync(powershellExecutable, ["-NoProfile", "-NonInteractive", "-EncodedCommand",
+      Buffer.from(command, "utf16le").toString("base64")], { cwd: root, encoding: "utf8", timeout: 30_000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()), ["provider_closed", "complete", "active", "active"]);
   } finally {
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   }
@@ -565,15 +840,41 @@ test("普通人工入口拒绝 Agent Router，避免误用非账号隔离会话"
   assert.match(nativeLauncher, /\$agentRouterOrigins -notcontains \$itemOrigin/);
 });
 
+test("调度器对 Agent Router 人工交接使用专用两阶段入口", async () => {
+  const scheduler = await fs.readFile(schedulerPath, "utf8");
+  assert.match(scheduler, /Get-AgentRouterManualAction/);
+  assert.match(scheduler, /arguments \+= @\('-ProviderOnly', '-ContinueToAgentRouter'\)/);
+  assert.doesNotMatch(scheduler, /arguments \+= @\('-ProviderOnly', '-OpenProviderWhenIndeterminate'\)/);
+  assert.match(scheduler, /AgentRouterOnly/);
+  assert.match(scheduler, /Complete-AgentRouterLogin\.ps1/);
+  assert.match(scheduler, /agentrouter-linuxdo-provider-state\.json/);
+  assert.match(scheduler, /Start-ManualHandoffActions/);
+  assert.doesNotMatch(scheduler, /Open-ManualLogin\.ps1.*Agent Router/);
+  assert.match(scheduler, /Mode -notin @\('awaiting_manual_handoff', 'verification_ready'\)/);
+  assert.match(scheduler, /无法读取进程列表，跳过 Agent Router 人工窗口启动/);
+});
+
 test("LinuxDO native session refresh is isolated, offscreen, bounded, and passive", async () => {
   const refresh = await fs.readFile(providerRefreshPath, "utf8");
   assert.match(refresh, /Resolve-AgentRouterAccountConfig/);
   assert.match(refresh, /\$account\.provider -ne 'LinuxDO'/);
   assert.match(refresh, /StartsWith\(\$dataRoot/);
-  assert.match(refresh, /https:\/\/linux\.do\//);
+  assert.match(refresh, /https:\/\/linux\.do\/login/);
+  assert.match(refresh, /\[int\]\$WaitSeconds = 12/);
   assert.match(refresh, /--window-position=-32000,-32000/);
   assert.match(refresh, /ValidateRange\(5, 30\)/);
   assert.match(refresh, /CloseMainWindow\(\)/);
   assert.doesNotMatch(refresh, /WindowStyle\s+Hidden/i);
   assert.doesNotMatch(refresh, /remote-debugging-port|native-cdp|click\(/i);
+});
+
+test("Agent Router manual stages label their LinuxDO probe diagnostics", async () => {
+  const manual = await fs.readFile(openPath, "utf8");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const automatic = await fs.readFile(path.join(root, "src", "oauth-login.mjs"), "utf8");
+  assert.match(helper, /'--diagnostic-stage' \$DiagnosticStage/);
+  assert.match(manual, /-DiagnosticStage \$diagnosticStage/);
+  assert.match(manual, /'manual_target_oauth'/);
+  assert.match(automatic, /"automatic_provider"/);
+  assert.match(automatic, /"automatic_target"/);
 });

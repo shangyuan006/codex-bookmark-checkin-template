@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  clickVisibleNativeSafeLineControl,
   matchesNativeCompletedControlText,
   nativeActionCandidateIsSafe,
   nativeChallengeFrameIsAllowed,
@@ -80,6 +81,29 @@ test("原生签到完成控件只接受明确的今日完成文本", () => {
   assert.equal(matchesNativeCompletedControlText("签到说明"), false);
 });
 
+test("原生签到会点击可见的雷池合法用户确认，并等待控件消失", async () => {
+  let visible = true;
+  const locators = new Map([
+    ["button#sl-check", {
+      count: async () => 1,
+      isVisible: async () => visible,
+      click: async () => { visible = false; },
+    }],
+    ["#sl-text", {
+      count: async () => 1,
+      isVisible: async () => true,
+      innerText: async () => "客户端异常，请确认您是合法用户",
+    }],
+  ]);
+  const page = {
+    url: () => "https://bookmark.test/attendance.php",
+    locator: selector => locators.get(selector) ?? { count: async () => 0 },
+    waitForTimeout: async () => {},
+  };
+  const result = await clickVisibleNativeSafeLineControl(page, "https://bookmark.test");
+  assert.deepEqual(result, { attempted: true, resolved: true, outcome: "safeline_resolved" });
+});
+
 test("原生预热脚本只对显式规则启用受限签到模式", async () => {
   const fs = await import("node:fs/promises");
   const source = await fs.readFile(new URL("../scripts/Prepare-NativeWafSession.ps1", import.meta.url), "utf8");
@@ -117,6 +141,9 @@ test("原生签到从实际点击后重新计算完整确认等待窗口", async
   assert.match(source, /clickVisibleNativeChallengeControl/);
   assert.match(source, /retryableChallengeOutcomes\.has\(challengeOutcome\)/);
   assert.match(source, /challenge_frame_not_stable/);
+  assert.match(source, /clickVisibleNativeSafeLineControl/);
+  assert.match(source, /safeLineAttempted/);
+  assert.match(source, /challengeOutcome = safeLine\.outcome/);
   assert.doesNotMatch(source, /Date\.now\(\) >= deadline/);
 });
 

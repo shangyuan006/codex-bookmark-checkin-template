@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { isConfirmedNotAvailable } from "../src/result-contract.mjs";
+import { verifyMissingNavigationControl } from "../src/pre-checkin-navigation.mjs";
 import {
   CHALLENGE_SELECTOR,
   assertCalendarDayCheckinLocation,
@@ -27,6 +28,7 @@ import {
   isConfiguredGrowthCheckinPage,
   isSafeDiscoveredHref,
   matchesConfiguredGrowthCompletedControlText,
+  manualChallengeHandoffResult,
   navigateConfiguredPreCheckinPage,
   processCandidate,
   processTarget,
@@ -41,6 +43,7 @@ import {
   shouldBlockManualChallengeAction,
   TargetTimeoutError,
   targetNeedsManualChallenge,
+  targetTimeoutResult,
   targetUsesCalendarDayCheckin,
   tryConfiguredNewApiCheckin,
   tryNewApiCheckin,
@@ -286,7 +289,9 @@ async function runLegacyNewApiCheckin(statuses, {
 
 test("legacy New API POST success requires a confirming status read", async () => {
   const unconfirmed = await runLegacyNewApiCheckin([false, false, false, false, false]);
-  assert.equal(unconfirmed.result, null);
+  assert.equal(unconfirmed.result.status, 'needs_attention');
+  assert.equal(unconfirmed.result.submissionAttempted, true);
+  assert.equal(unconfirmed.result.retryable, false);
   assert.equal(unconfirmed.requests.filter((request) => request.method === "POST").length, 1);
 
   const confirmed = await runLegacyNewApiCheckin([false, true]);
@@ -459,6 +464,14 @@ test("单站超时配置保留 Cloudflare 等待余量并限制错误值", () =>
   assert.equal(getTargetTimeoutMs({ targetTimeoutMs: 999_999_999 }), 600_000);
 });
 
+test("单站超时结果禁止进入自动恢复但保留人工处理资格", () => {
+  const result = targetTimeoutResult(180_000, "https://timeout.example/private?token=value");
+  assert.equal(result.status, "error");
+  assert.equal(result.failureCode, "target_timeout");
+  assert.equal(result.retryable, false);
+  assert.equal(result.url, "https://timeout.example/private?token=%5BREDACTED%5D");
+});
+
 test("签到前公告关闭规则只作用于当前书签允许来源", () => {
   const target = {
     origin: "https://bookmark.test",
@@ -606,7 +619,7 @@ test("pre-check-in navigation requires unique same-origin controls and an exact 
   ), true);
   assert.equal(currentUrl, "https://bookmark.test/profile");
 
-  for (const loginPath of ["/login", "/sign-in", "/user_log-in"]) {
+  for (const loginPath of ["/login", "/sign-in", "/user_log-in", "/login.php"]) {
     const loginPage = {
       url: () => `https://bookmark.test${loginPath}?redirect=%2Fprofile`,
       locator: () => { throw new Error("login pages must not run pre-check-in navigation"); },
@@ -681,6 +694,7 @@ test("pre-check-in terminal paths stop navigation and are treated as already sig
         steps: [{ selector: "a.check-in" }],
         expectedPath: "/check-in.php",
         terminalPaths: ["/finished.php"],
+        terminalAssumeSigned: true,
         waitMs: 1,
         afterClickWaitMs: 1,
       },
@@ -813,6 +827,46 @@ test("pre-check-in can treat a missing configured navigation control as an expli
     await navigateConfiguredPreCheckinPage(page, target, target.origin, config),
     { terminalNoAction: true },
   );
+});
+
+test("missing-entry completion requires a stable authenticated loaded home page", async () => {
+  const target = { origin: "https://bookmark.test" };
+  const config = { preCheckinNavigationRules: { [target.origin]: {
+    steps: [{ selector: "a.check-in" }], expectedPath: "/check-in.php",
+    terminalWhenNavigationControlMissing: true, terminalAssumeSigned: true,
+    terminalRequireAuthenticatedPage: true, terminalMissingControlPaths: ["/", "/index.php"], waitMs: 1,
+  } } };
+  const snapshot = { bodyText: "Homepage", loaded: true, authenticated: true,
+    hasPassword: false, challengeSelectors: false };
+  let observations = 0;
+  const page = {
+    url: () => `${target.origin}/`, evaluate: async () => { observations += 1; return snapshot; },
+    locator: () => ({ count: async () => 0 }), waitForTimeout: async () => {},
+  };
+  assert.deepEqual(await navigateConfiguredPreCheckinPage(page, target, target.origin, config), { terminalNoAction: true });
+  assert.equal(observations, 2);
+  for (const change of [
+    { loaded: false }, { authenticated: false }, { hasPassword: true },
+    { challengeSelectors: true }, { bodyText: "Just a moment" },
+    { bodyText: "请先登录" },
+  ]) {
+    const result = await verifyMissingNavigationControl({ ...page, evaluate: async () => ({ ...snapshot, ...change }) }, target, target.origin, config);
+    assert.ok(result.terminalUnconfirmed);
+    assert.equal(result.terminalNoAction, undefined);
+  }
+  const wrongPage = await verifyMissingNavigationControl({ ...page, url: () => `${target.origin}/unrelated.php` }, target, target.origin, config);
+  assert.equal(wrongPage.terminalUnconfirmed.failureCode, "terminal_home_unconfirmed");
+  const reappeared = await verifyMissingNavigationControl({ ...page,
+    locator: () => ({ count: async () => 1, nth: () => ({ isVisible: async () => true }) }) }, target, target.origin, config);
+  assert.equal(reappeared.terminalUnconfirmed.failureCode, "terminal_control_reappeared");
+  let currentUrl = `${target.origin}/`;
+  const unstable = await verifyMissingNavigationControl({ ...page, url: () => currentUrl,
+    waitForTimeout: async () => { currentUrl = `${target.origin}/index.php`; } }, target, target.origin, config);
+  assert.equal(unstable.terminalUnconfirmed.failureCode, "terminal_page_unstable");
+  assert.throws(() => getConfiguredPreCheckinNavigationRule(target, target.origin, {
+    preCheckinNavigationRules: { [target.origin]: { ...config.preCheckinNavigationRules[target.origin],
+      terminalMissingControlPaths: ["https://outside.test/"] } },
+  }), /exact home paths/);
 });
 
 test("pre-check-in navigation can explicitly click one hidden menu link", async () => {
@@ -1211,7 +1265,10 @@ test("异步签到状态完成加载后重新判定页面", async () => {
     "每日签到 正在加载签到状态... 加载中...",
     "每日签到 今日已签到",
   ]), { checkinStateWaitMs: 100, checkinStatePollMs: 5 });
-  assert.deepEqual(state, { status: "already_signed", reason: "今天已经签到" });
+  assert.equal(state.status, "already_signed");
+  assert.equal(state.reason, "今天已经签到");
+  assert.equal(state.evidence.source, "page_text");
+  assert.equal(state.evidence.authoritative, true);
 });
 
 test("异步签到状态超过有限等待时保持未确认", async () => {
@@ -1272,7 +1329,22 @@ test("验证码弹窗提交后等待完成控件异步更新", async () => {
     "每日签到 处理中",
     "每日签到 今日已签到",
   ]), { checkinStatePollMs: 5 }, 100);
-  assert.deepEqual(state, { status: "already_signed", reason: "今天已经签到" });
+  assert.equal(state.status, "already_signed");
+  assert.equal(state.reason, "今天已经签到");
+  assert.equal(state.evidence.source, "page_text");
+  assert.equal(state.evidence.authoritative, true);
+});
+
+test("page completion evidence is recorded without reward values or title-only proof", async () => {
+  const state = await waitForConfirmedCheckinState(checkinStatePage(["签到已得9876543210"]), {}, 10);
+  assert.equal(state.status, "already_signed");
+  assert.equal(state.evidence.source, "page_text");
+  assert.equal(state.evidence.outcome, "page_completion_text");
+  assert.doesNotMatch(JSON.stringify(state), /9876543210/);
+  const titleOnly = await waitForConfirmedCheckinState({ ...checkinStatePage(["Welcome"]),
+    title: async () => "今日已签到" }, {}, 10);
+  assert.equal(titleOnly.evidence, undefined);
+  assert.equal(titleOnly.status, "ready");
 });
 
 test("验证码弹窗提交后有限等待不把普通页面误报成功", async () => {
@@ -1299,6 +1371,18 @@ test("本机人工验证规则只作用于当前页面来源", () => {
   assert.equal(shouldBlockManualChallengeAction(target, "https://related.test", config, {
     unresolvedChallenge: false,
   }), false);
+  assert.deepEqual(manualChallengeHandoffResult(target, "https://related.test", config, {
+    status: "interactive_challenge",
+    reason: "需要真人验证",
+  }), {
+    status: "interactive_challenge",
+    reason: "需要真人验证",
+    failureCode: "manual_challenge_required",
+    retryable: false,
+  });
+  assert.deepEqual(manualChallengeHandoffResult(target, "https://bookmark.test", config, {
+    status: "interactive_challenge",
+  }), { status: "interactive_challenge" });
 });
 
 test("日历日期签到规则同时限定当前页面来源和精确路径", () => {

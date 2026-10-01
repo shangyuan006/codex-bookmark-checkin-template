@@ -1,4 +1,23 @@
-function Read-NativePreflightConfirmations([string]$Path, [datetimeoffset]$Now = [datetimeoffset]::Now) {
+. (Join-Path $PSScriptRoot 'CheckinCycle.ps1')
+
+function Get-NativePreflightConfirmationStatus($Inspection, [bool]$ExplicitlyConfirmed, [bool]$EndpointConfirmed) {
+    if ($ExplicitlyConfirmed) {
+        if ([string]$Inspection.status -eq 'signed') { return 'signed' }
+        if ([string]$Inspection.status -eq 'already_signed') {
+            # A completed action followed by an authoritative signed control
+            # proves this attempt completed check-in. Merely reading a prior
+            # completion, including a New API no-op, must keep already_signed.
+            if ($Inspection.actionAttempted -eq $true -and [string]$Inspection.actionOutcome -eq 'clicked') {
+                return 'signed'
+            }
+            return 'already_signed'
+        }
+    }
+    if ($EndpointConfirmed) { return 'signed' }
+    return $null
+}
+
+function Read-NativePreflightConfirmations([string]$Path, [datetimeoffset]$Now = [datetimeoffset]::Now, $Config = $null) {
     if (-not [System.IO.File]::Exists($Path)) { return }
     try { $report = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json -ErrorAction Stop }
     catch { return }
@@ -10,7 +29,9 @@ function Read-NativePreflightConfirmations([string]$Path, [datetimeoffset]$Now =
         # drops the UTC marker and fractional seconds.
         if ($timestamp -is [datetime] -or $timestamp -is [datetimeoffset]) { $observed = [datetimeoffset]$timestamp }
         elseif (-not [datetimeoffset]::TryParse([string]$timestamp, [ref]$observed)) { continue }
-        if ($observed -gt $Now -or $observed.LocalDateTime.Date -ne $Now.LocalDateTime.Date) { continue }
+        if ($Config.siteCycleRules.([string]$result.origin)) {
+            if (-not (Test-CheckinCycleCurrent $result $Config $Now $timestamp)) { continue }
+        } elseif ($observed -gt $Now -or $observed.LocalDateTime.Date -ne $Now.LocalDateTime.Date) { continue }
         # Preserve the original observation time, including legacy checkpoints.
         $result | Add-Member -NotePropertyName observedAt -NotePropertyValue $observed.ToString('o') -Force
         $result
@@ -27,14 +48,14 @@ function Complete-NativePreflightAttempt([scriptblock]$Cleanup, $Failure) {
     }
 }
 
-function Write-NativePreflightCheckpoint([string]$Path, $Results) {
+function Write-NativePreflightCheckpoint([string]$Path, $Results, $Config = $null) {
     $ErrorActionPreference = 'Stop'
     $now = (Get-Date).ToUniversalTime().ToString('o')
     foreach ($result in $Results) {
         if (-not $result.observedAt) { $result | Add-Member -NotePropertyName observedAt -NotePropertyValue $now -Force }
     }
     $merged = [ordered]@{}
-    foreach ($result in @(Read-NativePreflightConfirmations -Path $Path)) { $merged[[string]$result.origin] = $result }
+    foreach ($result in @(Read-NativePreflightConfirmations -Path $Path -Config $Config)) { $merged[[string]$result.origin] = $result }
     foreach ($result in $Results) {
         # An inconclusive retry must never replace a confirmation from today.
         if (-not $merged.Contains([string]$result.origin)) { $merged[[string]$result.origin] = $result }

@@ -134,10 +134,52 @@ function Write-ManualVerification($SessionState, $VerificationTargets) {
     Move-Item -LiteralPath $temporaryPath -Destination $verificationPath -Force
 }
 
+function Update-ManualHandoffForContinuation($SessionTargets) {
+    if (-not (Test-Path -LiteralPath $handoffPath)) { return }
+    $handoff = try { Get-Content -Raw -Encoding UTF8 -LiteralPath $handoffPath | ConvertFrom-Json } catch { $null }
+    if (-not $handoff -or [string]$handoff.state -ne 'awaiting_manual_handoff') {
+        Remove-Item -LiteralPath $handoffPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    $sessionOrigins = @{}
+    foreach ($target in @($SessionTargets)) {
+        $origin = ConvertTo-ManualAbandonmentOrigin $target.origin
+        if ($origin) { $sessionOrigins[$origin] = $true }
+    }
+    $remaining = @($handoff.targets | Where-Object {
+        $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
+        -not $origin -or -not $sessionOrigins.ContainsKey($origin)
+    })
+    if ($remaining.Count -eq 0) {
+        Remove-Item -LiteralPath $handoffPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    $handoff.targets = @($remaining)
+    if ($null -ne $handoff.PSObject.Properties['targetCount']) {
+        $handoff.targetCount = $remaining.Count
+    }
+    $temporaryPath = "$handoffPath.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryPath,
+            ($handoff | ConvertTo-Json -Depth 8),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporaryPath -Destination $handoffPath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Set-ManualAbandonmentContinuation($SessionState, $VerificationTargets) {
     $split = Resolve-ManualAbandonmentSelection $VerificationTargets
     Write-ManualAbandonment $split.Abandoned
-    Remove-Item -LiteralPath $handoffPath -Force -ErrorAction SilentlyContinue
+    Update-ManualHandoffForContinuation $VerificationTargets
     if (@($split.Remaining).Count -gt 0) {
         Write-ManualVerification $SessionState $split.Remaining
     }
@@ -216,6 +258,7 @@ if ($state -and [string]$state.mode -eq 'native') {
         }
         else {
             Write-ManualVerification $state $verificationTargets
+            Update-ManualHandoffForContinuation $verificationTargets
         }
         Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
@@ -258,6 +301,7 @@ if ($state -and [string]$state.mode -eq 'native') {
     }
     elseif ($canCreateVerification) {
         Write-ManualVerification $state $verificationTargets
+        Update-ManualHandoffForContinuation $verificationTargets
     }
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue

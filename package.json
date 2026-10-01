@@ -9,6 +9,7 @@
     "health": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Test-CheckinHealth.ps1",
     "preflight": "node src/preflight.mjs",
     "dry-run": "node src/index.mjs --dry-run",
+    "status": "node src/status-dashboard.mjs",
     "start": "node src/index.mjs"
   },
   "dependencies": {

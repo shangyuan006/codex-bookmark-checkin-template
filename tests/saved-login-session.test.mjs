@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { configuredBearerCheckinRule } from "../src/bearer-checkin.mjs";
 import {
   configuredSavedLoginSessionRule,
   verifyConfiguredSavedLoginSession,
@@ -118,12 +119,46 @@ test("New API session requires one storage ID and matching authoritative identit
     requestCount += 1;
     assert.equal(url, `${ORIGIN}/api/user/self`);
     assert.equal(options.credentials, "include");
+    assert.equal(options.signal instanceof AbortSignal, true);
     assert.equal(options.headers["New-Api-User"], "42");
     return response({ success: true, data: { id: 42 } });
   }, { local: { user: { id: 42 } } }), ORIGIN, config());
   assert.deepEqual(result, { status: "valid" });
   assert.equal(requestCount, 1);
   assert.deepEqual(Object.keys(result), ["status"]);
+});
+
+test("standalone Bearer verification never enables direct API check-in or exports the token", async () => {
+  const standalone = { savedLoginSessionRules: { [ORIGIN]: {
+    type: "bearer_refresh", refreshPath: "/api/user/auth/refresh", selfPath: "/api/user/self",
+  } } };
+  assert.equal(configuredBearerCheckinRule(ORIGIN, standalone), null);
+  const requests = [];
+  const result = await verifyConfiguredSavedLoginSession(page(async (url, options = {}) => {
+    requests.push(new URL(url).pathname);
+    assert.equal(options.signal instanceof AbortSignal, true);
+    if (new URL(url).pathname.endsWith('/refresh')) {
+      return response({ success: true, data: { ["access" + "_token"]: ["opaque", "fixture"].join('-'), token_type: "Bearer" } });
+    }
+    assert.equal(options.method, undefined);
+    return response({ success: true, data: { id: 42 } });
+  }), ORIGIN, standalone);
+  assert.deepEqual(result, { status: "valid" });
+  assert.deepEqual(requests, ["/api/user/auth/refresh", "/api/user/self"]);
+  assert.equal(configuredBearerCheckinRule(ORIGIN, standalone), null);
+  assert.throws(() => configuredSavedLoginSessionRule(ORIGIN, { savedLoginSessionRules: { [ORIGIN]: {
+    type: "bearer_refresh", refreshPath: "/refresh", selfPath: "https://other.example.test/self",
+  } } }), /same-origin/);
+  assert.throws(() => configuredSavedLoginSessionRule(ORIGIN, { savedLoginSessionRules: { [ORIGIN]: {
+    type: "bearer_refresh", selfPath: "/self",
+  } } }), /requires refreshPath and selfPath/);
+});
+
+test("a timed-out or unreadable self response is unknown, not expired login", async () => {
+  const result = await verifyConfiguredSavedLoginSession(page(async () => ({
+    ok: true, status: 200, json: async () => { throw new Error('response interrupted'); },
+  }), { local: { user: { id: 42 } } }), ORIGIN, config());
+  assert.deepEqual(result, { status: "unknown" });
 });
 
 test("New API session rejects unauthorized or conflicting identities", async () => {

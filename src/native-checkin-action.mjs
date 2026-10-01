@@ -85,6 +85,51 @@ export function matchesNativeCompletedControlText(value) {
   return /^(?:(?:今日|今天|当日|當日)\s*)?已\s*(?:签到|簽到)$/.test(normalizeText(value));
 }
 
+function isNativeSafeLinePrompt(value) {
+  return /客户端异常.*确认.*合法用户/.test(normalizeText(value));
+}
+
+// SafeLine renders a same-origin confirmation button instead of a Cloudflare
+// iframe.  Treat the button as a bounded interaction only; the caller still
+// has to read an authoritative signed/already-signed state afterwards.
+export async function clickVisibleNativeSafeLineControl(page, expectedOrigin, { waitMs = 30_000 } = {}) {
+  assertBookmarkNavigation(page.url(), [expectedOrigin]);
+  const button = page.locator("button#sl-check");
+  const description = page.locator("#sl-text");
+  if (await button.count().catch(() => 0) !== 1 || await description.count().catch(() => 0) !== 1) {
+    return { attempted: false, resolved: false, outcome: "safeline_not_found" };
+  }
+  if (!await button.isVisible().catch(() => false) || !await description.isVisible().catch(() => false)) {
+    return { attempted: false, resolved: false, outcome: "safeline_not_visible" };
+  }
+  const initialText = await description.innerText().catch(() => "");
+  if (!isNativeSafeLinePrompt(initialText)) {
+    return { attempted: false, resolved: false, outcome: "safeline_not_active" };
+  }
+
+  try {
+    await button.click({ timeout: 10_000 });
+  } catch {
+    return { attempted: true, resolved: false, outcome: "safeline_click_failed" };
+  }
+
+  const deadline = Date.now() + Math.max(1_000, Math.min(30_000, Number(waitMs) || 30_000));
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(500).catch(() => {});
+    const visible = await button.isVisible().catch(() => false);
+    const currentText = await description.innerText().catch(() => "");
+    const stillPrompt = isNativeSafeLinePrompt(currentText);
+    const explicitFailure = /失败|错误|异常/.test(normalizeText(currentText)) && !stillPrompt;
+    if (explicitFailure) {
+      return { attempted: true, resolved: false, outcome: "safeline_rejected" };
+    }
+    if (!visible || !stillPrompt) {
+      return { attempted: true, resolved: true, outcome: "safeline_resolved" };
+    }
+  }
+  return { attempted: true, resolved: false, outcome: "safeline_timeout" };
+}
+
 export async function waitForNativeCheckinAction(page, expectedOrigin, rule, {
   readState, timeoutMs, now = Date.now,
   click = clickUniqueNativeCheckinAction,

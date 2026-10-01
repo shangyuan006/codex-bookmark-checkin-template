@@ -26,6 +26,21 @@ test("拒绝复用书签允许范围之外的历史入口", () => {
   assert.deepEqual(applyPreferredCandidates(targets, state)[0].candidates, ["https://example.test/"]);
 });
 
+test("站内导航规则优先使用当前书签入口，不直达历史登录或签到页", () => {
+  const targets = [{
+    origin: "https://example.test",
+    candidates: ["https://example.test/"],
+    allowedOrigins: ["https://example.test"],
+  }];
+  const config = { preCheckinNavigationRules: { "https://example.test": {
+    steps: [{ selector: "a.check-in" }], expectedPath: "/attendance.php",
+  } } };
+  for (const preferredUrl of ["https://example.test/login.php", "https://example.test/attendance.php"]) {
+    const state = { sites: { "https://example.test": { preferredUrl } } };
+    assert.deepEqual(applyPreferredCandidates(targets, state, config)[0].candidates, ["https://example.test/"]);
+  }
+});
+
 test("累计成功、失败连续次数与平均耗时", () => {
   const first = updateSiteState({ version: 1, sites: {} }, [{
     origin: "https://example.test", status: "signed", reason: "ok", url: "https://example.test/checkin", durationMs: 1000,

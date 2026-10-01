@@ -23,7 +23,12 @@ import {
   summarizeResults,
   writeRunResult,
 } from "./logger.mjs";
-import { loginHelperOutcome, loginHelperOutcomeFromStreams, resolveLoginRecoveryUrl } from "./login-recovery.mjs";
+import {
+  loginHelperOutcome,
+  loginHelperOutcomeFromStreams,
+  resolveLoginRecoveryUrl,
+  shouldRecheckCheckinAfterLogin,
+} from "./login-recovery.mjs";
 import { runRecoveryProcess } from "./recovery-process.mjs";
 import { continueNativeCheckinAfterLogin } from "./native-login-continuation.mjs";
 import { configuredNoCheckinResult, isTerminalResult } from "./result-contract.mjs";
@@ -35,6 +40,7 @@ import {
   applyPreferredCandidates,
   loadSiteState,
   runWithRecentNotAvailableCache,
+  reuseCycleSuccess,
   updateSiteState,
   writeSiteState,
 } from "./site-state.mjs";
@@ -51,11 +57,17 @@ import {
   isResumeRetryEligible,
   nextDeferredRetryAt,
 } from "./retry-policy.mjs";
+import { checkinCycle, expireCycleResult } from './checkin-cycle.mjs';
+import { closeAutomationContext } from "./automation-context-close.mjs";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
 const execFileAsync = promisify(execFile);
 const config = JSON.parse(await fs.readFile(path.join(rootDirectory, "config", "config.json"), "utf8"));
+for (const origin of Object.keys(config.siteCycleRules ?? {})) {
+  checkinCycle(origin, config);
+  if (config.reauthCheckinRules?.[origin]) throw new Error('Custom cycles currently support ordinary sites; reauth accounts retain their existing daily recovery contract');
+}
 const qaConfig = JSON.parse(await fs.readFile(path.join(rootDirectory, "config", "qa-rules.json"), "utf8"));
 const localQaConfig = await fs.readFile(path.join(rootDirectory, "config", "qa-rules.local.json"), "utf8")
   .then(JSON.parse)
@@ -101,6 +113,28 @@ function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+let automationContextCleanupFailed = false;
+let forceExitAfterCleanupFailure = false;
+
+async function closeRunAutomationContext(context, label) {
+  const outcome = await closeAutomationContext(context, {
+    timeoutMs: 10_000,
+    fallback: context
+      ? () => execFileAsync(config.powershellExecutable || "pwsh.exe", [
+          "-NoProfile", "-NonInteractive", "-File",
+          path.join(rootDirectory, "scripts", "Close-RecoveryBrowser.ps1"),
+        ], { cwd: rootDirectory, windowsHide: true, timeout: 25_000, maxBuffer: 65_536 })
+      : null,
+  });
+  if (!outcome.closed) {
+    automationContextCleanupFailed = true;
+    forceExitAfterCleanupFailure ||= !outcome.fallbackSucceeded;
+    process.exitCode = 2;
+    console.warn(`[browser cleanup] ${label} context 未在 10 秒内正常关闭；已停止后续浏览器恢复并继续生成最终报告。`);
+  }
+  return outcome;
+}
+
 if (!dryRun && !listPreflightTargets && !reauthAccountKey) {
   const manualVerification = await fs.readFile(manualVerificationPath, "utf8")
     .then(JSON.parse)
@@ -134,7 +168,7 @@ async function readFreshNativeWafPreflight(includeHandoffs = false, attemptId = 
   const report = await fs.readFile(nativeWafPreflightPath, "utf8")
     .then((text) => JSON.parse(text))
     .catch(() => null);
-  const confirmations = freshNativePreflightResults(report, allowedOrigins);
+  const confirmations = freshNativePreflightResults(report, allowedOrigins, new Date(), config);
   if (!includeHandoffs) return confirmations;
   const handoffs = freshNativePreflightHandoffs(report, allowedOrigins, attemptId);
   return new Map([...handoffs, ...confirmations]);
@@ -172,6 +206,7 @@ try {
       if (!resolvedResume.startsWith(`${resolvedLogs}${path.sep}`)) throw new Error("续跑报告必须位于本任务 logs 目录内");
       resumeBase = JSON.parse(await fs.readFile(resolvedResume, "utf8"));
       if (!Array.isArray(resumeBase?.results)) throw new Error("续跑报告缺少站点结果");
+      resumeBase.results = resumeBase.results.map(result => expireCycleResult(result, config, new Date(), resumeBase.finishedAt));
       if (!isCurrentLocalRunId(resumeBase.runId)) throw new Error("续跑报告不是今天生成的，拒绝复用旧签到结果");
       const resumeFingerprint = String(
         resumeBase.planFingerprint ?? resumeBase.bookmarkSummary?.planFingerprint ?? "",
@@ -208,7 +243,7 @@ try {
     ];
     const results = [];
     const nativeWafPreflight = await readFreshNativeWafPreflight(true);
-    const preferredTargets = applyPreferredCandidates(plan.targets, siteState);
+    const preferredTargets = applyPreferredCandidates(plan.targets, siteState, config);
     const originFilteredTargets = selectedOrigins
       ? preferredTargets.filter((target) => selectedOrigins.has(target.origin))
       : preferredTargets;
@@ -225,6 +260,9 @@ try {
     const nativeHandoffResults = nativeResults.filter(result => result.retryable === false);
     results.push(...nativeCompletedResults);
     results.push(...nativeHandoffResults);
+    const nativeOrigins = new Set(results.map(result => result.origin));
+    results.push(...selectedTargets.filter(target => !nativeOrigins.has(target.origin)
+      && !configuredNoCheckinResult(target, config)).map(target => reuseCycleSuccess(target, siteState, config)).filter(Boolean));
     results.push(...selectedTargets.map(target => configuredNoCheckinResult(target, config)).filter(Boolean));
     const precompletedOrigins = new Set(results.map(result => result.origin));
     const selectedOriginList = selectedTargets.map((target) => target.origin);
@@ -373,7 +411,8 @@ try {
       }
       const result = await runWithRecentNotAvailableCache(target, siteState, config,
         () => processTarget(activeContext, target, config, qaRules, runLog.directory));
-      const timed = { ...result, durationMs: Date.now() - started };
+      const timed = { ...result, observedAt: result.observedAt ?? new Date().toISOString(),
+        ...(config.siteCycleRules?.[target.origin] ? {cycle:checkinCycle(target.origin,config)} : {}), durationMs: Date.now() - started };
       rememberLogicalCompletion(target, timed);
       return timed;
     };
@@ -395,14 +434,14 @@ try {
         await writeProgress("checkin");
       }
     } finally {
-      await context?.close();
+      await closeRunAutomationContext(context, "primary");
     }
 
     // Only unresolved sites enter recovery.  Login repair is attempted before
     // each isolated round, and reporting remains deferred until all rounds end.
     const recoveryRounds = Math.max(1, Math.min(3, Number(config.recoveryRounds) || 2));
     const recoveryDelays = Array.isArray(config.recoveryDelaysMs) ? config.recoveryDelaysMs : [5000, 30000];
-    for (let round = 0; round < recoveryRounds; round += 1) {
+    for (let round = 0; round < recoveryRounds && !automationContextCleanupFailed; round += 1) {
       const recoveryEntries = recoveryEntriesForResults(results, selectedTargets);
       if (recoveryEntries.length === 0) break;
       console.log(`[recovery ${round + 1}/${recoveryRounds}] 将复查 ${recoveryEntries.length} 个异常站点`);
@@ -534,14 +573,28 @@ try {
           console.log(`[recovery ${round + 1}.${recoveryIndex + 1}/${recoveryEntries.length}] ${target.origin}`);
           const loginOutcome = loginOutcomes.get(target.origin);
           const sameSessionStatus = loginOutcome?.authoritativeCheckinStatus;
-          const recoveredResult = nativeContinuations.get(target.origin) ?? (["signed", "already_signed"].includes(sameSessionStatus)
+          let recoveredResult = nativeContinuations.get(target.origin) ?? (["signed", "already_signed"].includes(sameSessionStatus)
             ? {
                 status: sameSessionStatus,
                 reason: sameSessionStatus === "signed"
                   ? "原生同会话 OAuth 后由签到接口确认今日签到完成"
                   : "原生同会话 OAuth 后由签到接口确认今日已签到",
               }
-            : await runOneTarget(recoveryContext, target));
+            : await runOneTarget(recoveryContext, target, false));
+          // Native saved-login recovery can finish before the target site's
+          // session cookie is visible to a newly-created page. Reuse this
+          // recovery context for one bounded fresh navigation before the
+          // result is deferred for a later scheduler run.
+          if (!nativeContinuations.has(target.origin)
+            && !["signed", "already_signed"].includes(sameSessionStatus)
+            && shouldRecheckCheckinAfterLogin(loginOutcome, recoveredResult)) {
+            const recheckDelayMs = Math.max(
+              250,
+              Math.min(10_000, Number(config.loginRecoveryCheckinRetryDelayMs) || 1500),
+            );
+            await wait(recheckDelayMs);
+            recoveredResult = await runOneTarget(recoveryContext, target, false);
+          }
           const priorHistory = initialResult.recovery?.history ?? [];
           results[resultIndex] = {
             origin: target.origin,
@@ -564,7 +617,7 @@ try {
           });
         }
       } finally {
-        await recoveryContext?.close();
+        await closeRunAutomationContext(recoveryContext, `recovery-${round + 1}`);
       }
     }
 
@@ -625,4 +678,5 @@ try {
   }
 } finally {
   await releaseRunLock(lockLease).catch(() => {});
+  if (forceExitAfterCleanupFailure) process.exit(process.exitCode || 2);
 }

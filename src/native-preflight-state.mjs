@@ -1,19 +1,24 @@
-function freshNativeResults(report, allowedOrigins, accept, now) {
+import { isCurrentCheckinCycle } from './checkin-cycle.mjs';
+
+function freshNativeResults(report, allowedOrigins, accept, now, config={}) {
   const current = now.getTime();
   const fresh = value => {
     const time = Date.parse(value ?? '');
     return Number.isFinite(time) && time <= current
       && new Date(time).toDateString() === now.toDateString();
   };
-  if (!fresh(report?.generatedAt)) return new Map();
+  const generated=Date.parse(report?.generatedAt??'');
+  if (!Number.isFinite(generated) || generated>current) return new Map();
   return new Map((report?.results ?? [])
     .filter(result => allowedOrigins.has(result?.origin) && accept(result)
-      && fresh(result.observedAt ?? report.generatedAt))
+      && (config.siteCycleRules?.[result.origin]
+        ? isCurrentCheckinCycle(result.origin,result.observedAt??report.generatedAt,config,now)
+        : fresh(report.generatedAt) && fresh(result.observedAt ?? report.generatedAt)))
     .map(result => [result.origin, result]));
 }
 
-export function freshNativePreflightResults(report, allowedOrigins, now = new Date()) {
-  return freshNativeResults(report, allowedOrigins, result => ['signed', 'already_signed'].includes(result.status), now);
+export function freshNativePreflightResults(report, allowedOrigins, now = new Date(), config={}) {
+  return freshNativeResults(report, allowedOrigins, result => ['signed', 'already_signed'].includes(result.status), now, config);
 }
 
 // Blockers apply only to the preflight that immediately precedes this runner.

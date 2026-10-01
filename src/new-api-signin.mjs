@@ -109,6 +109,7 @@ export function configuredNewApiSignInRule(origin, config = {}) {
     logUrl: sameOriginHttpsUrl(expectedOrigin, raw.logPath || DEFAULT_LOG_PATH, "logPath"),
     logSuccessText: requiredShortText(raw.logSuccessText, "logSuccessText"),
     rewardAmount,
+    quotaIncludesUsage: raw.quotaIncludesUsage === true,
     logType,
     userStorageKeys: configuredUserStorageKeys(raw.userStorageKeys),
     ...verificationOptions(raw),
@@ -192,6 +193,8 @@ export function classifyNewApiSignInObservation(observed, rule) {
   const sources = [];
   if (observed.rewardLogAfter === true && observed.rewardLogBefore !== true) sources.push("usage_log");
   if (amountMatches(observed.quotaDelta, rule.rewardAmount)) sources.push("self_quota_delta");
+  if (rule.quotaIncludesUsage === true && observed.responseSuccess === true
+    && observed.totalRewardMatched === true) sources.push("total_quota_with_signin_response");
   if (sources.length > 0) {
     return {
       status: "signed",
@@ -300,8 +303,12 @@ export async function tryNewApiSignIn(page, origin, config = {}) {
       }
       const returnedId = normalizeId(extractUserId(result.body));
       if (returnedId && returnedId !== userId) return { ambiguous: true, authenticated: false, quota: null };
-      const quota = Number(result.body?.data?.quota ?? result.body?.data?.user?.quota);
-      return { unauthorized: false, authenticated: true, quota: Number.isFinite(quota) ? quota : null };
+      const rawQuota = result.body?.data?.quota ?? result.body?.data?.user?.quota;
+      const rawUsedQuota = result.body?.data?.used_quota ?? result.body?.data?.user?.used_quota;
+      const quota = rawQuota == null ? NaN : Number(rawQuota);
+      const usedQuota = rawUsedQuota == null ? NaN : Number(rawUsedQuota);
+      return { unauthorized: false, authenticated: true, quota: Number.isFinite(quota) ? quota : null,
+        usedQuota: Number.isFinite(usedQuota) ? usedQuota : null };
     };
     const readQuotaPerUnit = async () => {
       const result = await fetchJson(activeRule.statusUrl, { headers: { Accept: "application/json" } });
@@ -354,6 +361,12 @@ export async function tryNewApiSignIn(page, origin, config = {}) {
     if (rewardLogBefore.unauthorized) return { state: "unauthorized" };
     if (rewardLogBefore.found) return { state: "already_confirmed" };
     const quotaPerUnit = await readQuotaPerUnit();
+    const totalMatches = after => {
+      if (!activeRule.quotaIncludesUsage || before.quota == null || after?.quota == null
+        || before.usedQuota == null || after.usedQuota == null || after.usedQuota < before.usedQuota) return false;
+      const delta = (after.quota + after.usedQuota - before.quota - before.usedQuota) / (quotaPerUnit || 1);
+      return Number.isFinite(delta) && Math.abs(delta - activeRule.rewardAmount) < 0.000001;
+    };
 
     const signIn = await fetchJson(activeRule.signInUrl, { method: "POST", headers });
     if ([401, 403].includes(signIn.status)) return { state: "unauthorized" };
@@ -367,7 +380,7 @@ export async function tryNewApiSignIn(page, origin, config = {}) {
       if (rewardLogAfter.unauthorized) return { state: "unauthorized" };
       const rawDelta = before.quota != null && after.quota != null ? after.quota - before.quota : null;
       const quotaDelta = rawDelta == null ? null : (quotaPerUnit ? rawDelta / quotaPerUnit : rawDelta);
-      if (rewardLogAfter.found || (Number.isFinite(quotaDelta)
+      if (rewardLogAfter.found || (signIn.body?.success === true && totalMatches(after)) || (Number.isFinite(quotaDelta)
         && Math.abs(quotaDelta - activeRule.rewardAmount) < 0.000001)) break;
       if (attempt < activeRule.verificationAttempts && activeRule.verificationDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, activeRule.verificationDelayMs));
@@ -382,6 +395,7 @@ export async function tryNewApiSignIn(page, origin, config = {}) {
       responseSuccess: signIn.body?.success === true,
       responseMessage: String(signIn.body?.message || "").slice(0, 200),
       quotaDelta,
+      totalRewardMatched: totalMatches(after),
       rewardLogBefore: false,
       rewardLogAfter: rewardLogAfter.found === true,
     };

@@ -51,6 +51,49 @@ function ConvertTo-ManualVerificationUtcDateTime($Value) {
     return $null
 }
 
+function Write-ManualHandoffLaunch([string]$Path, [string]$LaunchId, $Process = [System.Diagnostics.Process]::GetCurrentProcess()) {
+    if ($LaunchId -notmatch '^[a-f0-9]{32}$') { throw 'Invalid manual handoff launch identity.' }
+    $value = [ordered]@{
+        schemaVersion = 1
+        launchId = $LaunchId
+        processId = $Process.Id
+        processStartedAt = $Process.StartTime.ToUniversalTime().ToString('o')
+    }
+    [System.IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
+    $temporaryPath = "$Path.$PID.$LaunchId.tmp"
+    try {
+        [System.IO.File]::WriteAllText($temporaryPath, ($value | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ManualHandoffLaunchActive([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json
+        $expectedStart = ConvertTo-ManualVerificationUtcDateTime $value.processStartedAt
+        if ($value.schemaVersion -ne 1 -or [string]$value.launchId -notmatch '^[a-f0-9]{32}$' `
+            -or [int]$value.processId -le 0 -or $null -eq $expectedStart) { return $true }
+        $lookupErrors = @()
+        $process = Get-Process -Id ([int]$value.processId) -ErrorAction SilentlyContinue -ErrorVariable lookupErrors
+        if (-not $process) {
+            return @($lookupErrors | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' }).Count -gt 0
+        }
+        return (-not $process.HasExited) `
+            -and [Math]::Abs(($process.StartTime.ToUniversalTime() - $expectedStart).TotalSeconds) -le 2
+    }
+    catch { return $true }
+}
+
+function Remove-ManualHandoffLaunch([string]$Path, [string]$LaunchId) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json
+    if ([string]$value.launchId -eq $LaunchId) { Remove-Item -LiteralPath $Path -Force }
+}
+
 function Get-ManualVerificationShanghaiDate([datetime]$Value) {
     $utc = $Value.ToUniversalTime()
     try {
@@ -124,10 +167,21 @@ function Get-ManualHandoffTargets($Report, [datetime]$Now = (Get-Date)) {
         # or challenge handoff. The cooldown still governs unattended retries.
         if (Test-ManualVerificationHandoffResult $result) {
             $seen[$origin] = $true
-            $targets += [ordered]@{
+            $target = [ordered]@{
                 origin = $origin
                 previousStatus = [string]$result.status
             }
+            # Agent Router accountKey values are local anonymous selectors,
+            # not site identities. Preserve only unresolved nested account
+            # keys so the scheduler can select the dedicated two-stage flow.
+            $accountKeys = @($result.accountResults | Where-Object {
+                -not (Test-ManualVerificationResultTerminal $_) `
+                    -and [string]$_.accountKey -match '^[a-z0-9][a-z0-9_-]{0,63}$'
+            } | ForEach-Object { [string]$_.accountKey } | Sort-Object -Unique)
+            if ($accountKeys.Count -gt 0) {
+                $target.accountKeys = @($accountKeys)
+            }
+            $targets += $target
         }
     }
     return @($targets)

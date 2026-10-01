@@ -63,6 +63,18 @@ export function configuredSavedLoginSessionRule(origin, config = {}) {
     throw new Error("savedLoginSessionRules type must be new_api or bearer_refresh");
   }
   if (raw.type === "bearer_refresh") {
+    if (raw.refreshPath !== undefined || raw.selfPath !== undefined) {
+      if (!raw.refreshPath || !raw.selfPath) {
+        throw new Error("standalone bearer_refresh requires refreshPath and selfPath");
+      }
+      return {
+        type: "bearer_refresh",
+        sessionAdapter: {
+          refreshPath: sameOriginUrl(expectedOrigin, raw.refreshPath, "refreshPath"),
+          selfPath: sameOriginUrl(expectedOrigin, raw.selfPath, "selfPath"),
+        },
+      };
+    }
     if (!configuredBearerCheckinRule(expectedOrigin, config)) {
       throw new Error("bearer_refresh session verification requires a bearerCheckinRules entry");
     }
@@ -76,10 +88,17 @@ export function configuredSavedLoginSessionRule(origin, config = {}) {
 }
 
 export async function verifyConfiguredSavedLoginSession(page, origin, config = {}) {
-  const rule = configuredSavedLoginSessionRule(origin, config);
+  const expectedOrigin = secureOrigin(origin);
+  const rule = configuredSavedLoginSessionRule(expectedOrigin, config);
   if (!rule) return null;
   if (rule.type === "bearer_refresh") {
-    return verifyConfiguredBearerSession(page, origin, config);
+    // An explicit session-only adapter is deliberately ephemeral. Enabling
+    // login verification must not enable a direct check-in POST for this site.
+    const sessionConfig = rule.sessionAdapter ? {
+      ...config,
+      bearerCheckinRules: { ...config.bearerCheckinRules, [expectedOrigin]: rule.sessionAdapter },
+    } : config;
+    return verifyConfiguredBearerSession(page, expectedOrigin, sessionConfig);
   }
   return page.evaluate(async (activeRule) => {
     const extractUserId = (value) => value?.id
@@ -106,21 +125,26 @@ export async function verifyConfiguredSavedLoginSession(page, origin, config = {
     if (uniqueIds.length !== 1) return { status: "unknown" };
 
     const userId = uniqueIds[0];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
     let response;
     try {
       response = await fetch(activeRule.selfUrl, {
         credentials: "include",
+        signal: controller.signal,
         headers: { Accept: "application/json", "New-Api-User": userId },
       });
+      if ([401, 403].includes(response.status)) return { status: "invalid" };
+      if (!response.ok) return { status: "unknown" };
+      const body = await response.json();
+      if (!body || body.success === false) return { status: "invalid" };
+      const returnedId = normalizeId(extractUserId(body));
+      if (!returnedId || returnedId !== userId) return { status: "invalid" };
+      return { status: "valid" };
     } catch {
       return { status: "unknown" };
+    } finally {
+      clearTimeout(timeout);
     }
-    if ([401, 403].includes(response.status)) return { status: "invalid" };
-    if (!response.ok) return { status: "unknown" };
-    const body = await response.json().catch(() => null);
-    if (!body || body.success === false) return { status: "invalid" };
-    const returnedId = normalizeId(extractUserId(body));
-    if (!returnedId || returnedId !== userId) return { status: "invalid" };
-    return { status: "valid" };
   }, rule).catch(() => ({ status: "unknown" }));
 }
