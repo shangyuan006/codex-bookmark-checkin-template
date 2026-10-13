@@ -1,3 +1,5 @@
+import { sanitizeOAuthPageObservation } from './oauth-target-state.mjs';
+
 const LOGIN_HELPER_STATUSES = new Set([
   "logged_in",
   "needs_attention",
@@ -9,7 +11,8 @@ const LOGIN_HELPER_STATUSES = new Set([
   "failed",
 ]);
 
-const OAUTH_DIAGNOSTIC_STAGES = new Set([
+export const OAUTH_DIAGNOSTIC_STAGES = new Set([
+  "logout_verification",
   "target_login",
   "provider_button",
   "login_challenge",
@@ -18,6 +21,7 @@ const OAUTH_DIAGNOSTIC_STAGES = new Set([
   "linuxdo_session_challenge",
   "linuxdo_session_rate_limited",
   "linuxdo_login_challenge",
+  "linuxdo_provider_login_required",
   "provider_session",
   "github_autofill_missing",
   "github_account_selection",
@@ -58,6 +62,12 @@ const PROVIDER_AUTHORIZATION_CHALLENGE_OUTCOMES = new Set([
   "unresolved_after_click",
 ]);
 
+const PROVIDER_AUTHORIZATION_OUTCOMES = new Set([
+  'not_applicable', 'authorization_not_found', 'authorization_not_unique', 'authorization_click_failed',
+  'authorization_clicked', 'authorization_completed', 'authorization_departed', 'provider_login_required',
+  'provider_challenge_not_clickable', 'provider_challenge_unresolved',
+]);
+
 const LOGIN_ROUTE_PATTERN = /\/(?:log[-_]?in|sign[-_]?in|auth)(?:[/]|$)/i;
 const REDACTED_VALUE_PATTERN = /\[(?:VALUE|REDACTED)[^\]]*\]/i;
 
@@ -83,6 +93,38 @@ const CHECKIN_RECHECKABLE_STATUSES = new Set([
   "no_action",
   "deferred",
 ]);
+
+const MANUAL_LOGIN_OUTCOMES = new Set([
+  "needs_attention", "no_saved_credential", "credential_missing", "invalid_credential", "unsupported",
+]);
+
+export function loginRecoveryRequiresManualHandoff(attempts) {
+  if (!Array.isArray(attempts) || attempts.length === 0
+    || attempts.some(attempt => attempt?.succeeded === true || attempt?.status === "logged_in")) return false;
+  // A failed automated autofill probe alone is inconclusive. A native probe
+  // that also finds no usable form or saved login confirms that this fallback
+  // cannot restore the session. Other failures and timeouts remain retryable.
+  const nativeFallbackUnavailable = attempts.some(attempt => attempt?.method === "native_saved_password"
+    && ["unsupported", "no_saved_credential"].includes(attempt.status));
+  return attempts.every(attempt => CHECKIN_AFTER_LOGIN_METHODS.has(attempt?.method)
+    && (MANUAL_LOGIN_OUTCOMES.has(attempt.status)
+      || (attempt.method === "saved_password" && attempt.status === "failed" && nativeFallbackUnavailable)));
+}
+
+export function applyLoginRecoveryHandoff(result, loginOutcome) {
+  // Always recheck the page after the helpers: their failure must not override
+  // a restored session, a check-in result, or a transient navigation error.
+  if (result?.status !== "login_required" || loginOutcome?.succeeded
+    || !loginRecoveryRequiresManualHandoff(loginOutcome?.attempts)) return result;
+  const { nextEligibleAt: _nextEligibleAt, ...preserved } = result;
+  return {
+    ...preserved,
+    status: "needs_attention",
+    failureCode: "login_recovery_requires_manual",
+    retryable: false,
+    reason: "页面仍要求登录，现有自动恢复方法无可用登录路径；需人工登录，不再重复自动恢复",
+  };
+}
 
 /**
  * A successful login helper only proves that a session was restored. A site
@@ -138,12 +180,15 @@ export function loginHelperOutcome(text, fallback = "failed") {
     succeeded: status === "logged_in",
     status,
     diagnostic: messages[status] ?? messages.failed,
+    ...sanitizeOAuthPageObservation(value),
     ...(["signed", "already_signed"].includes(String(value?.checkinStatus))
       ? { checkinStatus: String(value.checkinStatus) }
       : {}),
     ...(OAUTH_DIAGNOSTIC_STAGES.has(String(value?.oauthStage))
       ? { oauthStage: String(value.oauthStage) }
       : {}),
+    ...(PROVIDER_AUTHORIZATION_OUTCOMES.has(value?.authorizationOutcome)
+      ? {authorizationOutcome:value.authorizationOutcome} : {}),
     ...(LOGIN_DIAGNOSTIC_STAGES.has(String(value?.loginStage))
       ? { loginStage: String(value.loginStage) }
       : {}),
@@ -165,8 +210,12 @@ export function loginHelperOutcomeFromStreams(stdout, stderr = "", fallback = "f
   if (stdoutResult) {
     return {
       ...primary,
+      ...Object.fromEntries(Object.entries(sanitizeOAuthPageObservation(diagnostic))
+        .filter(([key]) => primary[key] == null)),
       ...(!primary.oauthStage && diagnostic.oauthStage ? { oauthStage: diagnostic.oauthStage } : {}),
       ...(!primary.loginStage && diagnostic.loginStage ? { loginStage: diagnostic.loginStage } : {}),
+      ...(!primary.authorizationOutcome && diagnostic.authorizationOutcome
+        ? {authorizationOutcome:diagnostic.authorizationOutcome} : {}),
       ...(!primary.providerAuthorizationChallengeOutcome && diagnostic.providerAuthorizationChallengeOutcome
         ? { providerAuthorizationChallengeOutcome: diagnostic.providerAuthorizationChallengeOutcome }
         : {}),

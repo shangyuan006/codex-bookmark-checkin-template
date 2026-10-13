@@ -8,7 +8,8 @@ export function reauthRecoveryAction(previous, now = new Date()) {
   if (previous?.date !== date || !Number.isFinite(updatedAt.getTime())
     || updatedAt > now || localRunDate(updatedAt) !== date) return "restart";
   if (previous.status === "completed") return "complete";
-  if (previous.status === "logged_out" && previous.loginEvidenceReset === true) return "resume";
+  if (previous.status === "logged_out" && previous.loginEvidenceReset === true
+    && previous.logoutConfirmed !== false) return "resume";
   return "restart";
 }
 

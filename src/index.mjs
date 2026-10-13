@@ -24,6 +24,7 @@ import {
   writeRunResult,
 } from "./logger.mjs";
 import {
+  applyLoginRecoveryHandoff,
   loginHelperOutcome,
   loginHelperOutcomeFromStreams,
   resolveLoginRecoveryUrl,
@@ -58,12 +59,15 @@ import {
   nextDeferredRetryAt,
 } from "./retry-policy.mjs";
 import { checkinCycle, expireCycleResult } from './checkin-cycle.mjs';
-import { closeAutomationContext } from "./automation-context-close.mjs";
+import { closeAutomationContext, automationCleanupAllowsRecovery } from "./automation-context-close.mjs";
+import { normalizeBoundEvidenceResult } from './checkin-evidence.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
 const execFileAsync = promisify(execFile);
 const config = JSON.parse(await fs.readFile(path.join(rootDirectory, "config", "config.json"), "utf8"));
+// Runtime-only path: never copy a private journal into public configuration.
+config.submissionJournalPath = path.join(rootDirectory,'data','submission-journal.json');
 for (const origin of Object.keys(config.siteCycleRules ?? {})) {
   checkinCycle(origin, config);
   if (config.reauthCheckinRules?.[origin]) throw new Error('Custom cycles currently support ordinary sites; reauth accounts retain their existing daily recovery contract');
@@ -115,6 +119,7 @@ function wait(delayMs) {
 
 let automationContextCleanupFailed = false;
 let forceExitAfterCleanupFailure = false;
+const browserCleanup = [];
 
 async function closeRunAutomationContext(context, label) {
   const outcome = await closeAutomationContext(context, {
@@ -126,11 +131,15 @@ async function closeRunAutomationContext(context, label) {
         ], { cwd: rootDirectory, windowsHide: true, timeout: 25_000, maxBuffer: 65_536 })
       : null,
   });
-  if (!outcome.closed) {
+  const recoveryAllowed = automationCleanupAllowsRecovery(outcome);
+  browserCleanup.push({ phase: label, ...outcome, recoveryAllowed });
+  if (!recoveryAllowed) {
     automationContextCleanupFailed = true;
     forceExitAfterCleanupFailure ||= !outcome.fallbackSucceeded;
     process.exitCode = 2;
     console.warn(`[browser cleanup] ${label} context 未在 10 秒内正常关闭；已停止后续浏览器恢复并继续生成最终报告。`);
+  } else if (!outcome.closed) {
+    console.warn(`[browser cleanup] ${label} context 关闭未完成；备用流程已确认项目浏览器退出，可以继续恢复。`);
   }
   return outcome;
 }
@@ -153,7 +162,9 @@ if (!dryRun && !listPreflightTargets && !reauthAccountKey) {
 
 async function readValidatedBookmarkPlan() {
   const plan = await readEffectiveBookmarkPlan(config.bookmarksPath, config, lastValidBookmarkPlanPath);
-  plan.planFingerprint = buildCurrentPlan(plan, config).planFingerprint;
+  const metadata = buildCurrentPlan(plan, config);
+  plan.planFingerprint = metadata.planFingerprint;
+  plan.targetPlanFingerprints = metadata.targetPlanFingerprints;
   await atomicWriteJson(lastValidBookmarkPlanPath, publicBookmarkReport(plan));
   return plan;
 }
@@ -318,6 +329,7 @@ try {
         selectedProcessedTotal: completedSelectedResults.length,
         selectedResults: selectedProgressResults(),
         updatedAt: new Date().toISOString(),
+        browserCleanup: [...browserCleanup],
         ...details,
         results: progressResults,
       }));
@@ -595,6 +607,7 @@ try {
             await wait(recheckDelayMs);
             recoveredResult = await runOneTarget(recoveryContext, target, false);
           }
+          recoveredResult = applyLoginRecoveryHandoff(recoveredResult, loginOutcome);
           const priorHistory = initialResult.recovery?.history ?? [];
           results[resultIndex] = {
             origin: target.origin,
@@ -630,7 +643,7 @@ try {
       : results;
     const currentOrigins = new Set(results.map((result) => result.origin));
     const finalResults = advanceAttemptedDeferredRetries(
-      assembledResults.map((result) => currentOrigins.has(result.origin) ? deferUnresolvedLogin(result, config, finishedAt) : result),
+      assembledResults.map((result) => normalizeBoundEvidenceResult(currentOrigins.has(result.origin) ? deferUnresolvedLogin(result, config, finishedAt) : result,config,finishedAt)),
       currentOrigins,
       resumeBase?.results,
       config,
@@ -660,6 +673,7 @@ try {
       bookmarkSummary: report,
       summary,
       nextRetryAt: nextDeferredRetryAt(finalResults, finishedAt),
+      browserCleanup: [...browserCleanup],
       results: finalResults,
     };
     const minimumTargets = Math.max(1, Number(config.minimumBookmarkTargetCount) || 1);

@@ -200,6 +200,39 @@ if (-not (Test-Path -LiteralPath $statePath)) {
 }
 
 $state = try { Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json } catch { $null }
+if ($state -and [string]$state.mode -eq 'live_checkin') {
+    . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+    $livePid = 0
+    if (-not [int]::TryParse([string]$state.pid, [ref]$livePid) -or $livePid -le 0 `
+        -or [string]$state.sessionId -notmatch '^[a-f0-9]{32}$') { throw '同页会话身份无效，保留状态。' }
+    $liveProcess = Get-Process -Id $livePid -ErrorAction SilentlyContinue
+    if ($liveProcess -and ($liveProcess.ProcessName -ne 'node' -or -not (Test-CheckinProcessStartIdentity `
+        -Process $liveProcess -RecordedStart (ConvertTo-CheckinUtcDateTime $state.processStartedAt) -ToleranceSeconds 2))) {
+        throw '同页会话进程身份不匹配，拒绝关闭。'
+    }
+    $verificationTargets = @(Get-ManualVerificationTargets $state)
+    if ($Abandon) { $null = Set-ManualAbandonmentContinuation $state $verificationTargets }
+    if ($liveProcess) {
+        [System.IO.File]::WriteAllText($signalPath, (@{
+            sessionId = [string]$state.sessionId; command = 'close'
+        } | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+        if (-not $liveProcess.WaitForExit(20000)) {
+            throw '同页窗口尚未完成关闭；保留会话记录，请稍后复核，勿重复启动。'
+        }
+    }
+    if (Test-Path -LiteralPath $statePath) {
+        $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+        if (@(Get-CheckinAutomationBrowserProcesses $config).Count -gt 0) {
+            throw '同页辅助进程已退出，但项目浏览器仍存在；保留状态以防重复打开。'
+        }
+        if (-not $Abandon -and $verificationTargets.Count -gt 0) { Write-ManualVerification $state $verificationTargets }
+        Remove-Item -LiteralPath $statePath -Force
+    }
+    Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
+    if ($Abandon) { Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue }
+    Write-Output '同页窗口已关闭；关闭动作不作为签到成功证据。'
+    return
+}
 if ($state -and [string]$state.mode -eq 'native') {
     . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
     $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json

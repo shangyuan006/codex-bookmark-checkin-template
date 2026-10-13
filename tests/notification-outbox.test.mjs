@@ -48,6 +48,7 @@ async function enqueue(outboxPath, configPath, report, preview = false) {
       fs.copyFile(reporter, fixtureReporter),
       fs.copyFile(abandonmentHelper, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
       fs.copyFile(resultContractHelper, path.join(scriptsDirectory, "ResultContract.ps1")),
+      fs.copyFile(path.join(root,"scripts/CheckinContract.generated.ps1"), path.join(scriptsDirectory,"CheckinContract.generated.ps1")),
     ]);
     await fs.writeFile(reportPath, JSON.stringify(report), "utf8");
     return JSON.parse(await runPowerShell(fixtureReporter, [

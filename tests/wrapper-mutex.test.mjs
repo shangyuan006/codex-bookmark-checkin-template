@@ -11,7 +11,7 @@ import { powershellExecutable } from "./helpers/powershell.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const dependencies = ["Run-Checkin", "Resolve-Runtime", "RunLock", "ManualVerification", "ResultContract",
+const dependencies = ["CheckinContract.generated", "Run-Checkin", "Resolve-Runtime", "RunLock", "ManualVerification", "ResultContract",
   "ManualAbandonment", "NativeFallbackPolicy", "PreflightScope", "CheckinCycle", "TaskRetryPolicy", "TaskRuntimeBudget"];
 
 test("第二个 wrapper 在命名互斥被占用时快速退出且不启动签到", async () => {

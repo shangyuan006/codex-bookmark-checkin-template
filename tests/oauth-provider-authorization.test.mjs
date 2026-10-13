@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   authorizeConfiguredOAuthProvider,
+  configuredLinuxDoAuthorizationPhase,
   configuredProviderAuthorizationOrigin,
   describeConfiguredAuthorizationSurface,
   isConfiguredProviderAuthorizationPage,
@@ -200,6 +201,31 @@ test("LinuxDO OAuth selects one allow action and rejects deny or ambiguity", asy
     outcome: "not_applicable",
   });
   assert.equal(wrongOrigin.clicks(), 0);
+});
+
+test("LinuxDO approval challenges remain in the authorization flow without resubmitting consent", async () => {
+  const approval = "https://connect.linux.do/oauth2/approve/fixture-request";
+  const withUserInfo = new URL(approval);
+  withUserInfo.username = "fixture";
+  assert.equal(configuredLinuxDoAuthorizationPhase(approval, "Linux DO"), "approval");
+  assert.equal(configuredLinuxDoAuthorizationPhase("https://connect.linux.do/oauth2/authorize", "LinuxDO"), "authorization");
+  assert.equal(isConfiguredProviderAuthorizationPage(approval, "LinuxDO"), true);
+  assert.equal(configuredProviderAuthorizationOrigin(approval, "LinuxDO"), "https://connect.linux.do");
+  for (const invalid of ["http://connect.linux.do/oauth2/approve/fixture-request",
+    "https://connect.linux.do.evil.example/oauth2/approve/fixture-request",
+    "https://connect.linux.do:8443/oauth2/approve/fixture-request",
+    withUserInfo.href,
+    "https://connect.linux.do/oauth2/approve/", "https://connect.linux.do/oauth2/approve/a/b",
+    "https://connect.linux.do/oauth2/token/fixture-request"]) {
+    assert.equal(isConfiguredProviderAuthorizationPage(invalid, "LinuxDO"), false);
+  }
+  assert.equal(isConfiguredProviderAuthorizationPage(approval, "GitHub"), false);
+  const submitted = page(approval, 1, ["允许"], { "允许": 1 });
+  assert.equal((await authorizeConfiguredOAuthProvider(submitted, "LinuxDO")).clicked, false);
+  assert.equal(submitted.clicks(), 0);
+  assert.deepEqual(await describeConfiguredAuthorizationSurface(submitted, "LinuxDO"), {
+    topControlCount: 1, sameOriginFrameCount: 0, sameOriginControlCount: 0, challengeFrameCount: 0,
+  });
 });
 
 test("GitHub OAuth clicks only one explicit authorize submit control", async () => {

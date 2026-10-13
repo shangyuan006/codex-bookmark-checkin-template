@@ -30,6 +30,7 @@ async function previewReport(report, runnerStatus = "completed", abandonedOrigin
       fs.copyFile(reporter, fixtureReporter),
       fs.copyFile(abandonmentHelper, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
       fs.copyFile(resultContractHelper, path.join(scriptsDirectory, "ResultContract.ps1")),
+      fs.copyFile(path.join(root,"scripts/CheckinContract.generated.ps1"), path.join(scriptsDirectory,"CheckinContract.generated.ps1")),
     ]);
     await fs.writeFile(path.join(configDirectory, "defaults.json"), JSON.stringify({ notification: { mode: "none" } }), "utf8");
     if (abandonedOrigins.length > 0) {

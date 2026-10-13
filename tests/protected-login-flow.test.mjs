@@ -224,6 +224,26 @@ test("OAuth login challenge permits one delayed retry only when explicitly confi
   assert.equal(clicked, 2);
 });
 
+test("LinuxDO authorization and submitted approval have separate bounded challenge budgets", async () => {
+  let current = "https://connect.linux.do/oauth2/authorize";
+  let clicks = 0;
+  const page = {
+    url: () => current,
+    getByRole: () => ({ count: async () => 1, isVisible: async () => true, click: async () => { clicks += 1; } }),
+  };
+  const config = { autoClickTurnstileOrigins: ["https://connect.linux.do"] };
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://connect.linux.do", config), true);
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://connect.linux.do", config), false);
+  current = "https://connect.linux.do/oauth2/approve/fixture-request";
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://connect.linux.do", config), true);
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://connect.linux.do", config), false);
+  current = "https://connect.linux.do/oauth2/authorize";
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://connect.linux.do", config), false);
+  current = "https://connect.linux.do/oauth2/approve/another-fixture-request";
+  assert.equal(await clickConfiguredLoginChallengeControl(page, "https://connect.linux.do", config), false);
+  assert.equal(clicks, 2);
+});
+
 test("OAuth login challenge fails closed when multiple Cloudflare frames are visible", async () => {
   let clicked = 0;
   const frameUrl = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2";

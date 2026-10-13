@@ -1,7 +1,7 @@
 import { successEvidence, reconcileCheckinResult } from './checkin-evidence.mjs';
 import { runCheckinAdapter } from './checkin-adapters.mjs';
 
-export async function runNewApiCheckinInBrowser() {
+export async function runNewApiCheckinInBrowser({readOnly=false}={}) {
     const normalizeUserId = (value) => {
       const text = String(value ?? "").trim();
       return /^\d{1,20}$/.test(text) ? text : null;
@@ -125,6 +125,7 @@ export async function runNewApiCheckinInBrowser() {
     );
     if (checked === true) return { status: "already_signed", reason: "签到接口显示今日已签到" };
     if (checked !== false) return null;
+    if (readOnly) return {status:"not_signed",reason:"签到状态接口明确显示今日未签到",dailyUnsigned:true};
 
     let checkinResponse;
     const unconfirmedSubmission = () => ({status:'needs_attention',reason:'签到请求已提交，但未获得完成证据，停止重复提交',submissionAttempted:true,retryable:false});
@@ -174,11 +175,11 @@ export async function runNewApiCheckinInBrowser() {
     return unconfirmedSubmission();
 }
 
-export async function tryNewApiCheckin(page) {
+export async function tryNewApiCheckin(page, {readOnly=false}={}) {
   const outcome = await runCheckinAdapter({
     id:'new_api_browser',
     detect:async()=>({supported:true}),
-    execute:async()=>({result:await page.evaluate(runNewApiCheckinInBrowser)}),
+    execute:async()=>({result:await page.evaluate(runNewApiCheckinInBrowser,{readOnly})}),
     verify:async({result})=>{
       if (!['signed','already_signed'].includes(result?.status)) return result;
       return reconcileCheckinResult(result, successEvidence(/页面签到控件/.test(result.reason)?'page_text':'status_endpoint','checked_in_today'));

@@ -72,6 +72,23 @@ test("原生浏览器调试端口冷启动时会重试直到连接成功", async
   assert.deepEqual(new Set(endpoints), new Set(["http://127.0.0.1:12345"]));
 });
 
+test('raw CDP never replays a mutating expression after a lost reply',async()=>{
+  let sends=0;
+  class BrokenSocket {
+    listeners=new Map();
+    constructor(){queueMicrotask(()=>this.listeners.get('open')?.({}));}
+    addEventListener(type,callback){this.listeners.set(type,callback);}
+    send(){sends++;queueMicrotask(()=>this.listeners.get('close')?.({}));}
+    close(){}
+  }
+  await assert.rejects(evaluateOverRawCdp(12345,'https://target.test','performAction()',{
+    timeoutMs:100,retryDelayMs:1,WebSocketImpl:BrokenSocket,fetchImpl:async()=>({ok:true,json:async()=>[
+      {type:'page',url:'https://target.test/profile',webSocketDebuggerUrl:'ws://127.0.0.1:12345/page'}],
+    }),
+  }),/禁止重新发送/);
+  assert.equal(sends,1);
+});
+
 test("原生浏览器调试连接拒绝无效端口和连接器", async () => {
   await assert.rejects(() => connectOverCdpWithRetry({ connectOverCDP() {} }, 0), /参数无效/);
   await assert.rejects(() => connectOverCdpWithRetry({ connectOverCDP() {} }, 65536), /参数无效/);

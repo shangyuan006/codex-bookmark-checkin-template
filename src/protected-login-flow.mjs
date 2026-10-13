@@ -1,4 +1,5 @@
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
+import { configuredLinuxDoAuthorizationPhase } from "./oauth-provider-authorization.mjs";
 
 const challengeClickState = new WeakMap();
 
@@ -71,15 +72,21 @@ export async function clickConfiguredLoginChallengeControl(page, origin, config 
     ? Math.max(1, Math.min(configuredTimeoutMs, Number(timeoutMs)))
     : configuredTimeoutMs;
   const rule = loginChallengeRule(config, expectedOrigin);
-  const previous = challengeClickState.get(page) ?? { clicks: 0, clickedAt: 0 };
+  // Connect can challenge both the consent page and the submitted approval
+  // request. Give each phase its own bounded budget, without keying on or
+  // retaining the private approval request identifier.
+  const phase = configuredLinuxDoAuthorizationPhase(page.url(), "LinuxDO") ?? "login";
+  const phases = challengeClickState.get(page) ?? new Map();
+  const previous = phases.get(phase) ?? { clicks: 0, clickedAt: 0 };
   if (previous.clicks >= rule.maxClicks
     || (previous.clickedAt > 0 && Date.now() - previous.clickedAt < rule.retryDelayMs)) return false;
   const clicked = await clickKnownChallengeControl(page, clickTimeoutMs, expectedOrigin, rule);
   if (clicked) {
-    challengeClickState.set(page, {
+    phases.set(phase, {
       clicks: previous.clicks + 1,
       clickedAt: Date.now(),
     });
+    challengeClickState.set(page, phases);
   }
   return clicked;
 }

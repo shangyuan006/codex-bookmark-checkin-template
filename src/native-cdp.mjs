@@ -84,6 +84,7 @@ export async function evaluateOverRawCdp(port, expectedOrigin, expression, optio
   const retryDelayMs = positiveInteger(options.retryDelayMs, 500, 5000);
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
+  let evaluationStarted = false;
   do {
     try {
       const response = await fetchImpl(`http://127.0.0.1:${port}/json/list`, {
@@ -92,6 +93,7 @@ export async function evaluateOverRawCdp(port, expectedOrigin, expression, optio
       if (!response?.ok) throw new Error("raw CDP target list unavailable");
       const target = selectNewestRawCdpTarget(await response.json(), expectedOrigin, port);
       if (!target) throw new Error("raw CDP target origin not found");
+      evaluationStarted = true;
       return await evaluateRawCdpSocket(
         target.webSocketDebuggerUrl,
         expression,
@@ -100,6 +102,9 @@ export async function evaluateOverRawCdp(port, expectedOrigin, expression, optio
       );
     } catch (error) {
       lastError = error;
+      if (evaluationStarted && options.readOnly !== true) {
+        throw new Error('原生执行结果不确定，禁止重新发送可能提交的表达式', {cause:error});
+      }
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
       await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelayMs, remaining)));

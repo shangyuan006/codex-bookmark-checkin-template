@@ -1,3 +1,14 @@
+export function configuredLinuxDoAuthorizationPhase(rawUrl, provider) {
+  if (String(provider).trim().toLowerCase().replace(/\s+/g, "") !== "linuxdo") return null;
+  try {
+    const url = new URL(rawUrl);
+    if (url.origin !== "https://connect.linux.do" || url.username || url.password) return null;
+    if (/^\/oauth2\/authorize\/?$/i.test(url.pathname)) return "authorization";
+    if (/^\/oauth2\/approve\/[a-z0-9_-]{1,256}\/?$/i.test(url.pathname)) return "approval";
+  } catch { /* Not an official authorization surface. */ }
+  return null;
+}
+
 function configuredProviderAuthorizationKind(rawUrl, provider) {
   const normalizedProvider = String(provider).trim().toLowerCase().replace(/\s+/g, "");
   try {
@@ -5,9 +16,7 @@ function configuredProviderAuthorizationKind(rawUrl, provider) {
     if (normalizedProvider === "github" && url.protocol === "https:"
       && url.hostname === "github.com"
       && /^\/login\/oauth\/authorize\/?$/i.test(url.pathname)) return "github";
-    if (normalizedProvider === "linuxdo" && url.protocol === "https:"
-      && url.hostname === "connect.linux.do"
-      && /^\/oauth2\/authorize\/?$/i.test(url.pathname)) return "linuxdo";
+    if (configuredLinuxDoAuthorizationPhase(rawUrl, provider)) return "linuxdo";
     return null;
   } catch {
     return null;
@@ -181,6 +190,11 @@ export async function authorizeConfiguredOAuthProvider(page, provider) {
     return { applicable: false, clicked: false, outcome: "not_applicable" };
   }
   if (kind === "linuxdo") {
+    // The approval request has already been submitted. Its WAF challenge is
+    // still part of authorization, but must never resubmit a consent control.
+    if (configuredLinuxDoAuthorizationPhase(page.url(), provider) === "approval") {
+      return { applicable: true, clicked: false, outcome: "authorization_not_found" };
+    }
     const matches = [];
     for (const scope of linuxDoAuthorizationScopes(page)) {
       const match = await findLinuxDoAuthorizationControl(scope);

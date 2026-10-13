@@ -1,5 +1,6 @@
 import { normalizeText } from "./detector.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
+import { beforePageSubmission } from './submission-guard.mjs';
 
 const ACTION_SELECTOR = 'button, a, [role="button"], input[type="button"], input[type="submit"]';
 
@@ -37,6 +38,13 @@ export function normalizeNativeCheckinActionRule(raw) {
   const dismissButtonTexts = normalizedStringArray(raw.dismissButtonTexts, "dismissButtonTexts", 10);
   const dismissSelectors = normalizedStringArray(raw.dismissSelectors, "dismissSelectors", 10);
   if (actionTexts.length === 0) throw new Error("native check-in action rule requires actionTexts");
+  let dailyUnsignedTextPattern;
+  if (raw.dailyUnsignedTextPattern != null) {
+    if (typeof raw.dailyUnsignedTextPattern !== "string" || !raw.dailyUnsignedTextPattern.trim()
+      || raw.dailyUnsignedTextPattern.length > 300) throw new Error("daily unsigned pattern must be bounded and non-empty");
+    dailyUnsignedTextPattern = raw.dailyUnsignedTextPattern;
+    if (new RegExp(dailyUnsignedTextPattern, "iu").test("")) throw new Error("daily unsigned pattern must not match empty text");
+  }
   return {
     actionTexts,
     dismissButtonTexts,
@@ -45,6 +53,7 @@ export function normalizeNativeCheckinActionRule(raw) {
     dismissWaitMs: Math.max(250, Math.min(10_000, Number(raw.dismissWaitMs) || 3000)),
     clickChallenge: raw.clickChallenge === true,
     challengeFrameStableMs: Math.max(3000, Math.min(5000, Number(raw.challengeFrameStableMs) || 4000)),
+    ...(dailyUnsignedTextPattern ? { dailyUnsignedTextPattern } : {}),
   };
 }
 
@@ -257,6 +266,7 @@ export async function clickUniqueNativeCheckinAction(page, expectedOrigin, rawRu
   if (candidates.length !== 1) {
     return { clicked: false, outcome: candidates.length === 0 ? "action_not_found" : "action_not_unique" };
   }
+  await beforePageSubmission(page);
   await page.locator(ACTION_SELECTOR).nth(candidates[0].index).click({ timeout: 10_000 });
   assertBookmarkNavigation(page.url(), [expectedOrigin]);
   return { clicked: true, outcome: "clicked" };

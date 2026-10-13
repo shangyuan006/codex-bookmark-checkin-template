@@ -93,6 +93,8 @@ export function buildCurrentPlan(plan, config = {}) {
     accountGroupCount: accountGroups.length,
     accountIdentityCount: accountGroups.reduce((count, group) => count + group.identities.length, 0),
     accountGroups,
+    targetPlanFingerprints: Object.fromEntries(targets.map(target => [target.origin,
+      computePlanFingerprint({ targets: [target] }, accountGroups.filter(group => group.origin === target.origin))])),
   };
   result.planFingerprint = computePlanFingerprint(plan, accountGroups);
   return result;

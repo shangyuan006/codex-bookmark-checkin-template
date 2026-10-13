@@ -271,6 +271,9 @@ function Get-AgentRouterManualAction($ManualHandoff, $Config) {
             $stageAccount = Resolve-AgentRouterAccountConfig -Accounts @($Config.agentrouterAccounts) `
                 -AccountKey $stageKey -Origin ([string]$stageTarget.origin)
             if ([string]$stageAccount.provider -ne 'LinuxDO') { return $null }
+            if ((Test-TargetFirstAgentRouterOAuth $stageAccount) -and [string]$stage.stage -ne 'agentrouter') {
+                return [pscustomobject]@{ Action = 'agentrouter'; AccountKey = $stageKey; Target = $stageTarget }
+            }
             if ([string]$stage.stage -eq 'provider_pending') {
                 if (Test-AgentRouterProviderProbeDue $stage) {
                     return [pscustomobject]@{ Action = 'provider_recheck'; AccountKey = $stageKey; Target = $stageTarget }
@@ -294,7 +297,7 @@ function Get-AgentRouterManualAction($ManualHandoff, $Config) {
             $account = Resolve-AgentRouterAccountConfig -Accounts @($Config.agentrouterAccounts) `
                 -AccountKey ([string]$accountKey) -Origin ([string]$target.origin)
             $action = switch ([string]$account.provider) {
-                'LinuxDO' { 'provider' }
+                'LinuxDO' { if (Test-TargetFirstAgentRouterOAuth $account) { 'agentrouter' } else { 'provider' } }
                 'GitHub' { 'github' }
                 default { return $null }
             }
@@ -307,12 +310,21 @@ function Get-AgentRouterManualAction($ManualHandoff, $Config) {
     return $null
 }
 
-function Start-AgentRouterManualAction($Action, $SourceRunId) {
+function Start-AgentRouterManualAction($Action, $SourceRunId, $Config = $null) {
     if ($Action.Action -in @('active', 'waiting') -or (Test-AgentRouterHelperRunning)) { return $false }
     $shell = (Get-Command pwsh,powershell -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     if (-not $shell) { throw '未找到 PowerShell 可执行文件，无法启动 Agent Router 专用交接。' }
+    $targetFirstOAuth = $false
+    if ($null -ne $Config) {
+        $activeAccount = Resolve-AgentRouterAccountConfig -Accounts @($Config.agentrouterAccounts) `
+            -AccountKey ([string]$Action.AccountKey) -Origin ([string]$Action.Target.origin)
+        $targetFirstOAuth = Test-TargetFirstAgentRouterOAuth $activeAccount
+    }
     $script = if ($Action.Action -eq 'complete') {
         Join-Path $PSScriptRoot 'Complete-AgentRouterLogin.ps1'
+    }
+    elseif ($targetFirstOAuth) {
+        Join-Path $PSScriptRoot 'Open-AgentRouterLogin.ps1'
     }
     elseif ($Action.Action -in @('provider_closed', 'provider_recheck')) {
         Join-Path $PSScriptRoot 'Close-AgentRouterLogin.ps1'
@@ -321,7 +333,10 @@ function Start-AgentRouterManualAction($Action, $SourceRunId) {
         Join-Path $PSScriptRoot 'Open-AgentRouterLogin.ps1'
     }
     $arguments = @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script, '-AccountKey', [string]$Action.AccountKey)
-    if ($Action.Action -eq 'provider') {
+    if ($targetFirstOAuth -and $Action.Action -ne 'complete') {
+        $arguments += '-AgentRouterOnly'
+    }
+    elseif ($Action.Action -eq 'provider') {
         # Continue immediately after a valid probe, including one-shot dispatch.
         $arguments += @('-ProviderOnly', '-ContinueToAgentRouter')
     }
@@ -356,7 +371,7 @@ function Start-ManualHandoffActions($ManualHandoff, $Config) {
         if (-not $handoffMutexOwned) { return }
         $agentRouterAction = Get-AgentRouterManualAction $ManualHandoff $Config
         if ($null -ne $agentRouterAction -and $agentRouterAction.Action -notin @('active', 'waiting')) {
-            [void](Start-AgentRouterManualAction $agentRouterAction $ManualHandoff.SourceRunId)
+            [void](Start-AgentRouterManualAction $agentRouterAction $ManualHandoff.SourceRunId $Config)
         }
         if ((Test-ManualHandoffHasNonAgentTargets $ManualHandoff $Config) `
             -and -not (Test-Path -LiteralPath $manualSessionPath) `

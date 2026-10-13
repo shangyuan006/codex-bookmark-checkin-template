@@ -3,6 +3,7 @@ import path from "node:path";
 import { atomicWriteJson, redactPrivateResultText } from "./security.mjs";
 import { isConfirmedNotAvailable, isTerminalResult } from "./result-contract.mjs";
 import { isCurrentCheckinCycle } from './checkin-cycle.mjs';
+import { reconcileCheckinResult } from './checkin-evidence.mjs';
 
 const SUCCESSFUL = new Set(["signed", "already_signed"]);
 
@@ -10,7 +11,9 @@ export function reuseCycleSuccess(target, state, config, now=new Date()) {
   if (!config.siteCycleRules?.[target.origin] || config.reauthCheckinRules?.[target.origin]) return null;
   const prior=state?.sites?.[target.origin];
   if (!prior?.lastSuccessResult || !isCurrentCheckinCycle(target.origin,prior.lastSuccessAt,config,now)) return null;
-  return {...prior.lastSuccessResult,origin:target.origin,title:target.title,folderNames:target.folderNames,status:'already_signed',observedAt:prior.lastSuccessAt,cached:true,attempt:0};
+  const result={...prior.lastSuccessResult,origin:target.origin,title:target.title,folderNames:target.folderNames,status:'already_signed',observedAt:prior.lastSuccessAt,cached:true,attempt:0};
+  if (result.evidence?.binding && reconcileCheckinResult(result,result.evidence,now,{target,config}).status==='unconfirmed') return null;
+  return result;
 }
 
 export async function loadSiteState(filePath) {
@@ -100,8 +103,8 @@ export function updateSiteState(previous, results, finishedAt = new Date()) {
     const durationMs = Math.max(0, Number(result.durationMs) || 0);
     const priorAverage = Math.max(0, Number(prior.averageDurationMs) || 0);
     const averageDurationMs = Math.round(((priorAverage * (runCount - 1)) + durationMs) / runCount);
-    const confirmed = isTerminalResult(result);
-    const successful = SUCCESSFUL.has(result.status);
+    const confirmed = isTerminalResult(result,finishedAt);
+    const successful = confirmed && SUCCESSFUL.has(result.status);
     const preferredUrl = reusablePreferredUrl(result) ?? prior.preferredUrl ?? null;
     sites[result.origin] = {
       ...prior,

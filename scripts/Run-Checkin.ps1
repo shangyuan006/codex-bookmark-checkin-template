@@ -111,12 +111,20 @@ function Get-TodayResumeReport {
     try {
         $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json
         $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
+        if ([string]$value.runId -notlike "$todayPrefix*") { return $null }
         $latestFingerprint = [string]$value.planFingerprint
         if (-not $latestFingerprint -and $value.bookmarkSummary) {
             $latestFingerprint = [string]$value.bookmarkSummary.planFingerprint
         }
         if ($currentPlanFingerprint -and $latestFingerprint -and $latestFingerprint -ne $currentPlanFingerprint) {
-            return $null
+            $scopeScript = Join-Path $root 'src\resume-scope-reconciliation.mjs'
+            $scopeOutput = @(& $node $scopeScript $root)
+            if ($LASTEXITCODE -ne 0) { throw '当天续跑范围整理失败；未启动预热或签到。' }
+            $scopeResult = ($scopeOutput -join [Environment]::NewLine) | ConvertFrom-Json
+            if (-not $scopeResult.path) { return $null }
+            $latestPath = [string]$scopeResult.path
+            $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $latestPath | ConvertFrom-Json
+            Write-Host "已按当前书签整理续跑范围：移除 $($scopeResult.removedTargetCount) 个目标，新增 $($scopeResult.addedTargetCount) 个目标仍需核验。"
         }
         $minimumTargets = [Math]::Max(1, [int]$config.minimumBookmarkTargetCount)
         if ([string]$value.runId -like "$todayPrefix*" `
@@ -126,7 +134,7 @@ function Get-TodayResumeReport {
             return [pscustomobject]@{ Path = $latestPath; Report = $value; LastWriteTime = (Get-Item -LiteralPath $latestPath).LastWriteTime }
         }
     }
-    catch { }
+    catch { throw }
     return $null
 }
 
@@ -138,18 +146,18 @@ function Test-IsCompleteFinalReport($Report) {
     return $plannedTotal -gt 0 -and $processedTotal -ge $plannedTotal -and @($Report.results).Count -ge $plannedTotal
 }
 
-function Test-HasImmediateRetry($Report, [datetime]$RetryAt) {
+function Test-HasImmediateRetry($Report, [datetimeoffset]$RetryAt) {
     $results = @($Report.results)
     if (-not (Test-IsCompleteFinalReport $Report)) { return $true }
     $unresolved = @($results | Where-Object { -not (Test-CheckinResultTerminal $_) })
     if ($unresolved.Count -eq 0) { return $false }
-    $immediateRetryStatuses = @('error', 'login_required', 'managed_challenge', 'managed_challenge_timeout', 'unconfirmed', 'clicked', 'visited')
+    $immediateRetryStatuses = $script:CheckinImmediateRetryStatuses
     foreach ($result in $unresolved) {
         if ($result.retryable -eq $false -or $result.submissionAttempted -eq $true) { continue }
         $status = [string]$result.status
         if ($status -eq 'deferred') {
             try {
-                if (-not $result.nextEligibleAt -or [datetime]$result.nextEligibleAt -le $RetryAt) { return $true }
+                if (-not $result.nextEligibleAt -or [datetimeoffset]$result.nextEligibleAt -le $RetryAt) { return $true }
             }
             catch { return $true }
             continue

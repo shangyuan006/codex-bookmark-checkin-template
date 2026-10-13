@@ -1,3 +1,10 @@
+// The fallback must verify that the scoped browser process has exited before
+// resolving. A timeout of context.close() alone does not prove cleanup failed.
+export function automationCleanupAllowsRecovery(outcome) {
+  return outcome?.closed === true
+    || outcome?.fallbackAttempted === true && outcome?.fallbackSucceeded === true;
+}
+
 export async function closeAutomationContext(context, {
   timeoutMs = 10_000,
   fallback = null,

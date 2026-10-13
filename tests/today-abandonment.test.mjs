@@ -55,6 +55,7 @@ async function createFixture({ activeSession = false, pendingVerificationOrigins
     fs.copyFile(helperPath, path.join(scriptsDirectory, "ManualAbandonment.ps1")),
     fs.copyFile(verificationHelperPath, path.join(scriptsDirectory, "ManualVerification.ps1")),
     fs.copyFile(resultContractHelperPath, path.join(scriptsDirectory, "ResultContract.ps1")),
+    fs.copyFile(path.join(root,"scripts/CheckinContract.generated.ps1"), path.join(scriptsDirectory,"CheckinContract.generated.ps1")),
     fs.copyFile(runtimePath, path.join(scriptsDirectory, "Resolve-Runtime.ps1")),
     fs.writeFile(path.join(configDirectory, "config.json"), JSON.stringify({
       nodeExecutable: process.execPath,

@@ -420,10 +420,12 @@ test("DPAPI 凭据恢复默认关闭且强制同源验证", async () => {
 test("任务级重试不会为空动作或人工处理状态重复空转", async () => {
   const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
   const fallbackPolicy = await fs.readFile(new URL("../scripts/NativeFallbackPolicy.ps1", import.meta.url), "utf8");
-  const statuses = runner.match(/\$immediateRetryStatuses\s*=\s*@\(([^)]*)\)/)?.[1] ?? "";
-  assert.match(statuses, /'error'/);
-  assert.match(statuses, /'managed_challenge_timeout'/);
-  assert.doesNotMatch(statuses, /'no_action'|'interactive_challenge'|'needs_attention'/);
+  const contract = JSON.parse(await fs.readFile(new URL('../shared/checkin-contract.json',import.meta.url),'utf8'));
+  const statuses = contract.immediateRetryStatuses;
+  assert.match(runner,/\$immediateRetryStatuses\s*=\s*\$script:CheckinImmediateRetryStatuses/);
+  assert.ok(statuses.includes('error'));
+  assert.ok(statuses.includes('managed_challenge_timeout'));
+  assert.ok(!statuses.some(status=>['no_action','interactive_challenge','needs_attention'].includes(status)));
   assert.match(runner, /NativeFallbackPolicy\.ps1/);
   assert.match(fallbackPolicy, /function Get-NativeFallbackRetryOrigins/);
   assert.match(fallbackPolicy, /function Test-NeedsNativeFallbackRetry/);

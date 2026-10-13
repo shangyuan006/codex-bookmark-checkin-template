@@ -10,6 +10,12 @@ import { normalizeAgentRouterAccountKey, normalizeReauthProvider } from "./resul
 import { atomicWriteJson, safeErrorMessage } from "./security.mjs";
 import { hasCurrentReauthEvidence, reauthRecoveryAction, resetReauthLoginEvidence } from "./reauth-recovery.mjs";
 import { quotaChangeEvidence } from './quota-evidence.mjs';
+import { dailyReadinessEvidence } from "./checkin-evidence.mjs";
+import { successEvidence, bindSuccessEvidence } from './checkin-evidence.mjs';
+import { runWithSubmissionJournal, SUBMISSION_SCOPE } from './submission-guard.mjs';
+import { waitForReauthLogout } from './reauth-logout.mjs';
+import { oauthTargetPageObservation, readOAuthTargetSurface, sanitizeOAuthPageObservation } from './oauth-target-state.mjs';
+import { writeOAuthFlowDiagnostic } from './oauth-flow-diagnostics.mjs';
 
 const execFileAsync = promisify(execFile);
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -95,6 +101,20 @@ function shanghaiMinutes(now) {
   return Number(parts.hour) * 60 + Number(parts.minute);
 }
 
+export function configuredLinuxDoSessionStrategy(value, provider) {
+  const strategy = value ?? "provider_probe";
+  if (!["provider_probe", "target_oauth"].includes(strategy)
+    || (strategy === "target_oauth" && normalizeReauthProvider(provider, "reauth provider") !== "LinuxDO")) {
+    throw new Error("Invalid LinuxDO session strategy for this provider");
+  }
+  return strategy;
+}
+
+export function usesTargetFirstLinuxDoOAuth(rule) {
+  return normalizeReauthProvider(rule.provider, "reauth provider") === "LinuxDO"
+    && rule.linuxDoSessionStrategy === "target_oauth";
+}
+
 export function getConfiguredReauthRule(target, config) {
   const raw = config?.reauthCheckinRules?.[target?.origin];
   if (!raw || raw.enabled === false) return null;
@@ -165,7 +185,9 @@ export function getConfiguredReauthRule(target, config) {
     accountMenuSelector,
     logoutTexts,
     provider,
+    linuxDoSessionStrategy: configuredLinuxDoSessionStrategy(raw.linuxDoSessionStrategy, provider),
     after: afterMatch ? `${afterMatch[1]}:${afterMatch[2]}` : null,
+    allowCycleContinuation: raw.allowCycleContinuation===true,
     evidenceWaitMs: Math.max(1_000, Math.min(30_000, Number(raw.evidenceWaitMs) || 15_000)),
   };
 }
@@ -245,6 +267,8 @@ export function getConfiguredReauthAccounts(target, config) {
       accountKey,
       ...(accountId ? { accountId } : {}),
       provider,
+      linuxDoSessionStrategy: configuredLinuxDoSessionStrategy(entry.linuxDoSessionStrategy
+        ?? (provider === "LinuxDO" ? baseRule.linuxDoSessionStrategy : undefined), provider),
       ...(oauthAttempts == null ? {} : { oauthAttempts }),
       ...(oauthRetryDelayMs == null ? {} : { oauthRetryDelayMs }),
       ...(oauthWaitMs == null ? {} : { oauthWaitMs }),
@@ -390,6 +414,7 @@ export function mergeSelectedReauthAccountResult(accounts, previousParent, selec
 export function reauthLoginFailureReason(provider, oauthStage = null) {
   const normalized = String(provider ?? "").trim() || "配置的登录提供方";
   const stageReasons = {
+    logout_verification: "退出后未确认目标站登录页，未启动 OAuth",
     target_login: "目标站登录页未就绪",
     provider_button: "未找到登录提供方按钮",
     login_challenge: "安全验证完成后仍未找到提供方按钮",
@@ -398,6 +423,7 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
     linuxdo_session_challenge: "LinuxDO 会话探测被 CF 真人验证阻塞，登录状态尚未确认",
     linuxdo_session_rate_limited: "LinuxDO 会话探测受到请求频率限制，登录状态尚未确认",
     linuxdo_login_challenge: "LinuxDO 登录页 CF 真人验证未完成",
+    linuxdo_provider_login_required: "LinuxDO 授权跳回提供方登录表单，需恢复提供方登录后再继续目标站",
     provider_session: "登录提供方保存会话恢复未完成",
     github_autofill_missing: "GitHub 登录态失效，浏览器未自动填充账号密码",
     github_account_selection: "GitHub 要求选择账号",
@@ -419,20 +445,26 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
 }
 
 export function shouldRetryOAuthFailureStage(oauthStage) {
-  return !['linuxdo_session_challenge', 'linuxdo_session_rate_limited',
-    'linuxdo_login_challenge', 'github_autofill_missing', 'github_account_selection',
+  return !['logout_verification', 'linuxdo_session_challenge', 'linuxdo_session_rate_limited',
+    'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'github_autofill_missing', 'github_account_selection',
     'github_interactive_verification', 'github_form_not_unique', 'github_submit_not_unique',
     'github_login_not_completed'].includes(oauthStage);
 }
 
-export function reauthLoginFailureResult(provider, oauthStage, { beforeLogout = false } = {}) {
+export function reauthLoginFailureResult(provider, oauthStage, { beforeLogout = false, diagnostics = null } = {}) {
   const providerBlocked = ['linuxdo_session_challenge', 'linuxdo_session_rate_limited',
-    'linuxdo_login_challenge'].includes(oauthStage);
+    'linuxdo_login_challenge', 'linuxdo_provider_login_required'].includes(oauthStage);
   return {
     status: "needs_attention",
     reason: reauthLoginFailureReason(provider, oauthStage)
       + (beforeLogout ? "；未退出 Agent Router，请先完成提供方会话恢复" : ""),
     ...(providerBlocked ? { failureCode: `oauth_${oauthStage}`, retryable: false } : {}),
+    ...(diagnostics ? {oauthStage:diagnostics.oauthStage,
+      ...sanitizeOAuthPageObservation(diagnostics),
+      ...(diagnostics.authorizationOutcome ? {authorizationOutcome:diagnostics.authorizationOutcome} : {}),
+      ...(diagnostics.providerAuthorizationChallengeOutcome
+        ? {providerAuthorizationChallengeOutcome:diagnostics.providerAuthorizationChallengeOutcome,
+          providerAuthorizationChallengeClicks:diagnostics.providerAuthorizationChallengeClicks} : {})} : {}),
   };
 }
 
@@ -750,11 +782,12 @@ async function runOAuthHelper(rule, config, account, phaseArgs = []) {
       env: process.env,
     });
     const outcome = loginHelperOutcomeFromStreams(result.stdout, result.stderr);
-    return { succeeded: outcome.succeeded, oauthStage: outcome.oauthStage ?? null };
+    return { ...outcome, oauthStage: outcome.oauthStage ?? null };
   } catch (error) {
     const fallback = error?.code === "ETIMEDOUT" ? "timeout" : "failed";
     const outcome = loginHelperOutcomeFromStreams(error?.stdout, error?.stderr, fallback);
     return {
+      ...outcome,
       succeeded: false,
       oauthStage: outcome.oauthStage ?? (fallback === "timeout" ? "timeout" : "helper_failed"),
     };
@@ -785,6 +818,8 @@ async function retryOAuthOperation(rule, config, account, operation) {
     const current = await operation();
     if (current.succeeded) return current;
     latest = {
+      ...latest,
+      ...current,
       succeeded: false,
       oauthStage: preferOAuthFailureStage(latest.oauthStage, current.oauthStage),
     };
@@ -865,6 +900,17 @@ async function runAgentRouterOnlyWithRetry(rule, config, account) {
   );
 }
 
+// OAuth itself validates the provider session. An indeterminate standalone
+// probe must not turn into a forced provider-home login in this opt-in mode.
+// The caller still establishes a durable target logout and resets reward
+// evidence first; only a fresh callback/reward can finish today's reauth.
+export async function runTargetFirstLinuxDoOAuthWithRetry(rule, config, account, {
+  runHelper = runOAuthHelper,
+} = {}) {
+  if (!usesTargetFirstLinuxDoOAuth(rule)) throw new Error("Target-first OAuth is not enabled for this account");
+  return retryOAuthOperation(rule, config, account, () => runHelper(rule, config, account, []));
+}
+
 export function parseProviderSessionProbe(text) {
   const lines = String(text ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   for (const line of [...lines].reverse()) {
@@ -940,6 +986,20 @@ async function confirmReauthSessionAfterOAuthFailure(config, rule, statePath, st
 }
 
 export async function runConfiguredReauthCheckinForAccount(target, config, account, options = {}) {
+  const identity = {...target,accountKey:account.accountKey,actionType:'reauth'};
+  const run = async activeConfig => {
+    const result = await runReauthCheckinForAccountInternal(target,activeConfig,account,options);
+    if (!['signed','already_signed'].includes(result?.status)) return result;
+    const at = result.observedAt ? new Date(result.observedAt) : (options.now??new Date());
+    return bindSuccessEvidence(withReauthAccountMetadata({...result,
+      evidence:result.evidence??successEvidence('reauth_state','quota_reward_confirmed',at)},account),identity,activeConfig,options.now??new Date(),'reauth');
+  };
+  return config.submissionJournalPath
+    ? runWithSubmissionJournal(config.submissionJournalPath,identity,config,run,{now:()=>options.now??new Date()})
+    : run(config);
+}
+
+async function runReauthCheckinForAccountInternal(target, config, account, options = {}) {
   const rule = account;
   if (!rule) return null;
   const now = options.now ?? new Date();
@@ -962,7 +1022,18 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   const state = await readState(statePath);
   const previous = state.entries?.[stateKey];
   if (shouldReuseCompletedReauthState(previous, date, options.forceReauth, now)) {
-    return { status: "already_signed", reason: "今日已通过重新登录确认额度到账" };
+    return { status: "already_signed", reason: "今日已通过重新登录确认额度到账", observedAt:previous.updatedAt };
+  }
+  if (config.checkinReadOnly) {
+    const currentLogin = await inspectCurrentLogin(accountConfig,rule);
+    if (reauthRecoveryAction(previous,now)==='resume' && hasCurrentReauthEvidence(currentLogin,previous)) {
+      return {status:'signed',reason:'只读核验确认本次重新认证的额度证据'};
+    }
+    if(rule.allowCycleContinuation && previous?.date!==date && currentLogin.valid===true) {
+      return dailyReadinessEvidence({...target,accountKey:rule.accountKey,actionType:"reauth"},config,{
+        source:"reauth_state",outcome:"configured_daily_reauth_due",authoritative:false,now});
+    }
+    return {status:'needs_attention',reason:'不确定重新认证仅允许只读核验，不再次退出或登录'};
   }
   if (options.postOAuthVerify) {
     if (reauthRecoveryAction(previous, now) !== "resume") {
@@ -986,7 +1057,9 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     let currentLogin = await inspectCurrentLogin(accountConfig, rule);
     if (!currentLogin.valid) {
       const oauthResult = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO"
-        ? await runAgentRouterOnlyWithRetry(rule, accountConfig, rule)
+        ? (usesTargetFirstLinuxDoOAuth(rule)
+          ? await runTargetFirstLinuxDoOAuthWithRetry(rule, accountConfig, rule)
+          : await runAgentRouterOnlyWithRetry(rule, accountConfig, rule))
         : await runPrivateOAuthWithRetry(rule, accountConfig, rule);
       if (!oauthResult.succeeded) {
         const confirmed = await confirmReauthSessionAfterOAuthFailure(
@@ -997,7 +1070,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
           date,
         );
         if (confirmed) return confirmed;
-        return reauthLoginFailureResult(rule.provider, oauthResult.oauthStage);
+        return reauthLoginFailureResult(rule.provider, oauthResult.oauthStage, {diagnostics:oauthResult});
       }
       currentLogin = await inspectCurrentLogin(accountConfig, rule);
     }
@@ -1019,27 +1092,28 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   let beforeConsumption;
   try {
     const isLinuxDoProvider = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO";
-    if (isLinuxDoProvider) {
+    if (isLinuxDoProvider && !usesTargetFirstLinuxDoOAuth(rule)) {
       // The provider-only helper is the single authoritative LinuxDO stage.
       // It opens one provider context, confirms the session endpoint, and
       // closes that context before this function can open Agent Router.
       const providerRecovery = await runProviderOnlyWithRetry(rule, accountConfig, rule);
       if (!providerRecovery.succeeded) {
-        return reauthLoginFailureResult(rule.provider, providerRecovery.oauthStage, { beforeLogout: true });
+        return reauthLoginFailureResult(rule.provider, providerRecovery.oauthStage, { beforeLogout: true, diagnostics:providerRecovery });
       }
     }
     beforeSession = await openRulePage(accountConfig, rule);
-    before = await readQuota(beforeSession, rule);
-    beforeConsumption = await readConsumptionSnapshot(beforeSession, rule);
-    if (await verifyConfiguredProviderBeforeLogout(beforeSession, rule, accountConfig)) {
-      throw new Error(`${rule.provider} 登录入口未出现在当前站点登录页，已取消退出`);
-    }
-    await dismissConfiguredPreCheckinOverlay(
+    const beforeSurface = await readOAuthTargetSurface(beforeSession.page, rule.origin, accountConfig);
+    const noticeDismissed = await dismissConfiguredPreCheckinOverlay(
       beforeSession.page,
       target,
       new URL(beforeSession.page.url()).origin,
       accountConfig,
     );
+    before = await readQuota(beforeSession, rule);
+    beforeConsumption = await readConsumptionSnapshot(beforeSession, rule);
+    if (await verifyConfiguredProviderBeforeLogout(beforeSession, rule, accountConfig)) {
+      throw new Error(`${rule.provider} 登录入口未出现在当前站点登录页，已取消退出`);
+    }
     const accountMenu = await waitForUniqueVisibleLocator(
       beforeSession.page.locator(rule.accountMenuSelector),
       rule.evidenceWaitMs,
@@ -1056,14 +1130,26 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
       if (candidate) logoutMatches.push(candidate);
     }
     if (logoutMatches.length !== 1) throw new Error("没有找到唯一可见的退出动作");
+    await config[SUBMISSION_SCOPE]?.begin();
     await writeState(statePath, state, stateKey, buildReauthStateEntry(date, "started", now));
     const loginEvidenceReset = await resetReauthLoginEvidence(beforeSession.page, rule);
     await logoutMatches[0].click();
-    await beforeSession.page.waitForTimeout(1_000);
+    const logout = await waitForReauthLogout(beforeSession.page, rule);
+    await writeOAuthFlowDiagnostic({ flow: 'automatic_logout', provider: rule.provider,
+      status: logout.confirmed ? 'logged_out' : 'needs_attention', oauthStage: 'logout_verification',
+      stages: ['logout_verification'], logoutConfirmed: logout.confirmed,
+      ...oauthTargetPageObservation(beforeSurface, noticeDismissed), targetSurface: logout.targetSurface,
+    });
+    if (!logout.confirmed) {
+      return { status: 'needs_attention', reason: reauthLoginFailureReason(rule.provider, 'logout_verification'),
+        oauthStage: 'logout_verification', failureCode: 'reauth_logout_unconfirmed', retryable: false,
+        logoutConfirmed: false, targetSurface: logout.targetSurface };
+    }
     const refreshed = await readState(statePath);
     await writeState(statePath, refreshed, stateKey, {
       ...buildReauthStateEntry(date, "logged_out", new Date()),
       loginEvidenceReset,
+      logoutConfirmed: true,
     });
   } catch (error) {
     return { status: "needs_attention", reason: safeErrorMessage(error) };
@@ -1072,7 +1158,9 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
   }
 
   const oauthResult = normalizeReauthProvider(rule.provider, "agentrouter provider") === "LinuxDO"
-    ? await runAgentRouterOnlyWithRetry(rule, accountConfig, rule)
+    ? (usesTargetFirstLinuxDoOAuth(rule)
+      ? await runTargetFirstLinuxDoOAuthWithRetry(rule, accountConfig, rule)
+      : await runAgentRouterOnlyWithRetry(rule, accountConfig, rule))
     : await runPrivateOAuthWithRetry(rule, accountConfig, rule);
   if (!oauthResult.succeeded) {
     const confirmed = await confirmReauthSessionAfterOAuthFailure(
@@ -1083,7 +1171,7 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
       date,
     );
     if (confirmed) return confirmed;
-    return reauthLoginFailureResult(rule.provider, oauthResult.oauthStage);
+    return reauthLoginFailureResult(rule.provider, oauthResult.oauthStage, {diagnostics:oauthResult});
   }
 
   let afterSession;

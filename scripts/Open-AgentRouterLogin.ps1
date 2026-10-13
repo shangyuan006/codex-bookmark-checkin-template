@@ -21,6 +21,8 @@ $browser = Resolve-CheckinBrowser $config
 $requestedAccountKey = ConvertTo-AgentRouterAccountKey $AccountKey
 $account = Resolve-AgentRouterAccountConfig -Accounts @($config.agentrouterAccounts) -AccountKey $requestedAccountKey
 $provider = [string]$account.provider
+$targetFirstOAuth = (Test-TargetFirstAgentRouterOAuth $account) -and -not $ProviderOnly
+if ($targetFirstOAuth) { $AgentRouterOnly = $true }
 if ($ProviderOnly -and $AgentRouterOnly) {
     throw 'ProviderOnly and AgentRouterOnly cannot be used together.'
 }
@@ -85,7 +87,7 @@ $existingProfileProcesses = @(Get-CimInstance Win32_Process | Where-Object {
 })
 if ($existingProfileProcesses.Count -gt 0) { throw 'The selected Agent Router profile is already in use.' }
 
-if ($provider -eq 'LinuxDO' -and (Test-Path -LiteralPath $providerStagePath)) {
+if ($provider -eq 'LinuxDO' -and -not $targetFirstOAuth -and (Test-Path -LiteralPath $providerStagePath)) {
     $pendingProviderStage = Get-Content -Raw -Encoding UTF8 -LiteralPath $providerStagePath | ConvertFrom-Json
     if ([string]$pendingProviderStage.stage -eq 'provider_pending') {
         # A closed native window is pending verification, not another login.
@@ -236,6 +238,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         Write-Output "Today's completed account result was reconciled without another OAuth or manual window."
         return
     }
+    if (-not $targetFirstOAuth) {
     if (-not (Test-Path -LiteralPath $providerStagePath)) {
         throw 'No completed LinuxDO provider stage is recorded. Run with -ProviderOnly, finish login, and close that window first.'
     }
@@ -283,6 +286,8 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         throw "The LinuxDO provider session is invalid after $($providerSessionProbe.Attempts) bounded probe attempt(s). Run -ProviderOnly again and complete LinuxDO login first."
     }
 
+    }
+
     if ($recoveryAction -eq 'restart') {
         # The automatic run may have stopped BEFORE target logout. Let the
         # daily state machine establish that boundary before any login-only helper.
@@ -309,16 +314,17 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         $profile,
         '--account-id',
         $requestedAccountKey,
-        '--agent-router-only',
-        '--provider-session-confirmed',
         '--diagnostic-stage',
         'manual_target_oauth',
         '--private-result'
     )
+    if (-not $targetFirstOAuth) {
+        $oauthArguments += @('--agent-router-only', '--provider-session-confirmed')
+    }
     if ($null -ne $account.oauthWaitMs) {
         $oauthArguments += @('--wait-ms', [string]$account.oauthWaitMs)
     }
-    if ($ExperimentalTurnstileFrameClick) {
+    if ($ExperimentalTurnstileFrameClick -and -not $targetFirstOAuth) {
         $oauthArguments += '--experimental-sso-frame-click'
     }
     $previousErrorActionPreference = $ErrorActionPreference
@@ -385,15 +391,16 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         return
     }
     $safeOAuthStages = @(
-        'target_login', 'provider_button', 'login_challenge', 'provider_transition',
-        'linuxdo_session', 'linuxdo_login_challenge', 'provider_session',
+        'target_login', 'logout_verification', 'provider_button', 'login_challenge', 'provider_transition',
+        'linuxdo_session', 'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'provider_session',
         'provider_authorization', 'target_callback',
         'session_verification', 'checkin_verification', 'completed'
     )
     $safeAuthorizationOutcomes = @(
         'not_applicable', 'authorization_not_found', 'authorization_not_unique',
         'authorization_click_failed', 'authorization_clicked', 'authorization_completed',
-        'provider_challenge_not_clickable', 'provider_challenge_unresolved'
+        'provider_challenge_not_clickable', 'provider_challenge_unresolved',
+        'authorization_departed', 'provider_login_required'
     )
     $failedStage = if ([string]$automaticResult.oauthStage -in $safeOAuthStages) {
         [string]$automaticResult.oauthStage
@@ -421,7 +428,18 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         Write-Output "Automatic Agent Router OAuth did not complete, but the isolated target session authoritatively confirms today's check-in; no visible manual window was opened."
         return
     }
-    Write-Warning "Agent Router OAuth ended without a confirmed target session (stage=$failedStage, authorization=$failedAuthorization). Opening one native no-CDP Edge window for manual completion."
+    if ($provider -eq 'LinuxDO' -and $failedStage -eq 'linuxdo_provider_login_required') {
+        # Recover the official provider login form first. Closing that window
+        # verifies its saved session before continuing target OAuth.
+        $ProviderOnly = $true
+        $AgentRouterOnly = $false
+        $ContinueToAgentRouter = $true
+        $providerChallengeHandoff = $false
+        Write-Warning 'LinuxDO authorization returned to its login form. Opening only the provider login window; target OAuth will continue after verified provider recovery.'
+    }
+    else {
+        Write-Warning "Agent Router OAuth ended without a confirmed target session (stage=$failedStage, authorization=$failedAuthorization). Opening one native no-CDP Edge window for manual completion."
+    }
 }
 
 $launchMarker = [guid]::NewGuid().ToString('N')

@@ -14,6 +14,42 @@ const pageEvidence = (confirmedAt = "2026-07-29T04:00:00.000Z") => ({
   source: "page_text", outcome: "page_completion_text", authoritative: true, confirmedAt,
 });
 
+test("落盘时移除嵌套整页控件并保留签到证据和动作身份", () => {
+  const action = { status: "signed", actionType: "sequence_test", evidence: pageEvidence(),
+    controls: [{ text: "fixture-account-menu", href: "https://private.test/account/fixture" }] };
+  const original = { results: [{ status: "signed", controls: action.controls, actionResults: [action] }] };
+  const safe = sanitizeForPersistence(original);
+  assert.doesNotMatch(JSON.stringify(safe), /controls|fixture-account-menu|private\.test/);
+  assert.equal(safe.results[0].status, "signed");
+  assert.equal(safe.results[0].actionResults[0].actionType, action.actionType);
+  assert.deepEqual(safe.results[0].actionResults[0].evidence, action.evidence);
+  assert.equal(original.results[0].controls.length, 1);
+});
+
+test("历史日志清理移除整页控件且保留已签到结论", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "checkin-controls-privacy-"));
+  try {
+    const report = { runId: "20260729-080000", runState: "final", plannedTotal: 1,
+      processedTotal: 1, isComplete: true, results: [{ origin: "https://one.test", status: "signed",
+        evidence: pageEvidence(), actionResults: [{ controls: [{ text: "fixture-account-menu" }] }] }] };
+    const dir = path.join(root, report.runId);
+    await fs.mkdir(dir);
+    for (const file of [path.join(root, "latest.json"), path.join(dir, "progress.json"), path.join(dir, "result.json")]) {
+      await fs.writeFile(file, JSON.stringify(report));
+    }
+    const statePath = path.join(root, "site-state.json");
+    await fs.writeFile(statePath, JSON.stringify({ sites: { "https://one.test": report.results[0] } }));
+    const repaired = await repairLocalResultHistory(root, statePath);
+    assert.equal(repaired.sanitizedFiles, 4);
+    for (const file of [path.join(root, "latest.json"), path.join(dir, "progress.json"), path.join(dir, "result.json"), statePath]) {
+      const text = await fs.readFile(file, "utf8");
+      assert.doesNotMatch(text, /controls|fixture-account-menu/);
+      assert.match(text, /"status": "signed"/);
+      assert.match(text, /page_completion_text/);
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test("进度和嵌套候选历史中的奖励额度在落盘前统一脱敏", () => {
   const safe = sanitizeForPersistence({
     results: [{

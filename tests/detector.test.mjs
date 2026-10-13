@@ -173,6 +173,11 @@ test("只选择明确的签到动作", () => {
   assert.ok(scoreActionText("申请额度") > 0);
   assert.ok(scoreActionText("领取 Codex 权益") > 0);
   assert.ok(scoreActionText("領取Codex權益") > 0);
+  assert.ok(scoreActionText("签到得魔力") > 0);
+  assert.ok(scoreActionText("[簽到得魔力]") > 0);
+  assert.equal(scoreActionText("签到得魔力记录"), -1);
+  assert.equal(scoreActionText("签到得魔力规则"), -1);
+  assert.equal(scoreActionText("签到得魔力后可以购买"), -1);
   assert.equal(scoreActionText("签到记录"), -1);
   assert.equal(scoreActionText("购买"), -1);
 });

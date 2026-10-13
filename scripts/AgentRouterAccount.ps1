@@ -6,6 +6,13 @@ function ConvertTo-AgentRouterAccountKey([object]$Value) {
     return $normalized
 }
 
+function Test-TargetFirstAgentRouterOAuth($Account) {
+    $strategy = [string]$Account.linuxDoSessionStrategy
+    if (-not $strategy -or $strategy -ceq 'provider_probe') { return $false }
+    if ($strategy -ceq 'target_oauth' -and [string]$Account.provider -eq 'LinuxDO') { return $true }
+    throw 'Invalid LinuxDO session strategy for this provider.'
+}
+
 function Resolve-AgentRouterPowerShellExecutable {
     $current = try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { $null }
     foreach ($candidate in @(

@@ -1,8 +1,6 @@
-$script:ManualVerificationTerminalStatuses = @('signed', 'already_signed')
-$script:ManualVerificationImmediateStatuses = @(
-    'error', 'login_required', 'interactive_challenge', 'managed_challenge',
-    'managed_challenge_timeout', 'needs_attention', 'unconfirmed', 'clicked', 'visited'
-)
+. (Join-Path $PSScriptRoot 'CheckinContract.generated.ps1')
+$script:ManualVerificationTerminalStatuses = $script:CheckinSuccessStatuses
+$script:ManualVerificationImmediateStatuses = $script:CheckinManualHandoffStatuses
 $script:ManualVerificationHandoffDeferredCauses = @('login_required', 'managed_challenge_timeout')
 . (Join-Path $PSScriptRoot 'ResultContract.ps1')
 
@@ -264,6 +262,10 @@ function Update-ManualVerificationState($Pending, $Report, [string]$Path, [datet
             $target | Add-Member -NotePropertyName disabledByConfig -NotePropertyValue ($result.disabledByConfig -eq $true) -Force
             $target | Add-Member -NotePropertyName temporarilyUnavailable -NotePropertyValue ($result.temporarilyUnavailable -eq $true) -Force
             $target | Add-Member -NotePropertyName evidence -NotePropertyValue $result.evidence -Force
+            foreach ($field in @('cycle', 'actionType', 'accountKey', 'accountResults', 'allowedOrigins',
+                'actionResults', 'requiredActionTypes', 'submissionTrackedPerAction')) {
+                $target | Add-Member -NotePropertyName $field -NotePropertyValue $result.$field -Force
+            }
             $nextEligibleAt = ConvertTo-ManualVerificationUtcDateTime $result.nextEligibleAt
             $nextEligibleAtText = if ($null -ne $nextEligibleAt) { $nextEligibleAt.ToString('o') } else { [string]$result.nextEligibleAt }
             $target | Add-Member -NotePropertyName nextEligibleAt -NotePropertyValue $nextEligibleAtText -Force
@@ -282,7 +284,7 @@ function Update-ManualVerificationState($Pending, $Report, [string]$Path, [datet
     try {
         [System.IO.File]::WriteAllText(
             $temporaryPath,
-            ($Pending.Document | ConvertTo-Json -Depth 8),
+            ($Pending.Document | ConvertTo-Json -Depth 16),
             [System.Text.UTF8Encoding]::new($false)
         )
         Move-Item -LiteralPath $temporaryPath -Destination $Path -Force

@@ -72,6 +72,33 @@ test("scheduler dispatches GitHub single-stage and LinuxDO provider-stage parame
   ]);
 });
 
+test("target-first LinuxDO dispatch ignores legacy provider backoff but preserves tracked windows and GitHub", async () => {
+  const scenarios = await schedulerScenario([
+    "$config.agentrouterAccounts[1] | Add-Member -NotePropertyName linuxDoSessionStrategy -NotePropertyValue target_oauth",
+    "$results = @()",
+    "foreach ($scenario in @('fresh', 'pending', 'github', 'closed', 'active')) {",
+    "  if ($scenario -eq 'pending') { Write-AgentRouterProviderState $agentRouterProviderStagePath ([ordered]@{ stage = 'provider_pending'; accountKey = 'linuxdo'; nextProbeAt = [datetimeoffset]::UtcNow.AddMinutes(10).ToString('o') }) }",
+    "  if ($scenario -in @('closed', 'active')) { Write-AgentRouterProviderState $agentRouterManualStatePath ([ordered]@{ stage = 'provider'; accountKey = 'linuxdo'; profile = 'fixture' }) }",
+    "  if ($scenario -eq 'active') { function Get-CheckinProfileBrowserProcesses { return [pscustomobject]@{ ProcessId = 123 } } }",
+    "  $handoff.Targets[0].accountKeys = if ($scenario -eq 'github') { @('github') } else { @('linuxdo') }",
+    "  $before = $script:launches.Count",
+    "  $action = Get-AgentRouterManualAction $handoff $config",
+    "  [void](Start-AgentRouterManualAction $action 'fixture' $config)",
+    "  $launched = $script:launches.Count -gt $before",
+    "  $arguments = if ($launched) { $script:launches[-1] } else { @() }",
+    "  $results += [pscustomobject]@{ scenario = $scenario; action = $action.Action; launched = $launched; providerOnly = $arguments -contains '-ProviderOnly'; targetOnly = $arguments -contains '-AgentRouterOnly'; script = if ($launched) { [System.IO.Path]::GetFileName($arguments[6]) } else { $null } }",
+    "}",
+    "ConvertTo-Json -InputObject $results -Compress",
+  ].join("\r\n"));
+  assert.deepEqual(scenarios, [
+    { scenario: "fresh", action: "agentrouter", launched: true, providerOnly: false, targetOnly: true, script: "Open-AgentRouterLogin.ps1" },
+    { scenario: "pending", action: "agentrouter", launched: true, providerOnly: false, targetOnly: true, script: "Open-AgentRouterLogin.ps1" },
+    { scenario: "github", action: "github", launched: true, providerOnly: false, targetOnly: false, script: "Open-AgentRouterLogin.ps1" },
+    { scenario: "closed", action: "provider_closed", launched: true, providerOnly: false, targetOnly: true, script: "Open-AgentRouterLogin.ps1" },
+    { scenario: "active", action: "active", launched: false, providerOnly: false, targetOnly: false, script: null },
+  ]);
+});
+
 test("pending LinuxDO verification respects backoff without blocking GitHub", async () => {
   const scenarios = await schedulerScenario([
     "$results = @()",

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { closeAutomationContext } from "../src/automation-context-close.mjs";
+import { closeAutomationContext, automationCleanupAllowsRecovery } from "../src/automation-context-close.mjs";
 
 test("automation context close returns immediately after a normal close", async () => {
   let closed = false;
@@ -29,6 +29,7 @@ test("automation context close is bounded and runs one cleanup fallback", async 
 
   assert.ok(Date.now() - startedAt < 1_000);
   assert.equal(fallbackCalls, 1);
+  assert.equal(automationCleanupAllowsRecovery(result), true);
   assert.deepEqual(result, {
     closed: false,
     timedOut: true,
@@ -51,4 +52,11 @@ test("automation context close reports fallback failure without hanging", async 
     fallbackAttempted: true,
     fallbackSucceeded: false,
   });
+  assert.equal(automationCleanupAllowsRecovery(result), false);
+});
+
+test("unknown browser cleanup never permits a new recovery context", () => {
+  assert.equal(automationCleanupAllowsRecovery(null), false);
+  assert.equal(automationCleanupAllowsRecovery({ fallbackSucceeded: true }), false);
+  assert.equal(automationCleanupAllowsRecovery({ closed: true }), true);
 });

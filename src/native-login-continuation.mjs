@@ -22,6 +22,9 @@ export async function continueNativeCheckinAfterLogin(target, config, loginOutco
       reason: '原生登录恢复后，原生签到页面或接口明确确认今日已签到',
       url: confirmation.url,
       observedAt: confirmation.observedAt,
+      evidence: confirmation.evidence,
+      cycle: confirmation.cycle,
+      submissionAttempted: confirmation.submissionAttempted,
       nativePreflight: true,
     };
   }

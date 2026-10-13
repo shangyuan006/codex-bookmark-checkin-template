@@ -21,3 +21,12 @@ test("OAuth provider fallback fails closed for ambiguous or non-action labels", 
   ], "GitHub"), -1);
   assert.equal(selectOAuthProviderControlIndex([], "GitHub"), -1);
 });
+
+test("OAuth provider fallback recognizes both LinuxDO label variants without selecting a different provider", () => {
+  for (const provider of ["LinuxDO", "Linux DO"]) {
+    assert.equal(selectOAuthProviderControlIndex(["使用 Linux DO 继续", "使用 GitHub 继续"], provider), 0);
+    assert.equal(selectOAuthProviderControlIndex(["LinuxDO 登录"], provider), 0);
+    assert.equal(selectOAuthProviderControlIndex(["Linux DO", "GitHub 登录"], provider), -1);
+    assert.equal(selectOAuthProviderControlIndex(["Linux DO 登录", "LinuxDO 登录"], provider), -1);
+  }
+});

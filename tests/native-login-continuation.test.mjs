@@ -4,6 +4,7 @@ import {continueNativeCheckinAfterLogin} from '../src/native-login-continuation.
 import {freshNativePreflightHandoffs, freshNativePreflightResults} from '../src/native-preflight-state.mjs';
 import {isRetryEligible, filterAutomaticRetryOrigins} from '../src/retry-policy.mjs';
 import {isTerminalResult} from '../src/result-contract.mjs';
+import {bindSuccessEvidence,successEvidence,reconcileCheckinResult} from '../src/checkin-evidence.mjs';
 const target={origin:'https://one.example'};
 const config={nativeChallengePreflight:[{url:'https://one.example/profile',action:{actionTexts:['Check in']}}]};
 
@@ -15,6 +16,19 @@ test('successful login continues native check-in and requires confirmation for t
   });
   assert.equal(result.status,'signed');
   assert.equal(result.nativePreflight,true);
+});
+
+test('native login continuation retains the original bound completion proof through report verification',async()=>{
+  const now=new Date();
+  const proof=bindSuccessEvidence({origin:target.origin,status:'signed',
+    evidence:successEvidence('page_text','native_confirmed_completion',now),submissionAttempted:true},target,config,now);
+  const result=await continueNativeCheckinAfterLogin(target,config,{succeeded:true},{
+    runPreflight:async()=>{},readConfirmations:async()=>new Map([[target.origin,proof]]),
+  });
+  assert.deepEqual(result.evidence,proof.evidence);
+  assert.deepEqual(result.cycle,proof.cycle);
+  assert.equal(result.submissionAttempted,true);
+  assert.equal(reconcileCheckinResult({...result,origin:target.origin},result.evidence,now,{target,config,requireBinding:true}).status,'signed');
 });
 test('native login without check-in proof requires attention instead of falling back to a different session',async()=>{
   const result=await continueNativeCheckinAfterLogin(target,config,{succeeded:true},{

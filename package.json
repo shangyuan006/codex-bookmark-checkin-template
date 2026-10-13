@@ -10,11 +10,14 @@
     "preflight": "node src/preflight.mjs",
     "dry-run": "node src/index.mjs --dry-run",
     "status": "node src/status-dashboard.mjs",
+    "contract:generate": "node scripts/generate-checkin-contract.mjs",
+    "contract:check": "node scripts/generate-checkin-contract.mjs --check",
+    "release": "node src/code-release.mjs",
     "start": "node src/index.mjs"
   },
   "dependencies": {
     "playwright-core": "1.61.1",
-    "sharp": "^0.35.4",
+    "sharp": "^0.35.5",
     "tesseract.js": "^7.0.0"
   }
 }

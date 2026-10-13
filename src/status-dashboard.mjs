@@ -3,8 +3,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { redactPrivateResultText, ensurePrivateDirectory } from './security.mjs';
+import { CHECKIN_CONTRACT } from './checkin-contract.generated.mjs';
+import { completionEvidenceKind, normalizeBoundEvidenceResult } from './checkin-evidence.mjs';
+import { loadStatusHistory } from './status-history.mjs';
+import { readSubmissionJournal } from './submission-guard.mjs';
 
-const states=new Set(['signed','already_signed','not_available','abandoned','deferred','needs_attention','interactive_challenge','managed_challenge_timeout','login_required','unconfirmed','error','no_action','visited','clicked']);
+const states=new Set(CHECKIN_CONTRACT.statuses);
 const escape=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const code=value=>/^[a-z][a-z0-9_.-]{0,79}$/i.test(String(value??''))?value:'—';
 const time=value=>Number.isFinite(Date.parse(value??''))?new Date(value).toISOString():'—';
@@ -21,11 +25,12 @@ function localDateKey(now) {
   return [now.getFullYear(),String(now.getMonth()+1).padStart(2,'0'),String(now.getDate()).padStart(2,'0')].join('');
 }
 
-export function statusPageModel(report={},handoff={},verification={},profiles=[],abandonment={}, {now=new Date()}={}) {
+export function statusPageModel(report={},handoff={},verification={},profiles=[],abandonment={}, {now=new Date(),history={days:[]},expectedOrigins=[],quarantineCount=0}={}) {
+  const displayResults=(report.results??[]).map(result=>normalizeBoundEvidenceResult(result,undefined,now));
   const reportDay=String(report.runId??'').match(/^(\d{8})-/)?.[1];
   const abandoned=new Set(abandonment.date===reportDay&&reportDay===localDateKey(now)
     &&Array.isArray(abandonment.origins)?abandonment.origins.map(canonicalOrigin).filter(Boolean):[]);
-  for(const result of report.results??[]) {
+  for(const result of displayResults) {
     if(['signed','already_signed','not_available'].includes(result.status)) abandoned.delete(result.origin);
   }
   const pending=new Set((handoff.targets??[]).map(target=>target.origin));
@@ -33,22 +38,39 @@ export function statusPageModel(report={},handoff={},verification={},profiles=[]
     if(!['signed','already_signed','not_available'].includes(target.verificationStatus)) pending.add(target.origin);
   }
   return {
-    generatedAt:new Date().toISOString(),finishedAt:time(report.finishedAt),
+    generatedAt:now.toISOString(),finishedAt:time(report.finishedAt),history,quarantineCount,
+    stale:!Number.isFinite(Date.parse(report.finishedAt??''))||now.getTime()-Date.parse(report.finishedAt)>26*60*60*1000,
+    missingCount:expectedOrigins.filter(origin=>!(report.results??[]).some(result=>result.origin===origin)).length,
     complete:report.isComplete===true&&report.runState==='final',
-    rows:(report.results??[]).map(result=>({
+    rows:displayResults.map(result=>({
       host:host(result.origin),status:abandoned.has(result.origin)?'abandoned':states.has(result.status)?result.status:'unconfirmed',
       reason:abandoned.has(result.origin)?'今日按用户要求跳过，不再重试':redactPrivateResultText(String(result.reason??'')).slice(0,240),
       evidence:abandoned.has(result.origin)?'user_today_skip':code(result.evidence?.source??result.evidence?.sources?.[0]),
+      evidenceKind:completionEvidenceKind(result,now),
       observedAt:time(result.observedAt??result.evidence?.confirmedAt),nextRetry:abandoned.has(result.origin)?'—':time(result.nextEligibleAt),
       failureCode:abandoned.has(result.origin)?'—':code(result.failureCode),manual:!abandoned.has(result.origin)&&pending.has(result.origin)&&!['signed','already_signed','not_available','abandoned'].includes(result.status),
+      historicalWarningCount:Math.max(0,Number(result.historicalSubmissionWarning?.pendingCount)||0)
+        +(result.accountResults??[]).reduce((n,a)=>n+Math.max(0,Number(a.historicalSubmissionWarning?.pendingCount)||0),0),
       durationMs:Number.isFinite(result.durationMs)?Math.max(0,result.durationMs):null,
       requests:Number.isFinite(result.metrics?.requests)?Math.max(0,result.metrics.requests):null,adapter:code(result.metrics?.adapter),
-      accounts:(result.accountResults??[]).map(account=>({provider:['GitHub','LinuxDO'].includes(account.provider)?account.provider:'账号',status:abandoned.has(result.origin)?'abandoned':states.has(account.status)?account.status:'unconfirmed'})),
+      accounts:(result.accountResults??[]).map(account=>({provider:['GitHub','LinuxDO'].includes(account.provider)?account.provider:'账号',status:abandoned.has(result.origin)?'abandoned':states.has(account.status)?account.status:'unconfirmed',evidenceKind:completionEvidenceKind({...account,origin:account.origin??result.origin},now)})),
     })),profiles:profiles.map((p,index)=>({label:`隔离配置 ${index+1}`,sizeBytes:p.sizeBytes,partial:p.partial===true})),
   };
 }
 
 export function renderStatusPage(model) {
+  const displayModel={...model,rows:model.rows.map(row=>row.historicalWarningCount ? {...row,
+    reason:`${row.reason}；历史未确认记录 ${row.historicalWarningCount} 条（与本周期状态分开记录）`} : row)};
+  const history = (model.history?.days??[]).map(day=>`<tr><td>${escape(day.date)}</td><td>${day.accounts}</td><td>${day.counts.authoritative}</td><td>${day.counts.user_rule}</td><td>${day.counts.unbound}</td><td>${day.counts.pending}</td><td>${day.counts.uncertain}</td></tr>`).join('');
+  const banner = `${model.stale?'<p class="pending">报告已过期或没有有效时间，请重新生成快照。</p>':''}${model.missingCount?`<p class="pending">当前计划中有 ${model.missingCount} 个站点缺少报告。</p>`:''}${model.quarantineCount?`<p class="pending">有 ${model.quarantineCount} 次不确定提交处于持久隔离中。</p>`:''}`;
+  const rows = model.rows.flatMap(row => row.accounts.length ? row.accounts : [row]);
+  const count = kind => rows.filter(row=>row.evidenceKind===kind).length;
+  const summary = `<p class="hint">权威确认 ${count('authoritative')} · 用户规则完成 ${count('user_rule')} · 缺少完整证据 ${count('unbound')}。三者分开统计。</p>`;
+  const calendar = `<h2>每日历史（按账号统计，最近 31 天）</h2><div class="table"><table><thead><tr><th>日期</th><th>账号数</th><th>权威确认</th><th>用户规则</th><th>证据不完整</th><th>待处理</th><th>提交不确定</th></tr></thead><tbody>${history}</tbody></table></div><p class="hint">${model.history?.unreadableReports??0} 个历史报告不可读取${model.history?.truncated?'；已达到读取上限':''}。</p>`;
+  return renderCurrentStatusPage(displayModel).replace('<div class="toolbar">',`${banner}${summary}<div class="toolbar">`).replace('<footer>',`${calendar}<footer>`);
+}
+
+function renderCurrentStatusPage(model) {
   const script=`const q=document.querySelector('#search'),s=document.querySelector('#status');function filter(){for(const r of document.querySelectorAll('tbody tr'))r.hidden=!(r.textContent.toLowerCase().includes(q.value.toLowerCase())&&(!s.value||r.dataset.status===s.value));}q.addEventListener('input',filter);s.addEventListener('change',filter);`;
   const hash=createHash('sha256').update(script).digest('base64');
   const rows=model.rows.map(r=>`<tr data-status="${escape(r.status)}"><td>${escape(r.host)}${r.accounts.map(a=>`<small>${escape(a.provider)} · ${escape(a.status)}</small>`).join('')}</td><td>${escape(r.status==='abandoned'?'今日跳过':r.status)}${r.manual?'<small class="pending">待人工处理</small>':''}</td><td>${escape(r.evidence)}<small>${escape(r.observedAt)}</small></td><td>${escape(r.reason)}<small>${escape(r.failureCode)}</small></td><td>${escape(r.nextRetry)}</td><td>${r.durationMs==null?'—':(r.durationMs/1000).toFixed(1)+'s'}<small>${escape(r.adapter)} · ${r.requests==null?'—':r.requests} 次协议请求</small></td></tr>`).join('');
@@ -90,7 +112,11 @@ export async function generateStatusPage(root,{includeProfiles=false}={}){
   const sameDay=document=>/^\d{8}-/.test(report.runId??'')&&String(document.sourceRunId??'').slice(0,8)===report.runId.slice(0,8);
   const currentHandoff=sameDay(handoff)?handoff:{};
   const currentVerification=sameDay(verification)?verification:{};
-  const model=statusPageModel(report,currentHandoff,currentVerification,profiles,abandonment);
+  const [history,plan,journal]=await Promise.all([loadStatusHistory(root),json(path.join(root,'data/last-valid-bookmark-plan.json')),
+    readSubmissionJournal(path.join(root,'data/submission-journal.json')).catch(()=>({entries:[],unreadable:true}))]);
+  const model=statusPageModel(report,currentHandoff,currentVerification,profiles,abandonment,{history,
+    expectedOrigins:(plan.targets??[]).map(target=>target.origin),
+    quarantineCount:journal.unreadable?'未知（隔离记录不可读取）':journal.entries.filter(entry=>['intent','uncertain'].includes(entry.state)).length});
   const output=path.join(root,'outputs/status.html');
   await ensurePrivateDirectory(path.dirname(output));
   await fs.writeFile(output,renderStatusPage(model),{encoding:'utf8',mode:0o600});

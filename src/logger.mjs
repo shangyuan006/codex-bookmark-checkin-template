@@ -6,13 +6,18 @@ import {
   redactPrivateResultText,
 } from "./security.mjs";
 import { isTerminalResult } from "./result-contract.mjs";
-import { reconcileCheckinResult } from "./checkin-evidence.mjs";
+import { reconcileCheckinResult, normalizeBoundEvidenceResult, clearResolvedFailureFields } from "./checkin-evidence.mjs";
+import { syncManualCompletion } from "./manual-result-reconciliation.mjs";
 
 export function sanitizeForPersistence(value) {
   if (typeof value === "string") return redactPrivateResultText(value);
   if (Array.isArray(value)) return value.map(sanitizeForPersistence);
   if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeForPersistence(item)]));
+  // Whole-page controls can include account menus and unrelated private links.
+  // They are diagnostic input, never required completion evidence.
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => key !== "controls")
+    .map(([key, item]) => [key, sanitizeForPersistence(item)]));
 }
 
 function completeFinalReport(report) {
@@ -34,32 +39,45 @@ export function summarizeResults(results) {
 }
 
 function completionEvidenceStrength(result, now) {
+  if (result?.accountResults?.length) {
+    const strengths = result.accountResults.map(account=>completionEvidenceStrength({...account,origin:account.origin??result.origin},now));
+    return strengths.every(value=>value>0) ? Math.min(...strengths) : 0;
+  }
   if (!["signed", "already_signed"].includes(result?.status)
     || reconcileCheckinResult(result, result.evidence, now).status === "unconfirmed") return 0;
   if (result.evidence.source === "user_rule") return result.confirmationSource === "operator_confirmation" ? 1 : 2;
   return 3;
 }
 
+function completionEvidenceTime(result) {
+  if (result?.accountResults?.length) return Math.min(...result.accountResults.map(completionEvidenceTime));
+  return Date.parse(result?.evidence?.confirmedAt??'');
+}
+
 function promoteResult(current, incoming, now) {
-  if (!incoming || !isTerminalResult(incoming)) return current;
+  const resolvedCurrent = completionEvidenceStrength(current, now) > 0
+    ? clearResolvedFailureFields(current) : current;
+  if (!incoming || !isTerminalResult(incoming,now)) return resolvedCurrent;
+  if ((incoming.actionType ?? "checkin") !== (current.actionType ?? "checkin")) return resolvedCurrent;
   const incomingStrength = completionEvidenceStrength(incoming, now);
-  if (["signed", "already_signed"].includes(incoming.status) && incomingStrength === 0) return current;
-  const statusPromotion = !isTerminalResult(current)
+  if (["signed", "already_signed"].includes(incoming.status) && incomingStrength === 0) return resolvedCurrent;
+  const statusPromotion = !isTerminalResult(current,now)
     || (incoming.status === "signed" && current.status !== "signed");
   const currentStrength = completionEvidenceStrength(current, now);
   const strongerEvidence = incomingStrength > currentStrength
     && ["signed", "already_signed"].includes(current.status)
-    && (!currentStrength || Date.parse(incoming.evidence.confirmedAt) >= Date.parse(current.evidence.confirmedAt));
-  if (!statusPromotion && !strongerEvidence) return current;
+    && (!currentStrength || completionEvidenceTime(incoming) >= completionEvidenceTime(current));
+  if (!statusPromotion && !strongerEvidence) return resolvedCurrent;
   const promoted = { ...current, ...incoming };
   if (currentStrength > incomingStrength || (currentStrength && incomingStrength
-    && Date.parse(incoming.evidence.confirmedAt) < Date.parse(current.evidence.confirmedAt))) {
+    && completionEvidenceTime(incoming) < completionEvidenceTime(current))) {
     promoted.evidence = current.evidence;
+    if (current.accountResults?.length) promoted.accountResults = current.accountResults;
   }
   if (current.status === "signed" && incoming.status === "already_signed") promoted.status = "signed";
   if ((promoted.evidence?.authoritative === true || strongerEvidence) && !incoming.confirmationSource
     && promoted.confirmationSource === "operator_confirmation") delete promoted.confirmationSource;
-  return promoted;
+  return clearResolvedFailureFields(promoted);
 }
 
 function currentBookmarkPlan(incoming) {
@@ -84,7 +102,7 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
     || runDate(incoming.runId) !== latestDate) return null;
 
   const incomingByOrigin = new Map(incoming.results
-    .filter((result) => result?.origin && isTerminalResult(result)
+    .filter((result) => result?.origin && isTerminalResult(result,reconciledAt)
       && (!["signed", "already_signed"].includes(result.status)
         || completionEvidenceStrength(result, reconciledAt) > 0))
     .map((result) => [result.origin, result]));
@@ -184,17 +202,25 @@ export async function createRunLog(rootDirectory) {
 export async function writeRunResult(rootDirectory, runLog, result, {
   updateLatest = true,
   reconcileLatest = false,
+  now = new Date(),
 } = {}) {
   const runFile = path.join(runLog.directory, "result.json");
   const latestFile = path.join(rootDirectory, "latest.json");
-  const safeResult = sanitizeForPersistence(result);
+  const at=Number.isFinite(Date.parse(result.finishedAt??''))?new Date(result.finishedAt):new Date();
+  const normalizedResults=(result.results??[]).map(entry=>normalizeBoundEvidenceResult(entry,undefined,at));
+  const safeResult = sanitizeForPersistence({...result,results:normalizedResults,
+    ...(result.summary?{summary:summarizeResults(normalizedResults)}:{})});
+  let manualSource=safeResult;
   await atomicWriteJson(runFile, safeResult);
   if (updateLatest) {
     await atomicWriteJson(latestFile, safeResult);
   } else if (reconcileLatest) {
     const latest = await fs.readFile(latestFile, "utf8").then(JSON.parse).catch(() => null);
     const reconciled = mergeAuthoritativeDailyResults(latest, safeResult);
-    if (reconciled) await atomicWriteJson(latestFile, reconciled);
+    if (reconciled) { await atomicWriteJson(latestFile, reconciled); manualSource=reconciled; }
+  }
+  if(safeResult.runState==="final" && safeResult.isComplete===true) {
+    await syncManualCompletion(path.dirname(path.resolve(rootDirectory)),manualSource,{now});
   }
   return runFile;
 }

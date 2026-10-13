@@ -100,5 +100,5 @@ test('OAuth wiring preserves the settled provider stage and manual-only result b
   const oauth=await fs.readFile(new URL('../src/oauth-login.mjs',import.meta.url),'utf8');
   const reauth=await fs.readFile(new URL('../src/reauth-checkin.mjs',import.meta.url),'utf8');
   assert.match(oauth,/linuxDoProbeFailureStage\(result\);\s*if \(failureStage\) setOAuthStage\(failureStage\)/);
-  assert.match(reauth,/if \(!providerRecovery\.succeeded\) \{\s*return reauthLoginFailureResult\(rule\.provider, providerRecovery\.oauthStage, \{ beforeLogout: true \}\)/);
+  assert.match(reauth,/if \(!providerRecovery\.succeeded\) \{\s*return reauthLoginFailureResult\(rule\.provider, providerRecovery\.oauthStage, \{ beforeLogout: true, diagnostics:providerRecovery \}\)/);
 });

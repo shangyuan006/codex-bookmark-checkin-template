@@ -105,6 +105,27 @@ test('PowerShell retry paths skip blockers while handoff and successful manual v
   assert.deepEqual(result, { handoff: [origin], auto: false, fallback: [], retry: false, unconfirmedRetry: false, terminal: true });
 });
 
+test('PowerShell retry deadlines compare absolute instants across UTC and local offsets', async () => {
+  const runner = await fs.readFile(new URL('../scripts/Run-Checkin.ps1', import.meta.url), 'utf8');
+  const retryFunction = runner.slice(runner.indexOf('function Test-HasImmediateRetry('), runner.indexOf('function Resolve-RequestedCheckinOrigins('));
+  for (const shell of process.platform === 'win32' ? ['pwsh', 'powershell'] : ['pwsh']) {
+    const { stdout } = await exec(shell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', `
+      $ErrorActionPreference = 'Stop'
+      . ./scripts/ResultContract.ps1
+      function Test-IsCompleteFinalReport($Report) { $true }
+      ${retryFunction}
+      $result = '{"status":"deferred","nextEligibleAt":"2026-10-10T02:35:09.339Z"}' | ConvertFrom-Json
+      $report = [pscustomobject]@{results=@($result)}
+      $future = Test-HasImmediateRetry $report ([datetimeoffset]'2026-10-10T10:10:01+08:00')
+      $due = Test-HasImmediateRetry $report ([datetimeoffset]'2026-10-10T10:35:09.339+08:00')
+      $result.nextEligibleAt = '2026-10-10T04:10:00+02:00'
+      $past = Test-HasImmediateRetry $report ([datetimeoffset]'2026-10-10T10:10:01+08:00')
+      [pscustomobject]@{future=$future;due=$due;past=$past} | ConvertTo-Json -Compress
+    `], { windowsHide: true });
+    assert.deepEqual(JSON.parse(stdout), { future: false, due: true, past: true }, shell);
+  }
+});
+
 test('wrapper preflight distinguishes automatic continuation from the first manual or explicit attempt', async () => {
   const runner = await fs.readFile(new URL('../scripts/Run-Checkin.ps1', import.meta.url), 'utf8');
   const start = runner.indexOf('                if ($null -ne $resumeCandidate)', runner.indexOf('if ($preflightConfigured) {'));

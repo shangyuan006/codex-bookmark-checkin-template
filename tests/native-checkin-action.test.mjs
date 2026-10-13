@@ -127,7 +127,10 @@ test("原生 New API 签到只接受接口权威状态", async () => {
   assert.match(source, /inspectionMode === "execute-new-api"/);
   assert.match(source, /await evaluateOverRawCdp\(port, expectedOrigin, expression/);
   assert.match(source, /runNewApiCheckinInBrowser\.toString\(\)/);
-  assert.match(source, /newApiConfirmed = \["signed", "already_signed"\]\.includes\(state\.status\)/);
+  assert.match(source, /const reconciled=reconcileSubmissionResult\(confirmed,await scope\.allPending\(\)/);
+  assert.match(source, /newApiConfirmed = \["signed", "already_signed"\]\.includes\(reconciled\.status\)/);
+  assert.match(source, /readOnly:true/);
+  assert.match(source, /await scope\.begin\(\)/);
   assert.match(source, /status: "unconfirmed"/);
   assert.match(source, /newApiConfirmed,/);
   assert.match(source, /if \(executeNewApiCheckin\) await inspectNewApiWithRawCdp\(\)/);

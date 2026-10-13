@@ -48,7 +48,7 @@ function resolveConfiguredBookmarkSources(config) {
   const additionalSources = Array.isArray(config?.additionalBookmarkSources)
     ? config.additionalBookmarkSources
     : [];
-  const multiSource = configuredAsArray || additionalSources.length > 0;
+  const multiSource = configuredAsArray || additionalSources.length > 0 || config?.containerFolderSelectors != null;
   if (!multiSource) return null;
   if (configuredAsArray && additionalSources.length > 0) {
     return [{
@@ -85,6 +85,7 @@ function resolveConfiguredBookmarkSources(config) {
       name: configuredSourceName(source, index),
       path: sourcePath,
       optional: source?.optional === true,
+      containerFolderSelectors: source?.containerFolderSelectors ?? config.containerFolderSelectors,
       mobileFolderNames: folderNames(source?.mobileFolderNames).length > 0
         ? folderNames(source.mobileFolderNames)
         : globalMobileFolderNames,
@@ -97,7 +98,7 @@ function resolveConfiguredBookmarkSources(config) {
 }
 
 async function inspectConfiguredSource(source) {
-  const scopeConfigured = source.mobileFolderNames.length > 0 && source.targetFolderNames.length > 0;
+  const scopeConfigured = (source.containerFolderSelectors != null || source.mobileFolderNames.length > 0) && source.targetFolderNames.length > 0;
   const base = {
     id: source.id,
     name: source.name,
@@ -108,7 +109,7 @@ async function inspectConfiguredSource(source) {
   if (!scopeConfigured) return { ...base, status: "scope_unconfirmed", readable: false, scopeMatched: false };
 
   let firstReadable = null;
-  for (let index = 0; index < 2; index += 1) {
+  for (let index = 0; index < (source.containerFolderSelectors != null ? 1 : 2); index += 1) {
     const candidatePath = index === 0 ? source.path : `${source.path}.bak`;
     try {
       const plan = await readBookmarkPlan(candidatePath, {
@@ -116,6 +117,7 @@ async function inspectConfiguredSource(source) {
         bookmarkSourceName: source.name,
         mobileFolderNames: source.mobileFolderNames,
         targetFolderNames: source.targetFolderNames,
+        containerFolderSelectors: source.containerFolderSelectors,
       });
       const report = {
         ...base,

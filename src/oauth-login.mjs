@@ -3,11 +3,13 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { findBookmarkTarget } from "./bookmarks.mjs";
-import { launchAutomationContext, processCandidate } from "./browser.mjs";
+import { launchAutomationContext, processCandidate, dismissConfiguredPreCheckinOverlay } from "./browser.mjs";
+import { prepareOAuthTargetPage, readOAuthTargetSurface } from './oauth-target-state.mjs';
 import { connectOverCdpWithRetry } from "./native-cdp.mjs";
 import { selectPreferredOAuthTargetPage } from "./oauth-page-selection.mjs";
 import { linuxDoProbeFailureStage, probeProviderSessionInContext } from "./oauth-provider-session.mjs";
 import { writeLinuxDoProbeDiagnostic } from "./linuxdo-probe-diagnostics.mjs";
+import {writeOAuthFlowDiagnostic} from './oauth-flow-diagnostics.mjs';
 import { rewriteConfiguredOAuthCallbackUrl } from "./oauth-callback-rewrite.mjs";
 import {
   authorizeConfiguredOAuthProvider,
@@ -22,6 +24,7 @@ import {
 } from "./oauth-transition.mjs";
 import {
   isLinuxDoLoginPage,
+  linuxDoAuthorizationRequiresLogin,
   recoverSavedLinuxDoLogin,
   shouldRetryLinuxDoLoginRecovery,
 } from "./oauth-linuxdo-login.mjs";
@@ -173,17 +176,44 @@ let authorizationOutcome = null;
 let experimentalSsoChallengeOutcome = experimentalSsoFrameClick ? "not_exercised" : null;
 let providerAuthorizationChallengeOutcome = null;
 let providerAuthorizationChallengeClicks = 0;
+const oauthFlowStartedAt = Date.now();
+const oauthStageHistory = [];
+let targetSurface = 'unavailable';
+let noticeObserved = false;
+let noticeDismissed = false;
+
+function observeTargetPage(observation) {
+  targetSurface = observation.targetSurface;
+  noticeObserved ||= observation.noticeObserved === true;
+  noticeDismissed ||= observation.noticeDismissed === true;
+}
+
+async function prepareTargetPage(page) {
+  return prepareOAuthTargetPage(page, origin, config, {
+    dismissOverlay: dismissConfiguredPreCheckinOverlay, onObservation: observeTargetPage,
+  });
+}
 
 function setOAuthStage(value) {
   oauthStage = value;
+  if (oauthStageHistory.at(-1)!==value) oauthStageHistory.push(value);
   if (privateResult) process.stderr.write(`${JSON.stringify({ oauthStage })}\n`);
 }
 setOAuthStage("target_login");
 
-function printResult(status, details = {}) {
+async function printResult(status, details = {}) {
+  await writeOAuthFlowDiagnostic({
+    flow:diagnosticStageIndex>=0 ? process.argv[diagnosticStageIndex+1]
+      : providerOnly ? 'automatic_provider' : 'automatic_target',
+    provider:/linux\s*do/i.test(provider) ? 'LinuxDO' : /github/i.test(provider) ? 'GitHub' : 'other',
+    status, oauthStage, stages:oauthStageHistory, elapsedMs:Date.now()-oauthFlowStartedAt,
+    authorizationOutcome, providerAuthorizationChallengeOutcome, providerAuthorizationChallengeClicks,
+    targetSurface, noticeObserved, noticeDismissed,
+  });
   console.log(JSON.stringify({
     status,
     oauthStage,
+    targetSurface, noticeObserved, noticeDismissed,
     ...(authorizationOutcome ? { authorizationOutcome } : {}),
     ...(experimentalSsoChallengeOutcome ? { experimentalSsoChallengeOutcome } : {}),
     ...(providerAuthorizationChallengeOutcome ? { providerAuthorizationChallengeOutcome } : {}),
@@ -344,10 +374,10 @@ async function runProviderOnlyFlow() {
 if (providerOnly) {
   try {
     const succeeded = await runProviderOnlyFlow();
-    printResult(succeeded ? "logged_in" : "needs_attention");
+    await printResult(succeeded ? "logged_in" : "needs_attention");
     if (!succeeded) process.exitCode = 2;
   } catch {
-    printResult("needs_attention");
+    await printResult("needs_attention");
     process.exitCode = 2;
   }
 } else {
@@ -373,7 +403,7 @@ if (providerOnly) {
   const reusedSession = await reuseExistingNativeTargetSession(page);
   if (reusedSession) {
     setOAuthStage("completed");
-    printResult("logged_in", {
+    await printResult("logged_in", {
       finalOriginMatchesTarget: true,
       loginFormVisible: false,
       ...(reusedSession.checkinStatus ? { checkinStatus: reusedSession.checkinStatus } : {}),
@@ -400,6 +430,11 @@ if (providerOnly) {
     setOAuthStage("provider_button");
     const providerDeadline = Date.now() + providerWaitMs;
     while (Date.now() < providerDeadline) {
+      const observation = await prepareTargetPage(currentPage);
+      if (config.reauthCheckinRules?.[origin] && observation.targetSurface === 'authenticated_target') {
+        setOAuthStage('logout_verification');
+        throw new Error('Target session is still authenticated; no provider login was attempted');
+      }
       const agreementCheckbox = currentPage.locator('input[type="checkbox"]:visible');
       if (await agreementCheckbox.count() === 1 && !await agreementCheckbox.isChecked()) {
         await agreementCheckbox.check({ force: true, timeout: 5000 });
@@ -507,7 +542,8 @@ if (providerOnly) {
       if (recovery.challengeObserved && !recovery.recovered) {
         setOAuthStage("linuxdo_login_challenge");
       }
-      if (recovery.recovered || !isLinuxDoLoginPage(page)) break;
+      if (recovery.recovered) break;
+      if (!isLinuxDoLoginPage(page)) throw new Error('LinuxDO login recovery left the login page without a verified session');
       if (!shouldRetryLinuxDoLoginRecovery(recovery)) break;
       await page.waitForTimeout(Math.min(3_000, providerWaitMs));
     }
@@ -604,8 +640,14 @@ if (providerOnly) {
         ? "resolved_after_click"
         : "observed_auto_resolved";
     }
-    authorizationOutcome = "authorization_completed";
     await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+    if (await linuxDoAuthorizationRequiresLogin(page, provider)) {
+      authorizationOutcome = "provider_login_required";
+      setOAuthStage("linuxdo_provider_login_required");
+      throw new Error("LinuxDO authorization returned to the provider login form");
+    }
+    // Leaving the authorize URL is a transition, not a completed callback.
+    authorizationOutcome = "authorization_departed";
   }
 
   setOAuthStage("target_callback");
@@ -629,7 +671,13 @@ if (providerOnly) {
   }
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(1500);
+  if (await linuxDoAuthorizationRequiresLogin(page, provider)) {
+    authorizationOutcome = "provider_login_required";
+    setOAuthStage("linuxdo_provider_login_required");
+    throw new Error("LinuxDO callback did not proceed beyond the provider login form");
+  }
   const finalUrl = page.url();
+  observeTargetPage({ targetSurface: (await readOAuthTargetSurface(page, origin, config)).kind });
   const finalLocation = new URL(finalUrl);
   const visiblePassword = await page.locator('input[type="password"]:visible').count() > 0;
   let visibleProviderLogin = false;
@@ -674,8 +722,11 @@ if (providerOnly) {
   if (!loggedIn && interactiveAttention) {
     loggedIn = await waitForInteractiveTargetSession(context);
   }
-  if (loggedIn) setOAuthStage("completed");
-  printResult(loggedIn ? "logged_in" : "needs_attention", {
+  if (loggedIn) {
+    if (authorizationOutcome === "authorization_departed") authorizationOutcome = "authorization_completed";
+    setOAuthStage("completed");
+  }
+  await printResult(loggedIn ? "logged_in" : "needs_attention", {
     finalOriginMatchesTarget: loggedIn || finalLocation.origin === origin,
     loginFormVisible: loggedIn ? false : visiblePassword || visibleProviderLogin,
     ...(checkinStatus ? { checkinStatus } : {}),
@@ -696,12 +747,12 @@ if (providerOnly) {
       }
     }
     setOAuthStage("completed");
-    printResult("logged_in", {
+    await printResult("logged_in", {
       finalOriginMatchesTarget: true,
       loginFormVisible: false,
     });
   } else {
-    printResult("needs_attention");
+    await printResult("needs_attention");
     process.exitCode = 2;
   }
 } finally {

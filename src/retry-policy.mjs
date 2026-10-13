@@ -1,12 +1,10 @@
-export const RECOVERABLE_STATUSES = new Set([
-  "error", "login_required", "interactive_challenge", "managed_challenge_timeout",
-  "visited", "clicked", "no_action", "unconfirmed", "deferred",
-]);
+import { CHECKIN_CONTRACT } from './checkin-contract.generated.mjs';
+export const RECOVERABLE_STATUSES = new Set(CHECKIN_CONTRACT.recoverableStatuses);
 
 import { isTerminalResult } from "./result-contract.mjs";
 import { compatiblePriorResult, resultIdentity } from "./result-identity.mjs";
 
-export const TERMINAL_STATUSES = new Set(["signed", "already_signed"]);
+export const TERMINAL_STATUSES = new Set(CHECKIN_CONTRACT.successStatuses);
 
 export function recoveryEntriesForResults(results, targets, now = new Date()) {
   const byOrigin = new Map(targets.map(target => [target.origin, target]));

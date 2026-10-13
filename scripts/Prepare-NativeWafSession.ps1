@@ -255,6 +255,11 @@ foreach ($item in $items) {
                     actionOutcome = [string]$inspection.actionOutcome
                     challengeOutcome = [string]$inspection.challengeOutcome
                     newApiConfirmed = [bool]$inspection.newApiConfirmed
+                    evidence = $inspection.evidence
+                    cycle = $inspection.cycle
+                    actionResults = @($inspection.actionResults)
+                    requiredActionTypes = $inspection.requiredActionTypes
+                    submissionTrackedPerAction = $inspection.submissionTrackedPerAction -eq $true
                 }
                 Write-NativePreflightCheckpoint -Path $preflightPath -Results @($preflightResults + @($confirmedResult)) -Config $config
             }
@@ -263,7 +268,7 @@ foreach ($item in $items) {
         finally {
             Complete-NativePreflightAttempt -Cleanup { Close-AutomationBrowser $profilePath } -Failure $attemptFailure
         }
-        if ([string]$lastInspection.failureCode -eq 'safeline_client_challenge') { break }
+        if ([string]$lastInspection.failureCode -in @('safeline_client_challenge','submission_quarantined')) { break }
         if ($null -eq $inspection -and $inspectionAttempt -lt $item.maxAttempts) { Start-Sleep -Seconds 1 }
     }
     $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed') `
@@ -275,18 +280,29 @@ foreach ($item in $items) {
         -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
     $reportedInspection = if ($null -ne $inspection) { $inspection } else { $lastInspection }
     $requiresHandoff = -not $explicitlyConfirmed -and -not $endpointConfirmed `
-        -and [string]$reportedInspection.failureCode -eq 'safeline_client_challenge'
+        -and [string]$reportedInspection.failureCode -in @('safeline_client_challenge','submission_quarantined')
     if (-not $explicitlyConfirmed -and -not $endpointConfirmed -and -not $prepared) {
         Write-Warning "原生验证未能确认站点正文：$hostName"
     }
     $preflightResults += [pscustomobject]@{
         origin = $origin
         url = $url
-        status = if ($explicitlyConfirmed -or $endpointConfirmed) { Get-NativePreflightConfirmationStatus $inspection $explicitlyConfirmed $endpointConfirmed } elseif ($requiresHandoff) { 'interactive_challenge' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
-        failureCode = if ($requiresHandoff) { 'safeline_client_challenge' } else { $null }
+        status = if ($explicitlyConfirmed -or $endpointConfirmed) { Get-NativePreflightConfirmationStatus $inspection $explicitlyConfirmed $endpointConfirmed } elseif ($requiresHandoff -and [string]$reportedInspection.failureCode -eq 'submission_quarantined') { 'needs_attention' } elseif ($requiresHandoff) { 'interactive_challenge' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
+        failureCode = if ($requiresHandoff) { [string]$reportedInspection.failureCode } else { $null }
         retryable = if ($requiresHandoff) { $false } else { $null }
         preflightAttemptId = $AttemptId
-        reason = if ($explicitlyConfirmed -and $hasAction -and [bool]$inspection.actionAttempted) {
+        evidence = $reportedInspection.evidence
+        cycle = $reportedInspection.cycle
+        actionResults = @($reportedInspection.actionResults)
+        requiredActionTypes = $reportedInspection.requiredActionTypes
+        submissionTrackedPerAction = $reportedInspection.submissionTrackedPerAction -eq $true
+        submissionAttempted = $reportedInspection.submissionAttempted -eq $true
+        quarantine = $reportedInspection.quarantine
+        historicalSubmissionWarning = $reportedInspection.historicalSubmissionWarning
+        submissionObservation = $reportedInspection.submissionObservation
+        reason = if ($requiresHandoff -and [string]$reportedInspection.failureCode -eq 'submission_quarantined') {
+            '原生提交尚未取得完成证据，保持持久隔离，仅允许只读核验'
+        } elseif ($explicitlyConfirmed -and $hasAction -and [bool]$inspection.actionAttempted) {
             "原生 $($browser.DisplayName) 已执行签到动作，并由页面明确确认今天已签到"
         } elseif ($explicitlyConfirmed -and $hasNewApiCheckin -and [bool]$inspection.newApiConfirmed) {
             "原生 $($browser.DisplayName) 已执行 New API 签到，并由状态接口确认今天已签到"

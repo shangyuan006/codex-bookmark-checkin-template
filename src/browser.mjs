@@ -13,16 +13,23 @@ import { tryNewApiCaptchaCheckin, tryNewApiSignIn } from "./new-api-signin.mjs";
 import { tryBearerCheckin } from "./bearer-checkin.mjs";
 import { tryNewApiCheckin } from "./new-api-browser.mjs";
 export { runNewApiCheckinInBrowser, tryNewApiCheckin } from "./new-api-browser.mjs";
-import { stopAtConfiguredTerminal, successEvidence, verifyVisitCheckin } from "./checkin-evidence.mjs";
+import { stopAtConfiguredTerminal, successEvidence, verifyVisitCheckin, bindSuccessEvidence, reconcileCheckinResult } from "./checkin-evidence.mjs";
+import { SUBMISSION_SCOPE, guardPageSubmissions, beforePageSubmission, runWithSubmissionJournal, createSubmissionScope, attachSubmissionScope, quarantineResult } from './submission-guard.mjs';
 import { tryNewApiHttpFirst } from "./new-api-http.mjs";
+import { dailyReadinessEvidence } from "./checkin-evidence.mjs";
+import { runConfiguredDailyDashboardCheckin } from "./daily-dashboard-checkin.mjs";
+import { reconcileSubmissionResult, partitionSubmissions } from "./submission-guard.mjs";
 import { verifyConfiguredSavedLoginSession } from "./saved-login-session.mjs";
 import { readAfterNavigation } from "./page-state-read.mjs";
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
 import { readCloudflareFrameEvidence } from "./challenge-frame-state.mjs";
+import { getCloudflareRecoveryRule, continueCloudflareRecovery, cloudflareRecoveryHandoff } from './cloudflare-recovery.mjs';
+import { readSequentialDailyQuota, sequentialCompletionKind, sequentialActionType } from "./sequential-action-evidence.mjs";
 import {
   getConfiguredPreCheckinNavigationRule,
   getConfiguredPreCheckinTerminalPath,
   navigateConfiguredPreCheckinPage,
+  inspectConfiguredDailyUnsignedForm,
 } from "./pre-checkin-navigation.mjs";
 
 export {
@@ -42,6 +49,7 @@ const CANDIDATE_STATUS_PRIORITY = new Map([
   ["signed", 100],
   ["already_signed", 100],
   ["not_available", 95],
+  ["not_signed", 92],
   ["needs_attention", 90],
   ["login_required", 85],
   ["interactive_challenge", 84],
@@ -158,18 +166,26 @@ export async function tryConfiguredNewApiCheckin(page, activeOrigin, config = {}
   }
   if (hasCaptchaRule) {
     const rawRule = config.newApiCaptchaRules[activeOrigin];
-    return tryNewApiCaptchaCheckin(page, activeOrigin, config, async (image) => {
+    const result = await tryNewApiCaptchaCheckin(page, activeOrigin, config, async (image) => {
       const recognition = await recognizeAlphanumericCaptcha(image, { minLength: 5, maxLength: 5 });
       return reliableNewApiCaptchaCandidates(recognition, rawRule?.minConfidence ?? 30);
     });
+    return verifiedAdapterCompletion(result,'status_endpoint','captcha_status_confirmed');
   }
   if (hasSignInRule) {
-    return tryNewApiSignIn(page, activeOrigin, config);
+    return verifiedAdapterCompletion(await tryNewApiSignIn(page, activeOrigin, config),'reward_log','signin_reward_confirmed');
   }
   if (hasBearerRule) {
-    return tryBearerCheckin(page, activeOrigin, config);
+    return verifiedAdapterCompletion(await tryBearerCheckin(page, activeOrigin, config),'status_endpoint','bearer_status_confirmed');
   }
   return null;
+}
+
+// Use only immediately after an adapter's own authoritative verification, not
+// at the generic result boundary. An arbitrary success status is not proof.
+function verifiedAdapterCompletion(result,source,outcome) {
+  return ['signed','already_signed'].includes(result?.status) && !result.evidence?.confirmedAt
+    ? {...result,evidence:successEvidence(source,outcome)} : result;
 }
 
 function targetUsesConfiguredActiveOrigin(target, activeOrigin, configuredOrigins) {
@@ -374,8 +390,23 @@ export function getConfiguredSequentialActionRule(target, config = {}) {
     const url = assertBookmarkNavigation(String(step?.url || ""), allowedOrigins);
     const actionTexts = normalizedSequentialTexts(step?.actionTexts, `顺序动作第 ${index + 1} 步按钮文本`, 10);
     if (actionTexts.length === 0) throw new Error(`顺序动作第 ${index + 1} 步缺少按钮文本`);
+    const actionType = sequentialActionType({ ...step, url, actionTexts });
+    if (!/^[a-z][a-z0-9_-]{0,63}$/.test(actionType)) throw new Error('顺序动作 actionType 必须为稳定匿名标识');
+    const dailyQuotaPattern = step?.dailyQuotaPattern ?? null;
+    const dailyQuotaMinimum = Number(step?.dailyQuotaMinimum ?? 10);
+    if (step?.dailyQuotaZeroIsComplete === true && dailyQuotaPattern === null) {
+      throw new Error("顺序动作配额完成规则需要每日配额表达式");
+    }
+    if (dailyQuotaPattern !== null) {
+      if (typeof dailyQuotaPattern !== "string" || !dailyQuotaPattern || dailyQuotaPattern.length > 200
+        || !Number.isSafeInteger(dailyQuotaMinimum) || dailyQuotaMinimum < 1) {
+        throw new Error("顺序动作每日配额规则无效");
+      }
+      try { new RegExp(dailyQuotaPattern,"g"); } catch { throw new Error("顺序动作每日配额表达式无效"); }
+    }
     return {
       url,
+      actionType,
       actionTexts,
       actionTags: normalizedSequentialTags(step?.actionTags, `顺序动作第 ${index + 1} 步控件标签`),
       preferInteractive: step?.preferInteractive === true,
@@ -386,6 +417,10 @@ export function getConfiguredSequentialActionRule(target, config = {}) {
       responseEvidence: (step?.responseEvidence ?? []).map(normalizeSequentialResponseEvidence),
       waitMs: Math.max(1000, Math.min(60_000, Number(step?.waitMs) || 10_000)),
       disabledActionIsComplete: step?.disabledActionIsComplete === true,
+      dailyCheckin: step?.dailyCheckin === true,
+      dailyQuotaPattern,
+      dailyQuotaMinimum,
+      dailyQuotaZeroIsComplete: step?.dailyQuotaZeroIsComplete === true,
       acceptGenericCheckinState: step?.acceptGenericCheckinState !== false,
       reloadOnUnconfirmed: step?.reloadOnUnconfirmed === true,
     };
@@ -716,6 +751,19 @@ async function confirmConfiguredCheckinAfterWait(page, allowedOrigins, config, r
 
 export async function waitForManagedChallenge(page, config) {
   const pendingState = await waitForPendingCheckinState(page, config);
+  const origin = new URL(page.url()).origin;
+  const recoveryRule = getCloudflareRecoveryRule(origin, config);
+  if (recoveryRule && (['managed_challenge','interactive_challenge'].includes(pendingState.status)
+    || pendingState.unresolvedChallenge)) {
+    return continueCloudflareRecovery({
+      ...recoveryRule,
+      readState: async () => { assertBookmarkNavigation(page.url(), [origin]); return snapshotState(page); },
+      clickChallenge: () => clickVisibleNativeChallengeControl(page, origin, {
+        actionTexts:['签到'], clickChallenge:true, challengeFrameStableMs:recoveryRule.frameStableMs,
+      }),
+      wait:sleep,
+    });
+  }
   if (pendingState.status !== "managed_challenge") return pendingState;
   const deadline = Date.now() + config.cloudflareWaitMs;
   while (Date.now() < deadline) {
@@ -907,27 +955,23 @@ export async function clickConfiguredChallengeControl(page, rule, expectedOrigin
         }
       }
     }
-    let frameResult = null;
-    for (let frameAttempt = 1; frameAttempt <= 3; frameAttempt += 1) {
-      frameResult = await clickVisibleNativeChallengeControl(page, expectedOrigin, {
-        actionTexts: ["签到"],
-        clickChallenge: true,
-        challengeFrameStableMs: rule.frameStableMs,
+    const frameResult = await clickVisibleNativeChallengeControl(page, expectedOrigin, {
+      actionTexts: ["签到"], clickChallenge: true, challengeFrameStableMs: rule.frameStableMs,
+    });
+    if (['challenge_not_unique','challenge_frame_not_unique','challenge_click_failed'].includes(frameResult.outcome)) {
+      return cloudflareRecoveryHandoff(0);
+    }
+    if (frameResult.clicked || frameResult.details?.allowedFrameCount > 0
+      || frameResult.details?.allowedParentFrameCount > 0) {
+      return continueCloudflareRecovery({
+        waitMs:Math.max(0, deadline-Date.now()), maxClicks:3,
+        settleMs:Math.max(5000, Number(rule.settleMs)||5000), initialAttempts:frameResult.clicked?1:0,
+        readState:async () => { assertBookmarkNavigation(page.url(), allowedOrigins); return snapshotState(page); },
+        clickChallenge:() => clickVisibleNativeChallengeControl(page, expectedOrigin, {
+          actionTexts:['签到'], clickChallenge:true, challengeFrameStableMs:rule.frameStableMs,
+        }),
+        wait:sleep,
       });
-      if (!frameResult.clicked) break;
-      await sleep(500);
-      const afterFrameClick = await snapshotState(page);
-      if (["signed", "already_signed", "login_required", "deferred", "needs_attention"].includes(afterFrameClick.status)) {
-        return afterFrameClick;
-      }
-      if (frameAttempt < 3) continue;
-      return null;
-    }
-    if (frameResult.outcome === "challenge_not_unique") {
-      return { status: "needs_attention", reason: "自动验证找到多个可点击控件，已拒绝操作" };
-    }
-    if (frameResult.outcome === "challenge_click_failed") {
-      return { status: "needs_attention", reason: "自动验证控件点击失败" };
     }
     await sleep(Math.max(100, Math.min(1000, Number(config.checkinStatePollMs) || 500)));
     latest = await snapshotState(page);
@@ -1166,7 +1210,7 @@ async function inspectConfiguredGrowthCheckin(page, dateTokens) {
 async function reconcileConfiguredGrowthCheckinPage(page, target, activeUrl, config, state) {
   if (!isConfiguredGrowthCheckinPage(target, activeUrl, config)) return state;
   const evidence = await inspectConfiguredGrowthCheckin(page, shanghaiDateTokens());
-  return reconcileConfiguredGrowthCheckinState(target, activeUrl, config, state, evidence);
+  return verifiedAdapterCompletion(reconcileConfiguredGrowthCheckinState(target, activeUrl, config, state, evidence),'page_text','growth_page_confirmed');
 }
 
 async function inspectCalendarDayCheckin(page, expectedDate) {
@@ -1287,6 +1331,26 @@ export function classifyCalendarDayCheckinEvidence(evidence, { afterClick = fals
   return { status: "ready", reason: "日历签到页找到唯一可点击的当天日期" };
 }
 
+export async function waitForCalendarDayCheckinEvidence(page, target, config, {
+  afterClick = false, now = Date.now, readEvidence = inspectCalendarDayCheckin,
+} = {}) {
+  const configuredWaitMs = Number(config.calendarDayCheckinWaitMs ?? 15_000);
+  const waitMs = Number.isFinite(configuredWaitMs) ? Math.max(0, Math.min(45_000, configuredWaitMs)) : 15_000;
+  const pollMs = Math.max(100, Math.min(1000, Number(config.checkinStatePollMs) || 250));
+  const deadline = now() + waitMs;
+  let evidence;
+  do {
+    assertCalendarDayCheckinLocation(target, page.url(), config);
+    evidence = await readAfterNavigation(page, () => readEvidence(page, shanghaiCalendarDate(new Date(now()))));
+    assertCalendarDayCheckinLocation(target, page.url(), config);
+    const state = classifyCalendarDayCheckinEvidence(evidence, { afterClick });
+    if (["ready", "signed", "already_signed"].includes(state.status) || now() >= deadline) return evidence;
+    // Rendering a shell or a previous month's cells does not prove that the
+    // current day's control is absent. Retry observations, never submissions.
+    await page.waitForTimeout(Math.min(pollMs, Math.max(1, deadline - now())));
+  } while (true);
+}
+
 async function tryCalendarDayCheckin(page, target, activeUrl, config) {
   const allowedOrigins = target.allowedOrigins ?? [target.origin];
   const currentUrl = assertBookmarkNavigation(page.url(), allowedOrigins);
@@ -1296,8 +1360,7 @@ async function tryCalendarDayCheckin(page, target, activeUrl, config) {
   }
   await waitForExtendedDiscoveryContent(page, config);
   assertCalendarDayCheckinLocation(target, page.url(), config);
-  const expectedDate = shanghaiCalendarDate();
-  const before = await inspectCalendarDayCheckin(page, expectedDate);
+  const before = await waitForCalendarDayCheckinEvidence(page, target, config);
   const beforeState = classifyCalendarDayCheckinEvidence(before);
   if (beforeState.status !== "ready") return beforeState;
 
@@ -1308,6 +1371,7 @@ async function tryCalendarDayCheckin(page, target, activeUrl, config) {
     || !await action.isEnabled().catch(() => false)) {
     return { status: "needs_attention", reason: "日历签到当天日期按钮不唯一" };
   }
+  await beforePageSubmission(page);
   await action.click({ timeout: 10000 });
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
   await sleep(Math.max(1000, Number(config.actionWaitMs) || 0));
@@ -1316,7 +1380,7 @@ async function tryCalendarDayCheckin(page, target, activeUrl, config) {
   await waitForExtendedDiscoveryContent(page, config);
   assertCalendarDayCheckinLocation(target, page.url(), config);
 
-  const after = await inspectCalendarDayCheckin(page, expectedDate);
+  const after = await waitForCalendarDayCheckinEvidence(page, target, config, { afterClick: true });
   return classifyCalendarDayCheckinEvidence(after, { afterClick: true });
 }
 
@@ -1528,13 +1592,54 @@ export async function waitForCheckinAction(page, allowedOrigins, config = {}, ex
 
 async function clickCandidate(page, candidate, { domClick = false } = {}) {
   const locator = page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]').nth(candidate.index);
+  await beforePageSubmission(page);
   if (domClick) await locator.evaluate((element) => element.click());
   else await locator.click({ timeout: 10000 });
 }
 
+function inspectSequentialControl(element) {
+  const style = getComputedStyle(element), box = element.getBoundingClientRect();
+  return {
+    tagName: element.tagName,
+    text: String(element.innerText || element.value || element.getAttribute("aria-label") || element.title || "").replace(/\s+/g, " ").trim(),
+    visible: element.isConnected && style.display !== "none" && style.visibility !== "hidden" && box.width > 0 && box.height > 0,
+    disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
+    href: element.tagName === "A" ? element.href : null,
+    formAction: element.form ? element.form.action : null,
+    hasHandler: Boolean(element.form || element.getAttribute("onclick") || element.getAttribute("data-action")),
+  };
+}
+
+// Bind the current DOM element, rather than retaining an index across renders.
+// Trial clicks cannot dispatch an action and must pass before reserving intent.
+export async function clickConfiguredSequentialAction(page, step, allowedOrigins, beforeSubmit) {
+  const handles = await page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]').elementHandles();
+  try {
+    if (handles.length > 400) throw new Error("顺序动作页面目标控件过多");
+    const candidates = await Promise.all(handles.map(async (handle, index) => ({
+      ...await handle.evaluate(inspectSequentialControl).catch(() => ({ visible: false })), index,
+    })));
+    const selection = selectConfiguredSequentialActionCandidate(candidates, step, allowedOrigins);
+    if (!selection.candidate) return { clicked: false, outcome: selection.outcome };
+    const candidate = selection.candidate, handle = handles[candidate.index];
+    await handle.click({ trial: true, timeout: 8000 });
+    const current = await handle.evaluate(inspectSequentialControl);
+    if (!selectConfiguredSequentialActionCandidate([current], step, allowedOrigins).candidate
+      || current.tagName !== candidate.tagName || current.text !== candidate.text
+      || current.href !== candidate.href || current.formAction !== candidate.formAction) {
+      return { clicked: false, outcome: "action_changed_before_submit" };
+    }
+    await beforeSubmit();
+    await handle.click({ timeout: 10000 });
+    return { clicked: true, text: candidate.text };
+  } finally {
+    await Promise.allSettled(handles.map(handle => handle.dispose()));
+  }
+}
+
 async function readConfiguredSequentialStepEvidence(page, step, phase, responseConfirmed = false) {
   const state = await snapshotState(page);
-  const evidence = await page.evaluate(({ actionTexts, completedTexts, successTexts, completedIncludes, successIncludes }) => {
+  const evidence = await page.evaluate(({ actionTexts, completedTexts, successTexts, completedIncludes, successIncludes,dailyQuotaPattern,dailyQuotaMinimum }) => {
     const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
     const visible = (element) => {
       const style = getComputedStyle(element);
@@ -1556,7 +1661,6 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
       hasHandler: Boolean(element.form || element.getAttribute("onclick") || element.getAttribute("data-action")),
     }));
     return {
-      controls,
       completedTextPresent: completedTexts.some((text) => bodyLineSet.has(text))
         || completedIncludes.some((text) => bodyLines.some((line) => line.includes(text))),
       successTextPresent: successTexts.some((text) => bodyLineSet.has(text))
@@ -1564,6 +1668,10 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
       disabledActionPresent: controls.some((control) => (
         control.visible && control.disabled && actionTexts.includes(control.text)
       )),
+      explicitDailyUnsigned: /(?:今日|今天|当日)\s*(?:尚未|还未|未)\s*(?:完成)?\s*签到/.test(bodyLines.join(" ")),
+      bodyLines,
+      loaded: document.readyState === "complete",
+      busy: [...document.querySelectorAll('[aria-busy="true"], .ant-btn-loading, .semi-button-loading, .ant-spin-spinning')].some(visible),
     };
   }, {
     actionTexts: step.actionTexts,
@@ -1571,29 +1679,43 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
     successTexts: step.successTexts,
     completedIncludes: step.completedIncludes,
     successIncludes: step.successIncludes,
+    dailyQuotaPattern: step.dailyQuotaPattern,
+    dailyQuotaMinimum: step.dailyQuotaMinimum,
   });
 
-  if (step.acceptGenericCheckinState && ["signed", "already_signed"].includes(state.status)) {
-    return { done: true, status: state.status, reason: state.reason, controls: evidence.controls };
+  const quota = readSequentialDailyQuota(evidence.bodyLines.join(" "), step);
+  const kind = sequentialCompletionKind({ ...evidence, stateStatus: state.status, quota }, step, phase, responseConfirmed);
+  if (kind === "generic") {
+    return { done: true, status: state.status, reason: state.reason };
   }
-  if (evidence.completedTextPresent) {
-    return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤页面显示完成状态", controls: evidence.controls };
+  if (kind === "completed_text") {
+    return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤页面显示完成状态" };
   }
-  if (phase === "after" && evidence.successTextPresent) {
-    return { done: true, status: "signed", reason: "步骤页面显示成功状态", controls: evidence.controls };
+  if (kind === "success_text") {
+    return { done: true, status: "signed", reason: "步骤页面显示成功状态" };
   }
-  if (step.disabledActionIsComplete && evidence.disabledActionPresent) {
-    return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤动作控件确认已完成", controls: evidence.controls };
+  if (kind === "daily_quota_zero") {
+    return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤页面明确确认今日剩余配额为零" };
   }
-  if (phase === "after" && responseConfirmed) {
-    return { done: true, status: "signed", reason: "步骤接口确认成功", controls: evidence.controls };
+  if (kind === "disabled_user_rule") {
+    return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤动作控件确认已完成" };
   }
-  return { done: false, state, controls: evidence.controls };
+  if (kind === "response") {
+    return { done: true, status: "signed", reason: "步骤接口确认成功" };
+  }
+  return { done: false, state,explicitDailyUnsigned:evidence.explicitDailyUnsigned,eligibleDailyQuota:quota.eligible };
 }
 
 function watchConfiguredSequentialResponses(page, step, expectedOrigin) {
   let confirmed = false;
+  let requestObserved = false;
   const pending = new Set();
+  const matches = request => {
+    try { const url = new URL(request.url()); return url.origin === expectedOrigin && step.responseEvidence.some(rule =>
+      url.pathname.toLowerCase().includes(rule.urlIncludes) && rule.methods.includes(request.method().toUpperCase())); }
+    catch { return false; }
+  };
+  const requestHandler = request => { requestObserved ||= matches(request); };
   const handler = (response) => {
     const task = (async () => {
       const request = response.request();
@@ -1621,10 +1743,13 @@ function watchConfiguredSequentialResponses(page, step, expectedOrigin) {
     void task.finally(() => pending.delete(task));
   };
   page.on("response", handler);
+  page.on("request", requestHandler);
   return {
     confirmed: () => confirmed,
+    requestObserved: () => requestObserved,
     async stop() {
       page.off("response", handler);
+      page.off("request", requestHandler);
       await Promise.allSettled([...pending]);
       return confirmed;
     },
@@ -1655,14 +1780,33 @@ async function waitForConfiguredSequentialStep(page, target, config, step, watch
   return { done: false };
 }
 
-async function tryConfiguredSequentialActions(page, target, config) {
+export async function tryConfiguredSequentialActions(page, target, config) {
   const rule = getConfiguredSequentialActionRule(target, config);
   if (!rule) return null;
   const allowedOrigins = target.allowedOrigins ?? [target.origin];
   const completedActions = [];
   let anyActionClicked = false;
+  let completionUsesUserRule = false;
+  const actionResults=[];
+  const requiredActionTypes = rule.steps.map(step => step.actionType);
+  const partial = (result, step) => {
+    const { actionResults: nested, requiredActionTypes: ignored, ...stepResult } = result;
+    return { ...result, actionType: target.actionType ?? "checkin", requiredActionTypes, submissionTrackedPerAction: true,
+      actionResults: [...actionResults, ...(step ? [{ ...stepResult, origin: target.origin, actionType: step.actionType }] : [])],
+      action: result.action ?? (completedActions.join(" → ") || undefined),
+      submissionAttempted: result.submissionAttempted ?? anyActionClicked };
+  };
 
-  for (const step of rule.steps) {
+  let activeStep;
+  try { for (const step of rule.steps) {
+    activeStep = step;
+    const stepIdentity = {...target,actionType:step.actionType};
+    const stepScope = config.submissionJournalPath ? createSubmissionScope(config.submissionJournalPath,stepIdentity,config) : null;
+    const pending = await stepScope?.pending() ?? [];
+    let continuationNeeded = false;
+    const stepEvidence = observation => bindSuccessEvidence({...observation,url:page.url(),
+      evidence:successEvidence(observation.reason==='步骤动作控件确认已完成'?'user_rule':'page_text','sequential_step_confirmed'),
+    },stepIdentity,config);
     await page.goto(assertBookmarkNavigation(step.url, allowedOrigins), {
       waitUntil: "domcontentloaded",
       timeout: config.navigationTimeoutMs,
@@ -1671,64 +1815,110 @@ async function tryConfiguredSequentialActions(page, target, config) {
     assertBookmarkNavigation(page.url(), allowedOrigins);
 
     let before = await readConfiguredSequentialStepEvidence(page, step, "before");
-    if (["interactive_challenge", "managed_challenge"].includes(before.state?.status)) {
+    if (!config.checkinReadOnly && ["interactive_challenge", "managed_challenge"].includes(before.state?.status)) {
       const activeOrigin = new URL(page.url()).origin;
       const challengeState = await runConfiguredChallengePhase(page, target, activeOrigin, config, "before");
       if (challengeState && ["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(challengeState.status)) {
-        return { ...challengeState, action: completedActions.join(" → ") || undefined };
+        return partial(challengeState, step);
       }
       before = await readConfiguredSequentialStepEvidence(page, step, "before");
     }
     if (before.done) {
+      completionUsesUserRule ||= before.reason==='步骤动作控件确认已完成';
+      const observed=stepEvidence(before);
+      await stepScope?.observe(observed);
+      const reconciled=reconcileSubmissionResult(observed,await stepScope?.allPending()??[],stepIdentity,config);
+      if(!["signed","already_signed"].includes(reconciled.status)) return partial(reconciled, step);
+      actionResults.push(reconciled);
       completedActions.push(step.actionTexts[0]);
       continue;
     }
+    if (pending.length) {
+      const {current}=partitionSubmissions(pending,stepIdentity,config);
+      const ready=(step.dailyCheckin && before.explicitDailyUnsigned) || (step.dailyQuotaPattern && before.eligibleDailyQuota);
+      if(!config.checkinReadOnly && !current.length && ready) {
+        continuationNeeded = true;
+      } else {
+        await stepScope.observe(before.state??{status:"unconfirmed"});
+        return partial(reconcileSubmissionResult(before.state??{status:"unconfirmed"},pending,stepIdentity,config), step);
+      }
+    }
     if (["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(before.state?.status)) {
-      return { ...before.state, action: completedActions.join(" → ") || undefined };
+      return partial(before.state, step);
     }
-
-    const selection = selectConfiguredSequentialActionCandidate(before.controls, step, allowedOrigins);
-    if (!selection.candidate) {
-      return {
-        status: "needs_attention",
-        reason: selection.outcome === "action_not_unique" ? "顺序动作页面出现多个同名目标控件" : "顺序动作页面未找到唯一目标控件",
-        action: completedActions.join(" → ") || undefined,
-      };
-    }
+    if(config.checkinReadOnly) return partial({status:"unconfirmed",reason:"顺序动作只读核验尚未确认全部完成"}, step);
 
     const expectedOrigin = new URL(step.url).origin;
     const watcher = watchConfiguredSequentialResponses(page, step, expectedOrigin);
+    let submissionStarted = false;
+    let actionText = step.actionTexts[0];
     try {
-      await clickCandidate(page, selection.candidate);
+      const clicked = await clickConfiguredSequentialAction(page, step, allowedOrigins, async () => {
+        if (continuationNeeded) {
+          const fresh = await readConfiguredSequentialStepEvidence(page, step, "before");
+          if (fresh.done || !(step.dailyCheckin && fresh.explicitDailyUnsigned || step.dailyQuotaPattern && fresh.eligibleDailyQuota)) {
+            throw new Error("当前周期动作状态已变化，取消提交");
+          }
+          await stepScope.beginNewCycleAfterVerifiedReadiness(dailyReadinessEvidence(stepIdentity,config,{
+            outcome:step.dailyCheckin ? "daily_checkin_not_signed" : "daily_quota_available",observedOrigin:new URL(page.url()).origin}));
+        }
+        attachSubmissionScope(page,stepScope??config[SUBMISSION_SCOPE]);
+        await beforePageSubmission(page);
+        submissionStarted = true;
+      });
+      if (!clicked.clicked) return partial({status:"needs_attention", submissionAttempted:false,
+        failureCode:clicked.outcome,reason:clicked.outcome === "action_not_unique" ? "顺序动作页面出现多个同名目标控件" : "顺序动作控件未达到稳定可点击状态"}, step);
+      actionText = clicked.text;
       anyActionClicked = true;
       let confirmation = await waitForConfiguredSequentialStep(page, target, config, step, watcher);
       if (["interactive_challenge", "managed_challenge"].includes(confirmation.terminal?.status)) {
         const activeOrigin = new URL(page.url()).origin;
         const challengeState = await runConfiguredChallengePhase(page, target, activeOrigin, config, "after");
         if (challengeState && ["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(challengeState.status)) {
-          return { ...challengeState, action: [...completedActions, selection.candidate.text].join(" → ") };
+          return partial({ ...challengeState, action: [...completedActions, actionText].join(" → ") }, step);
         }
         confirmation = await waitForConfiguredSequentialStep(page, target, config, step, watcher);
       }
       if (confirmation.terminal) {
-        return { ...confirmation.terminal, action: [...completedActions, selection.candidate.text].join(" → ") };
+        return partial({ ...confirmation.terminal, action: [...completedActions, actionText].join(" → ") }, step);
       }
       if (!confirmation.done) {
-        return {
+        return partial({
           status: "needs_attention",
           reason: "顺序动作已执行，但页面或接口未提供权威完成证据",
-          action: [...completedActions, selection.candidate.text].join(" → "),
-        };
+          action: [...completedActions, actionText].join(" → "),
+          submissionRequestObserved: watcher.requestObserved(),
+        }, step);
       }
+      const observed=stepEvidence(confirmation);
+      await stepScope?.observe(observed);
+      completionUsesUserRule ||= confirmation.reason==='步骤动作控件确认已完成';
+      const reconciled=reconcileSubmissionResult(observed,await stepScope?.allPending()??[],stepIdentity,config);
+      if(!["signed","already_signed"].includes(reconciled.status)) return partial(reconciled, step);
+      actionResults.push(reconciled);
+    } catch (error) {
+      return partial({status:"needs_attention",reason:submissionStarted ? "顺序动作提交未确认，保留隔离记录" : "顺序动作点击预检未通过，未执行提交",
+        failureCode:submissionStarted ? "sequential_submission_unconfirmed" : "sequential_action_not_ready",
+        submissionAttempted:submissionStarted,submissionRequestObserved:watcher.requestObserved(),
+        detail:safeErrorMessage(error)}, step);
     } finally {
+      if (submissionStarted) await stepScope?.observe({status:'unconfirmed'});
+      attachSubmissionScope(page,config[SUBMISSION_SCOPE]);
       await watcher.stop();
     }
-    completedActions.push(selection.candidate.text);
+    completedActions.push(actionText);
+  } } catch (error) {
+    return partial({status:"needs_attention",reason:"顺序动作页面检查未完成，保留此前步骤结果",detail:safeErrorMessage(error)}, activeStep);
   }
 
   return {
     status: anyActionClicked ? "signed" : "already_signed",
     reason: anyActionClicked ? "全部顺序动作均获得权威完成证据" : "全部顺序动作均已完成",
+    evidence: successEvidence(completionUsesUserRule?'user_rule':'page_text','all_sequential_steps_confirmed'),
+    actionResults,
+    requiredActionTypes,
+    submissionTrackedPerAction: true,
+    ...(actionResults.some(r=>r.historicalSubmissionWarning) ? {historicalSubmissionWarning:{pendingCount:actionResults.reduce((n,r)=>n+(r.historicalSubmissionWarning?.pendingCount??0),0),actionType:"sequential_actions"}} : {}),
     action: completedActions.join(" → "),
   };
 }
@@ -1931,7 +2121,7 @@ async function tryQuotaRequestFlow(page, activeOrigin, config) {
   const state = await waitForManagedChallenge(page, config);
   if (["signed", "already_signed"].includes(state.status)) return state;
   const bodyText = String(await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-  if (/(额度申请已提交|申请额度成功|额度已发放|额度申请成功|申请成功.*额度|今日已申请|今天已申请|codex\s*(?:权益|權益)\s*已(?:领取|領取)|(?:领取|領取)\s*codex\s*(?:权益|權益)\s*成功)/i.test(bodyText)) return { status: "signed", reason: "额度申请已提交并获得页面确认" };
+  if (/(额度申请已提交|申请额度成功|额度已发放|额度申请成功|申请成功.*额度|今日已申请|今天已申请|codex\s*(?:权益|權益)\s*已(?:领取|領取)|(?:领取|領取)\s*codex\s*(?:权益|權益)\s*成功)/i.test(bodyText)) return { status: "signed", reason: "额度申请已提交并获得页面确认", evidence:successEvidence('page_text','quota_claim_confirmed') };
   const activeBenefit = await detectActiveQuotaBenefit(page, activeOrigin, config, "signed");
   if (activeBenefit) return activeBenefit;
   return { status: "unconfirmed", reason: "额度申请已提交，但页面未确认结果" };
@@ -2142,6 +2332,7 @@ async function tryOpenCdCaptcha(page, expectedOrigin) {
     return { status: "interactive_challenge", reason: "OpenCD 六位验证码本地识别结果无效" };
   }
   await input.fill(recognition.code);
+  await beforePageSubmission(page);
   await submit.click();
   await sleep(2000);
   const responseText = String(await frame.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
@@ -2149,6 +2340,7 @@ async function tryOpenCdCaptcha(page, expectedOrigin) {
     return {
       status: "signed",
       reason: `OpenCD 图片验证码识别成功（置信度 ${Math.round(recognition.confidence)}）`,
+      evidence:successEvidence('page_text','captcha_response_confirmed'),
     };
   }
   // OpenCD 的 iframe 有时不返回可识别的成功文本，但服务器已经完成
@@ -2199,6 +2391,7 @@ async function tryNexusImageCaptcha(page) {
     return { status: "interactive_challenge", reason: "NexusPHP 六位验证码本地识别结果无效" };
   }
   await input.fill(recognition.code);
+  await beforePageSubmission(page);
   await submit.click();
   await sleep(3000);
   const state = await snapshotState(page);
@@ -2209,7 +2402,7 @@ async function tryNexusImageCaptcha(page) {
   if (await showup.count() === 1) {
     const showupText = String(await showup.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
     if (/已签到|已簽到|showed up/i.test(showupText)) {
-      return { status: "signed", reason: `HDSky 图片验证码识别成功（置信度 ${Math.round(recognition.confidence)}）` };
+      return { status: "signed", reason: `HDSky 图片验证码识别成功（置信度 ${Math.round(recognition.confidence)}）`,evidence:successEvidence('page_text','captcha_showup_confirmed') };
     }
   }
   if (await page.locator("#showupimg").count() === 0) {
@@ -2248,6 +2441,7 @@ async function tryU2Captcha(page, expectedOrigin, config) {
   await message.fill(String(config.u2Message || "今日天气不错"));
   const chosen = page.locator(`input[type="submit"][name="${solution.answer.name}"]`);
   if (await chosen.count() !== 1) return { status: "interactive_challenge", reason: "U2 识别答案不属于当前题目" };
+  await beforePageSubmission(page);
   await chosen.click();
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
   const bodyText = String(await page.locator("body").innerText()).replace(/\s+/g, " ").trim();
@@ -2255,6 +2449,7 @@ async function tryU2Captcha(page, expectedOrigin, config) {
     return {
       status: "signed",
       reason: `U2 图片题识别正确：${solution.answer.text}`,
+      evidence:successEvidence('page_text','answer_reward_confirmed'),
     };
   }
   return { status: "interactive_challenge", reason: "U2 答案已提交，但页面未显示签到成功" };
@@ -2276,6 +2471,38 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
     return stopAtConfiguredTerminal(destination, config, 'terminal_path');
   }
   await page.goto(destination, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
+  if (config.checkinReadOnly) {
+    if (useExtendedDiscovery) await waitForExtendedDiscoveryContent(page,config);
+    let currentUrl=assertBookmarkNavigation(page.url(),allowedOrigins);
+    const navigationRule=getConfiguredPreCheckinNavigationRule(target,new URL(currentUrl).origin,config);
+    if (navigationRule?.dailyUnsignedForm || navigationRule?.readOnlyFallbackToExpectedPath) {
+      const navigation=await navigateConfiguredPreCheckinPage(page,target,new URL(currentUrl).origin,config);
+      if (navigation?.terminalPath) return stopAtConfiguredTerminal(page.url(),config,"terminal_path");
+      if (navigation?.terminalNoAction) return stopAtConfiguredTerminal(page.url(),config,"missing_navigation_control");
+      if (navigation?.terminalUnconfirmed) return {...navigation.terminalUnconfirmed,url:safeLogUrl(page.url())};
+      await page.waitForLoadState("load",{timeout:config.navigationTimeoutMs}).catch(()=>{});
+      currentUrl=assertBookmarkNavigation(page.url(),allowedOrigins);
+      const readiness=await inspectConfiguredDailyUnsignedForm(page,target,new URL(currentUrl).origin,config);
+      if(readiness) return {...readiness,url:safeLogUrl(currentUrl)};
+    }
+    const dashboard=await runConfiguredDailyDashboardCheckin(page,target,config);
+    if(dashboard) return {...dashboard,url:safeLogUrl(currentUrl)};
+    const visitRule=config.visitCheckinRules?.[new URL(currentUrl).origin];
+    if(visitRule?.after) return verifyVisitCheckin(visitRule,{url:currentUrl,
+      readState:()=>waitForConfirmedCheckinState(page,config,config.visitCheckinWaitMs),
+      verifySession:()=>verifyConfiguredSavedLoginSession(page,new URL(currentUrl).origin,config)});
+    if(getConfiguredSequentialActionRule(target,config)) return tryConfiguredSequentialActions(page,target,config);
+    if(targetUsesCalendarDayCheckin(target,currentUrl,config)) {
+      if(!useExtendedDiscovery) await waitForExtendedDiscoveryContent(page,config);
+      assertCalendarDayCheckinLocation(target,currentUrl,config);
+      const calendar=classifyCalendarDayCheckinEvidence(await waitForCalendarDayCheckinEvidence(page,target,config));
+      return {...(calendar.status==="ready" ? dailyReadinessEvidence(target,config,{observedOrigin:new URL(currentUrl).origin})
+        : verifiedAdapterCompletion(calendar,"page_text","calendar_day_confirmed")),url:safeLogUrl(currentUrl)};
+    }
+    const apiResult = useNewApiCheckin ? await tryNewApiCheckin(page,{readOnly:true}) : null;
+    if(apiResult?.status==="not_signed" && apiResult.dailyUnsigned===true) return {...dailyReadinessEvidence(target,config,{source:"status_endpoint",observedOrigin:new URL(page.url()).origin}),url:safeLogUrl(page.url())};
+    return apiResult ?? {...verifiedAdapterCompletion(await waitForPendingCheckinState(page,config),"page_text","page_completion_text"),url:safeLogUrl(page.url())};
+  }
   if (useExtendedDiscovery) {
     await waitForExtendedDiscoveryContent(page, config);
   }
@@ -2301,6 +2528,8 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
 
   await dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config);
   ({ activeUrl, activeOrigin } = currentAllowedLocation(page, allowedOrigins));
+  const dashboardResult=await runConfiguredDailyDashboardCheckin(page,target,config);
+  if(dashboardResult) return {...dashboardResult,url:safeLogUrl(page.url())};
   const hasConfiguredPreCheckinNavigation = Boolean(
     getConfiguredPreCheckinNavigationRule(target, activeOrigin, config),
   );
@@ -2374,13 +2603,13 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   if (state.status !== "ready") return { ...state, url: safeLogUrl(page.url()) };
 
   const calendarDayResult = await tryCalendarDayCheckin(page, target, activeUrl, config);
-  if (calendarDayResult) return { ...calendarDayResult, url: safeLogUrl(page.url()) };
+  if (calendarDayResult) return { ...verifiedAdapterCompletion(calendarDayResult,'page_text','calendar_day_confirmed'), url: safeLogUrl(page.url()) };
 
   const hddolbyResult = await tryHddolbyPostRedirectVerification(page, activeOrigin, config);
   if (hddolbyResult) return { ...hddolbyResult, url: safeLogUrl(page.url()) };
 
   const activeBenefit = await detectActiveQuotaBenefit(page, activeOrigin, config);
-  if (activeBenefit) return { ...activeBenefit, url: safeLogUrl(page.url()) };
+  if (activeBenefit) return { ...verifiedAdapterCompletion(activeBenefit,'page_text','active_benefit_confirmed'), url: safeLogUrl(page.url()) };
 
   const visitRule = (config.visitCheckinRules ?? {})[activeOrigin];
   if (visitRule?.after) {
@@ -2406,11 +2635,7 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
         config,
       );
       if (discoveryTerminalPath) {
-        return {
-          status: "already_signed",
-          reason: `拒绝直接打开终止页面 ${discoveryTerminalPath}，按站点规则停止重试`,
-          url: safeLogUrl(discoveryUrl),
-        };
+        return stopAtConfiguredTerminal(discoveryUrl,config,'terminal_discovery_path');
       }
       await page.goto(assertBookmarkNavigation(discoveryUrl, allowedOrigins), { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
       await waitForExtendedDiscoveryContent(page, config);
@@ -2770,6 +2995,18 @@ export async function launchAutomationContext(config) {
 }
 
 export async function processTarget(context, target, config, qaRules, logDirectory) {
+  const run = async activeConfig => {
+    const result = await processTargetInternal(context,target,activeConfig,qaRules,logDirectory);
+    const bound=bindSuccessEvidence(result,target,activeConfig);
+    return ['signed','already_signed'].includes(bound?.status)
+      ? reconcileCheckinResult(bound,bound.evidence,new Date(),{target,config:activeConfig,requireBinding:true}) : bound;
+  };
+  return config.submissionJournalPath
+    ? runWithSubmissionJournal(config.submissionJournalPath,target,config,run)
+    : run(config);
+}
+
+async function processTargetInternal(context, target, config, qaRules, logDirectory) {
   const configuredUnavailable = configuredNoCheckinResult(target, config);
   if (configuredUnavailable) return configuredUnavailable;
   const fast = await tryNewApiHttpFirst(context, target, config);
@@ -2782,6 +3019,7 @@ export async function processTarget(context, target, config, qaRules, logDirecto
   const targetDeadline = Date.now() + targetTimeoutMs;
   for (let attempt = 0; attempt <= config.retryCount; attempt += 1) {
     const page = await context.newPage();
+    await guardPageSubmissions(page,target,config[SUBMISSION_SCOPE],{readOnly:config.checkinReadOnly===true});
     let attemptResult = null;
     try {
       for (const candidateUrl of target.candidates) {

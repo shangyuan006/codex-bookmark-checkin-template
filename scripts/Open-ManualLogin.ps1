@@ -76,6 +76,42 @@ try {
     $occupied = @(Get-CheckinAutomationBrowserProcesses $config)
     if ($occupied.Count -gt 0) { throw '机器人专用浏览器配置正被其他进程占用。' }
 
+    # An explicit local rule can retain a verification-bearing document and
+    # continue its action in the same page. All other targets keep native login.
+    if ($config.samePageManualCheckinRules -and @($config.samePageManualCheckinRules.PSObject.Properties).Count -gt 0) {
+        $node = Resolve-CheckinNode $config
+        $samePageHelper = Join-Path $root 'src\live-checkin-session.mjs'
+        $attentionArguments = @()
+        foreach ($origin in @($Origins)) { $attentionArguments += @('--origin', $origin) }
+        foreach ($number in @($Selection)) { $attentionArguments += @('--selection', [string]$number) }
+        $rawPlan = @(& $node $samePageHelper --plan @attentionArguments)
+        if ($LASTEXITCODE -ne 0) { throw '无法解析同页接管规则。' }
+        $samePagePlan = ($rawPlan -join [Environment]::NewLine) | ConvertFrom-Json
+        if ($samePagePlan.origin) {
+            $sessionId = [guid]::NewGuid().ToString('N')
+            $helper = Start-Process -FilePath $node -ArgumentList @(
+                "`"$samePageHelper`"", '--origin', [string]$samePagePlan.origin, '--session-id', $sessionId
+            ) -WindowStyle Hidden -PassThru
+            $readyDeadline = (Get-Date).AddSeconds(30)
+            do {
+                Start-Sleep -Milliseconds 250
+                $session = try { Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json } catch { $null }
+                if ($session.sessionId -eq $sessionId -and $session.windowRetained -eq $true) { break }
+                $helper.Refresh()
+            } while (-not $helper.HasExited -and (Get-Date) -lt $readyDeadline)
+            if ($session.sessionId -ne $sessionId -or $session.windowRetained -ne $true) {
+                throw '同页接管窗口尚未就绪；保留启动状态，请检查会话，勿重复打开。'
+            }
+            if ($session.stage -eq 'needs_attention') {
+                Write-Warning '同页接管启动遇到异常，窗口已保留；请检查会话状态，勿重复打开。'
+            }
+            else {
+                Write-Output '已打开同页接管窗口：请只完成验证，不刷新或关闭；程序会在当前页继续签到。等待过久会记录提示，不会自动关窗。'
+            }
+            return
+        }
+    }
+
     $launchOptions = @{
         NativeMinimal = $true
         TrackManualSession = $true

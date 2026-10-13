@@ -1,8 +1,6 @@
-const AVAILABILITY_KINDS = new Set([
-  "feature_disabled",
-  "task_disabled",
-  "temporary_unavailable",
-]);
+import { CHECKIN_CONTRACT } from './checkin-contract.generated.mjs';
+import { normalizeBoundEvidenceResult } from './checkin-evidence.mjs';
+const AVAILABILITY_KINDS = new Set(CHECKIN_CONTRACT.availabilityKinds);
 
 const MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
 
@@ -60,12 +58,14 @@ export function isConfirmedNotAvailable(result, now = new Date()) {
     && validFeatureDisabledEvidence(evidence);
 }
 
-export function isTerminalResult(result) {
-  return ["signed", "already_signed"].includes(result?.status)
+export function isTerminalResult(result,now=new Date()) {
+  result=normalizeBoundEvidenceResult(result,undefined,now);
+  return CHECKIN_CONTRACT.successStatuses.includes(result?.status)
     || isConfirmedNotAvailable(result);
 }
 
 export function normalizeResultContract(result) {
+  result=normalizeBoundEvidenceResult(result);
   if (result?.status !== "not_available" || isConfirmedNotAvailable(result)) return result;
   return {
     ...result,

@@ -1,5 +1,6 @@
 import { runCheckinAdapter } from './checkin-adapters.mjs';
-import { successEvidence } from './checkin-evidence.mjs';
+import { successEvidence, dailyReadinessEvidence } from './checkin-evidence.mjs';
+import { SUBMISSION_SCOPE } from './submission-guard.mjs';
 
 export function apiFirstAllowed(target,config={}) {
   const origin=target.origin;
@@ -63,9 +64,14 @@ export async function tryNewApiHttpFirst(context,target,config={}, {wait=ms=>new
     execute:async(_,capability)=>{
       if(disabled(capability.status)) return {result:unavailable(),requests};
       if(checked(capability.status)===true) return {result:signed('already_signed'),requests};
+      if(config.checkinReadOnly) return {result:dailyReadinessEvidence(target,config,{source:"status_endpoint"}),requests};
+      await config[SUBMISSION_SCOPE]?.begin();
       const response=await read('/api/user/checkin','POST',capability.userId);
       // Explicit WAF rejection permits the existing interactive page workflow.
-      if(response?.success===false&&/turnstile|captcha|人机|人機/i.test(String(response.message??''))) return {result:null,submissionAttempted:false,requests};
+      if(response?.success===false&&/turnstile|captcha|人机|人機/i.test(String(response.message??''))) {
+        await config[SUBMISSION_SCOPE]?.reject('challenge_rejected');
+        return {result:null,submissionAttempted:false,requests};
+      }
       for(let attempt=0;attempt<4;attempt++){
         if(attempt) await wait(750);
         const status=await read(statusPath,'GET',capability.userId);

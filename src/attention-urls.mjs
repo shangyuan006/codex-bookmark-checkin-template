@@ -91,6 +91,7 @@ export function mergeAttentionEvidence(latest, runReports = []) {
   for (const [origin, candidate] of newestByOrigin) {
     const current = merged.get(origin);
     if (isTerminalResult(current)) continue;
+    if (current && (candidate.actionType ?? "checkin") !== (current.actionType ?? "checkin")) continue;
     merged.set(origin, candidate);
   }
   return {
@@ -174,6 +175,7 @@ export function buildAttentionHandoff({
           origin: target.origin,
           url: target.candidates[0],
           previousStatus: result.status,
+          ...(result.manualBrowserMode === 'native' ? {manualBrowserMode:'native'} : {}),
         };
       })
       .filter(Boolean),
@@ -195,6 +197,7 @@ export function buildAttentionHandoff({
         origin,
         url: target.candidates[0],
         previousStatus: previous?.status ?? "new_target",
+        ...(previous?.manualBrowserMode === 'native' ? {manualBrowserMode:'native'} : {}),
       };
     });
     const missing = normalized.filter((origin, index) => !selected[index]);
@@ -220,6 +223,7 @@ export function buildAttentionHandoff({
           origin,
           url: target.candidates[0],
           previousStatus: previous?.status ?? "new_target",
+          ...(previous?.manualBrowserMode === 'native' ? {manualBrowserMode:'native'} : {}),
         };
       })
       .filter(Boolean);

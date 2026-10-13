@@ -1,3 +1,5 @@
+import { readProviderSession, readProviderSessionPage } from './oauth-provider-session.mjs';
+
 function isLinuxDoLoginUrl(rawUrl) {
   try {
     const location = new URL(rawUrl);
@@ -9,6 +11,35 @@ function isLinuxDoLoginUrl(rawUrl) {
 
 export function isLinuxDoLoginPage(page) {
   return isLinuxDoLoginUrl(page?.url?.());
+}
+
+export async function linuxDoAuthorizationRequiresLogin(page, provider) {
+  if (!/^linux[\s._/-]*do$/i.test(String(provider ?? ''))) return false;
+  let location;
+  try { location = new URL(page.url()); } catch { return false; }
+  if (location.origin !== 'https://linux.do' || location.username || location.password) return false;
+  // A login URL can itself be a CF interstitial. Only a visible login form
+  // establishes that the provider session needs recovery.
+  return await page.locator('input[type="password"]:visible').count() > 0;
+}
+
+function isLinuxDoRecoveryLocation(page) {
+  try {
+    const url = new URL(page.url());
+    if (url.username || url.password) return false;
+    return (url.origin === 'https://linux.do' && !isLinuxDoLoginPage(page))
+      || (url.origin === 'https://connect.linux.do' && /^\/oauth2\/(?:authorize|approve)(?:\/|$)/.test(url.pathname));
+  } catch { return false; }
+}
+
+export async function verifyLinuxDoRecoverySession(page, timeoutMs, onObservation) {
+  if (!isLinuxDoRecoveryLocation(page)) return false;
+  const endpoint = 'https://linux.do/session/current.json';
+  const timeout = Math.max(1, Math.min(8_000, Number(timeoutMs) || 8_000));
+  const status = new URL(page.url()).origin === 'https://linux.do'
+    ? await readProviderSessionPage(page, endpoint, timeout, onObservation)
+    : await readProviderSession(page.context().request, endpoint, timeout, onObservation);
+  return status === 'valid' && isLinuxDoRecoveryLocation(page);
 }
 
 async function hasVisibleCloudflareChallenge(page) {
@@ -30,30 +61,45 @@ async function hasVisibleCloudflareChallenge(page) {
 async function waitForLinuxDoLoginTransition(
   page,
   deadline,
-  { stopWhenChallengeClears = false, now = Date.now } = {},
+  { stopWhenChallengeClears = false, now = Date.now, verifySession = verifyLinuxDoRecoverySession } = {},
 ) {
   let challengeObserved = false;
+  let sessionProbes = 0;
   while (now() < deadline) {
     if (!isLinuxDoLoginPage(page)) {
-      return { recovered: true, challengeObserved, challengeCleared: challengeObserved };
+      // A third-party login page is an unfinished login, not a restored
+      // LinuxDO session. Never navigate it away or return success from a URL.
+      if (!isLinuxDoRecoveryLocation(page)) break;
+      const challengeVisible = await hasVisibleCloudflareChallenge(page);
+      challengeObserved ||= challengeVisible;
+      if (!challengeVisible) {
+        sessionProbes += 1;
+        let probeBlocked = false;
+        const onObservation = observation => { probeBlocked ||= observation.challenge === true || observation.httpStatus === 429; };
+        const verified = await Promise.resolve().then(() => verifySession(page, deadline - now(), onObservation)).catch(() => false);
+        if (verified === true && isLinuxDoRecoveryLocation(page)) {
+          return { recovered: true, challengeObserved, challengeCleared: challengeObserved };
+        }
+        if (probeBlocked || sessionProbes >= 3 || !isLinuxDoRecoveryLocation(page)) break;
+      }
     }
     const challengeVisible = await hasVisibleCloudflareChallenge(page);
     challengeObserved ||= challengeVisible;
-    if (stopWhenChallengeClears && challengeObserved && !challengeVisible) {
+    if (stopWhenChallengeClears && isLinuxDoLoginPage(page) && challengeObserved && !challengeVisible) {
       return { recovered: false, challengeObserved: true, challengeCleared: true };
     }
     const remaining = deadline - now();
     if (remaining <= 0) break;
     await page.waitForTimeout(Math.min(500, remaining));
   }
-  return { recovered: !isLinuxDoLoginPage(page), challengeObserved, challengeCleared: false };
+  return { recovered: false, challengeObserved, challengeCleared: false };
 }
 
 export function shouldRetryLinuxDoLoginRecovery(result) {
   return !result?.recovered && !result?.submitted && !result?.challengeObserved;
 }
 
-export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now } = {}) {
+export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now, verifySession = verifyLinuxDoRecoverySession } = {}) {
   if (!isLinuxDoLoginPage(page)) {
     return { recovered: false, submitted: false, challengeObserved: false };
   }
@@ -64,6 +110,7 @@ export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now } 
     const initialChallenge = await waitForLinuxDoLoginTransition(page, deadline, {
       stopWhenChallengeClears: true,
       now,
+      verifySession,
     });
     if (initialChallenge.recovered) {
       return { recovered: true, submitted: false, challengeObserved: true };
@@ -117,7 +164,7 @@ export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now } 
   if (!submit) return { recovered: false, submitted: false, challengeObserved };
 
   await submit.click();
-  const transition = await waitForLinuxDoLoginTransition(page, deadline, { now });
+  const transition = await waitForLinuxDoLoginTransition(page, deadline, { now, verifySession });
   challengeObserved ||= transition.challengeObserved;
   return {
     recovered: transition.recovered,

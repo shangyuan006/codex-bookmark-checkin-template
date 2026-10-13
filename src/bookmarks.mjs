@@ -46,6 +46,8 @@ export async function listBookmarkFolderCandidates(bookmarksPath) {
       candidates.push({
         name: nodeName(folder),
         path: folderPath.join(" / "),
+        id: String(folder.id ?? ""),
+        guid: String(folder.guid ?? ""),
         descendantUrlCount,
         childFolders,
       });
@@ -143,6 +145,7 @@ export function resolveBookmarkSources(bookmarksPath, options = {}) {
       optional: source?.optional === true,
       mobileFolderNames: normalizedFolderNames(source?.mobileFolderNames),
       targetFolderNames: normalizedFolderNames(source?.targetFolderNames),
+      containerFolderSelectors: source?.containerFolderSelectors ?? options.containerFolderSelectors,
       recoveredFromBackup: source?.recoveredFromBackup === true,
       originalPath: String(source?.originalPath ?? "").trim() || sourcePath,
       document: source?.document,
@@ -171,7 +174,7 @@ async function readBookmarkDocuments(bookmarksPath, options) {
       documents.push({ source, raw });
     } catch (error) {
       const diagnostic = `${sourceLabel(source)}：${bookmarkReadFailure(error)}`;
-      if (!source.optional) throw new Error(`无法读取书签来源（${diagnostic}）`);
+      if (!source.optional || source.containerFolderSelectors != null) throw new Error(`无法读取书签来源（${diagnostic}）`);
       warnings.push(diagnostic);
     }
   }
@@ -188,7 +191,11 @@ async function bookmarkSourceCandidateGroups(bookmarksPath, options) {
   for (const source of sources) {
     const candidates = [
       { ...source, path: source.originalPath, recoveredFromBackup: false },
-      { ...source, path: `${source.originalPath}.bak`, recoveredFromBackup: true },
+      // An exact scope is fail-closed: a deleted/moved folder must not be
+      // resurrected from yesterday's backup, even for an optional source.
+      ...(source.containerFolderSelectors != null ? [] : [
+        { ...source, path: `${source.originalPath}.bak`, recoveredFromBackup: true },
+      ]),
     ];
     const available = [];
     const failures = [];
@@ -204,7 +211,7 @@ async function bookmarkSourceCandidateGroups(bookmarksPath, options) {
       groups.push(available);
     } else {
       const diagnostic = `${sourceLabel(source)}（${failures.join("；")}）`;
-      if (!source.optional) throw new Error(`无法读取必要书签来源：${diagnostic}`);
+      if (!source.optional || source.containerFolderSelectors != null) throw new Error(`无法读取必要书签来源：${diagnostic}`);
       warnings.push(diagnostic);
     }
   }
@@ -263,7 +270,7 @@ export async function readBookmarkPlan(bookmarksPath, options = {}) {
   const targetNames = new Set(normalizedFolderNames(options.targetFolderNames) ?? []);
   const sourceDefinitions = resolveBookmarkSources(bookmarksPath, options);
   for (const source of sourceDefinitions) {
-    const hasMobileScope = source.mobileFolderNames?.length || mobileNames.size > 0;
+    const hasMobileScope = source.containerFolderSelectors != null || source.mobileFolderNames?.length || mobileNames.size > 0;
     const hasTargetScope = source.targetFolderNames?.length || targetNames.size > 0;
     if (!hasMobileScope || !hasTargetScope) {
       const prefix = source.name ? `${source.name}的` : "";
@@ -285,9 +292,42 @@ export async function readBookmarkPlan(bookmarksPath, options = {}) {
       ? document.source.targetFolderNames
       : targetNames);
     for (const targetName of documentTargetNames) allTargetNames.add(targetName);
+    const folders = [];
     for (const root of Object.values(document.raw.roots ?? {})) {
       walkFolders(root, [], (folder, folderPath) => {
-        if (documentMobileNames.has(nodeName(folder))) {
+        folders.push({ folder, folderPath });
+      });
+    }
+    const selectors = document.source.containerFolderSelectors;
+    let selected;
+    if (selectors != null) {
+      if (!Array.isArray(selectors) || selectors.length === 0 || selectors.length > 16) {
+        throw new Error("精确书签范围必须包含 1–16 个选择器");
+      }
+      selected = selectors.map((selector) => {
+        if (!selector || typeof selector !== "object" || Array.isArray(selector)
+          || Object.keys(selector).some(key => !["path", "id", "guid"].includes(key))) {
+          throw new Error("精确书签选择器仅允许 path、id、guid");
+        }
+        const pathParts = selector.path == null ? null : Array.isArray(selector.path)
+          ? selector.path.map(value => String(value).trim())
+          : String(selector.path).split(/\s+\/\s+/).map(value => value.trim());
+        if ((pathParts && (!pathParts.length || pathParts.some(value => !value)))
+          || (!pathParts && !String(selector.id ?? "").trim() && !String(selector.guid ?? "").trim())) {
+          throw new Error("精确书签选择器不能为空");
+        }
+        const matches = folders.filter(({ folder, folderPath }) =>
+          (!pathParts || JSON.stringify(pathParts) === JSON.stringify(folderPath))
+          && (selector.id == null || String(folder.id ?? "") === String(selector.id))
+          && (selector.guid == null || String(folder.guid ?? "").toLowerCase() === String(selector.guid).toLowerCase()));
+        if (matches.length !== 1) throw new Error("精确书签范围失配或不唯一；停止执行，不扩大范围或回退备份");
+        return matches[0];
+      });
+      selected = [...new Map(selected.map(value => [value.folder, value])).values()];
+    } else {
+      selected = folders.filter(({ folder }) => documentMobileNames.has(nodeName(folder)));
+    }
+    for (const { folder, folderPath } of selected) {
           mobileFolders.push({
             folder,
             path: folderPath.join(" / "),
@@ -295,8 +335,6 @@ export async function readBookmarkPlan(bookmarksPath, options = {}) {
             bookmarkSource: document.source,
             targetNames: documentTargetNames,
           });
-        }
-      });
     }
   }
 
@@ -546,6 +584,7 @@ export function publicBookmarkReport(plan) {
     exactUrlCount: plan.exactUrlCount,
     targetCount: plan.targetCount,
     planFingerprint: plan.planFingerprint ?? null,
+    targetPlanFingerprints: plan.targetPlanFingerprints ?? null,
     targets: plan.targets.map((target) => ({
       origin: target.origin,
       title: target.title,
