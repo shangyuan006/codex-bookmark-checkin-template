@@ -222,6 +222,15 @@ export async function writeRunResult(rootDirectory, runLog, result, {
   if(safeResult.runState==="final" && safeResult.isComplete===true) {
     await syncManualCompletion(path.dirname(path.resolve(rootDirectory)),manualSource,{now});
   }
+  if (safeResult.runState === 'final') {
+    // History failure is diagnostic only and must never replay a check-in.
+    try {
+      const { historyModel } = await import('./status-history.mjs');
+      const { recordStatusHistory } = await import('./status-history-store.mjs');
+      const [day] = historyModel([manualSource],{now:at,maxDays:1});
+      if (day) await recordStatusHistory(path.dirname(path.resolve(rootDirectory)),day);
+    } catch { console.warn('[status history] 每日历史摘要未更新，原始签到结果已保留。'); }
+  }
   return runFile;
 }
 

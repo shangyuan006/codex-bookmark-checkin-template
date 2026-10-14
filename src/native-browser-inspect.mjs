@@ -14,6 +14,7 @@ import { pagesForOrigin, selectNewestOriginPage } from "./native-page-selection.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createSubmissionScope, attachSubmissionScope, guardPageSubmissions, quarantineResult } from './submission-guard.mjs';
+import { newApiCheckinOptions } from './new-api-policy.mjs';
 import { successEvidence } from './checkin-evidence.mjs';
 import { dailyReadinessEvidence } from "./checkin-evidence.mjs";
 import { reconcileSubmissionResult,partitionSubmissions } from "./submission-guard.mjs";
@@ -54,7 +55,7 @@ async function nativeEvidence(result,source='page_text',page=null) {
     return ['signed','already_signed'].includes(bound.status) ? {...bound,status:result.status} : bound;
   }
   return bindNativeCompletion({...result,origin:expectedOrigin,
-    ...(['signed','already_signed'].includes(result.status) ? {evidence:successEvidence(source,'native_confirmed_completion')} : {}),
+    ...(['signed','already_signed'].includes(result.status) ? {evidence:result.evidence??successEvidence(source,'native_confirmed_completion')} : {}),
   },{origin:expectedOrigin},config,page ? activeConfig=>tryConfiguredSequentialActions(page,{origin:expectedOrigin},activeConfig) : null);
 }
 if (!Number.isInteger(port) || port <= 0) {
@@ -69,7 +70,8 @@ async function readPageState(page) {
 }
 
 async function inspectNewApiWithRawCdp() {
-  const probeExpression = `(async () => ({state: await (${runNewApiCheckinInBrowser.toString()})({readOnly:true})}))()`;
+  const options = newApiCheckinOptions({origin:expectedOrigin},config);
+  const probeExpression = `(async () => ({state: await (${runNewApiCheckinInBrowser.toString()})(${JSON.stringify({...options,readOnly:true})})}))()`;
   const probe = await evaluateOverRawCdp(port,expectedOrigin,probeExpression,{readOnly:true,timeoutMs:15000,retryDelayMs:500});
   if (partitionSubmissions(outstanding,{origin:expectedOrigin},config).current.length || probe?.state?.status!=="not_signed") {
     const result = await nativeEvidence(probe?.state??{status:'unconfirmed'},'status_endpoint');
@@ -81,7 +83,7 @@ async function inspectNewApiWithRawCdp() {
   if(outstanding.length) await scope.beginNewCycleAfterVerifiedReadiness(await nativeEvidence(probe.state,"status_endpoint"));
   else await scope.begin();
   const expression = `(async () => {
-    const state = await (${runNewApiCheckinInBrowser.toString()})();
+    const state = await (${runNewApiCheckinInBrowser.toString()})(${JSON.stringify(options)});
     return {
       state,
       siteBodyLoaded: String(document.body?.innerText || "").trim().length > 80,

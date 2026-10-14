@@ -266,10 +266,26 @@ export async function clickUniqueNativeCheckinAction(page, expectedOrigin, rawRu
   if (candidates.length !== 1) {
     return { clicked: false, outcome: candidates.length === 0 ? "action_not_found" : "action_not_unique" };
   }
-  await beforePageSubmission(page);
-  await page.locator(ACTION_SELECTOR).nth(candidates[0].index).click({ timeout: 10_000 });
-  assertBookmarkNavigation(page.url(), [expectedOrigin]);
-  return { clicked: true, outcome: "clicked" };
+  // Keep the inspected element: an announcement inserted during the trial
+  // must not shift an indexed locator onto a different button.
+  const action = await page.locator(ACTION_SELECTOR).nth(candidates[0].index).elementHandle();
+  if (!action) return { clicked: false, outcome: "action_not_found" };
+  try {
+    // A visible, enabled button may still be covered by an announcement. Trial
+    // clicks never submit: reserve only after Playwright confirms actionability.
+    try {
+      await action.click({ trial: true, timeout: 10_000 });
+    } catch {
+      return { clicked: false, outcome: "action_not_actionable" };
+    }
+    assertBookmarkNavigation(page.url(), [expectedOrigin]);
+    await beforePageSubmission(page);
+    await action.click({ timeout: 10_000 });
+    assertBookmarkNavigation(page.url(), [expectedOrigin]);
+    return { clicked: true, outcome: "clicked" };
+  } finally {
+    await action.dispose().catch(() => {});
+  }
 }
 
 async function inspectNativeChallengeControls(page, expectedOrigin) {

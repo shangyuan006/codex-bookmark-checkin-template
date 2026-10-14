@@ -193,12 +193,13 @@ test("targeted timeout and notification code retain selected-scope fields", asyn
   assert.match(reporter, /selectedSummary/);
 });
 
-test("原生登录生命周期脚本保留 Windows PowerShell 5.1 可识别的 UTF-8 BOM", async () => {
+test("原生登录及共享中文状态合同保留 Windows PowerShell 5.1 可识别的 UTF-8 BOM", async () => {
   for (const script of [
     "Open-ManualLogin.ps1",
     "Open-PlainLoginChrome.ps1",
     "Close-ManualLogin.ps1",
     "Recover-NativeOAuthCheckin.ps1",
+    "CheckinContract.generated.ps1",
   ]) {
     const contents = await fs.readFile(new URL(`../scripts/${script}`, import.meta.url));
     assert.deepEqual([...contents.subarray(0, 3)], [0xef, 0xbb, 0xbf]);

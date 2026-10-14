@@ -12,9 +12,8 @@ function Test-CheckinFeatureDisabledEvidence($Evidence) {
     $source = [string]$Evidence.source
     $originalSource = if ($source -eq 'cached_confirmation') { [string]$Evidence.originalSource } else { $source }
     $outcome = [string]$Evidence.outcome
-    if ($originalSource -eq 'bmapi_checkin_status' -and $outcome -eq 'enabled_false') { return $true }
-    if ($originalSource -in @('new_api_checkin_status', 'new_api_checkin_action') -and $outcome -eq 'message_not_enabled') { return $true }
-    return $originalSource -eq 'configuration' -and $outcome -eq 'known_no_checkin_feature'
+    return $script:CheckinFeatureDisabledEvidence.ContainsKey($originalSource) `
+        -and $outcome -cin $script:CheckinFeatureDisabledEvidence[$originalSource]
 }
 
 function Test-ConfirmedNotAvailable($Result, [datetime]$Now = (Get-Date)) {

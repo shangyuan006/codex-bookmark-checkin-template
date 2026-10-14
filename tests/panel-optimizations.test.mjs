@@ -121,11 +121,11 @@ const apiConfig={apiFirstOrigins:[origin],newApiCheckinOrigins:[origin]};
 const self={success:true,data:{id:123}};
 const checked=value=>({success:true,data:{checked_in_today:value}});
 test('HTTP fast path confirms without creating a browser tab or exporting credentials',async()=>{
-  const {context,calls}=httpFixture([self,checked(true)]);
+  const {context,calls}=httpFixture([self,checked(true),self]);
   context.newPage=()=>{throw new Error('must not open a page');};
   const result=await processTarget(context,{origin,candidates:[origin]},apiConfig,[],null);
   assert.equal(result.status,'already_signed');assert.equal(result.evidence.source,'status_endpoint');
-  assert.equal(result.metrics.pageLoads,0);assert.equal(result.metrics.requests,2);
+  assert.equal(result.metrics.pageLoads,0);assert.equal(result.metrics.requests,3);
   assert.ok(calls.every(call=>call.options.maxRedirects===0));
   assert.equal(JSON.stringify(result).includes('123'),false);
 });
@@ -146,9 +146,9 @@ test('HTTP submission is sent once and uncertainty cannot cause a page resubmiss
 });
 
 test('HTTP response alone is insufficient; status reread confirms the action',async()=>{
-  const fixture=httpFixture([self,checked(false),{success:true},checked(true)]);
+  const fixture=httpFixture([self,checked(false),{success:true},checked(true),self]);
   const result=await tryNewApiHttpFirst(fixture.context,{origin},apiConfig,{wait:async()=>{}});
-  assert.equal(result.result.status,'signed');assert.equal(fixture.calls.length,4);
+  assert.equal(result.result.status,'signed');assert.equal(fixture.calls.length,5);
 });
 
 test('consumption-aware evidence rejects counter resets and total changes without corroboration',()=>{

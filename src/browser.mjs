@@ -16,6 +16,8 @@ export { runNewApiCheckinInBrowser, tryNewApiCheckin } from "./new-api-browser.m
 import { stopAtConfiguredTerminal, successEvidence, verifyVisitCheckin, bindSuccessEvidence, reconcileCheckinResult } from "./checkin-evidence.mjs";
 import { SUBMISSION_SCOPE, guardPageSubmissions, beforePageSubmission, runWithSubmissionJournal, createSubmissionScope, attachSubmissionScope, quarantineResult } from './submission-guard.mjs';
 import { tryNewApiHttpFirst } from "./new-api-http.mjs";
+import { newApiCheckinOptions } from './new-api-policy.mjs';
+import { readPtPassiveState } from './pt-passive-read.mjs';
 import { dailyReadinessEvidence } from "./checkin-evidence.mjs";
 import { runConfiguredDailyDashboardCheckin } from "./daily-dashboard-checkin.mjs";
 import { reconcileSubmissionResult, partitionSubmissions } from "./submission-guard.mjs";
@@ -2499,7 +2501,7 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
       return {...(calendar.status==="ready" ? dailyReadinessEvidence(target,config,{observedOrigin:new URL(currentUrl).origin})
         : verifiedAdapterCompletion(calendar,"page_text","calendar_day_confirmed")),url:safeLogUrl(currentUrl)};
     }
-    const apiResult = useNewApiCheckin ? await tryNewApiCheckin(page,{readOnly:true}) : null;
+    const apiResult = useNewApiCheckin ? await tryNewApiCheckin(page,{...newApiCheckinOptions({origin:new URL(page.url()).origin},config),readOnly:true}) : null;
     if(apiResult?.status==="not_signed" && apiResult.dailyUnsigned===true) return {...dailyReadinessEvidence(target,config,{source:"status_endpoint",observedOrigin:new URL(page.url()).origin}),url:safeLogUrl(page.url())};
     return apiResult ?? {...verifiedAdapterCompletion(await waitForPendingCheckinState(page,config),"page_text","page_completion_text"),url:safeLogUrl(page.url())};
   }
@@ -2577,7 +2579,7 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   let initialApiResult = null;
   let pendingNewApiRetry = false;
   if (useNewApiCheckin) {
-    initialApiResult = await tryNewApiCheckin(page);
+    initialApiResult = await tryNewApiCheckin(page,newApiCheckinOptions({origin:activeOrigin},config));
     if (initialApiResult?.status === "not_available") {
       return { ...initialApiResult, reason: "站点签到接口确认未启用", url: safeLogUrl(page.url()) };
     }
@@ -2828,7 +2830,7 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
       if (["login_required", "needs_attention", "interactive_challenge", "managed_challenge_timeout", "deferred"].includes(state.status)) {
         return { ...state, action: action.text, url: safeLogUrl(page.url()) };
       }
-      const retryApiResult = await tryNewApiCheckin(page);
+      const retryApiResult = await tryNewApiCheckin(page,newApiCheckinOptions({origin:new URL(page.url()).origin},config));
       if (["signed", "already_signed"].includes(retryApiResult?.status)) {
         return { ...retryApiResult, action: retryActionText ? `${action.text} → ${retryActionText}` : action.text, url: safeLogUrl(page.url()) };
       }
@@ -2930,7 +2932,7 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   }
 
   if (useNewApiCheckin) {
-    const apiResult = initialApiResult ?? await tryNewApiCheckin(page);
+    const apiResult = initialApiResult ?? await tryNewApiCheckin(page,newApiCheckinOptions({origin:new URL(page.url()).origin},config));
     if (apiResult) return { ...apiResult, url: safeLogUrl(page.url()) };
   }
   if ((config.knownNoCheckinFeatureOrigins ?? []).includes(activeOrigin)) {
@@ -3009,6 +3011,10 @@ export async function processTarget(context, target, config, qaRules, logDirecto
 async function processTargetInternal(context, target, config, qaRules, logDirectory) {
   const configuredUnavailable = configuredNoCheckinResult(target, config);
   if (configuredUnavailable) return configuredUnavailable;
+  if (config.ptPassiveReadRules?.[target.origin]) {
+    const passive = await readPtPassiveState(context,target,config);
+    if (config.checkinReadOnly || passive?.status !== 'not_signed') return passive;
+  }
   const fast = await tryNewApiHttpFirst(context, target, config);
   if (fast && !fast.fallback && fast.result) {
     return { ...fast.result, origin: target.origin, metrics: fast.metrics, attempt: 1, candidateHistory: [] };

@@ -13,15 +13,8 @@ export function configuredNoCheckinResult(target, config, now = new Date()) {
     evidence: { source: 'configuration', outcome: 'known_no_checkin_feature', authoritative: true, confirmedAt: now.toISOString() },
   };
 }
-const FEATURE_DISABLED_EVIDENCE = new Map([
-  ["bmapi_checkin_status", new Set(["enabled_false"])],
-  ["new_api_checkin_status", new Set(["message_not_enabled"])],
-  ["new_api_checkin_action", new Set(["message_not_enabled"])],
-  // A user-maintained knownNoCheckinFeatureOrigins entry is an explicit,
-  // local configuration decision. It is still recorded as evidence so that
-  // old or malformed page text cannot silently become terminal.
-  ["configuration", new Set(["known_no_checkin_feature"])],
-]);
+const FEATURE_DISABLED_EVIDENCE = new Map(Object.entries(CHECKIN_CONTRACT.featureDisabledEvidence)
+  .map(([source, outcomes]) => [source, new Set(outcomes)]));
 
 function validEvidenceTimestamp(value, now) {
   const timestamp = Date.parse(String(value ?? ""));

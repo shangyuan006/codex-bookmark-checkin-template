@@ -1,6 +1,8 @@
 import fs from 'node:fs/promises';
 import { checkinCycle } from "./checkin-cycle.mjs";
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { atomicWriteJson } from './security.mjs';
 import { acquireRunLock, releaseRunLock } from './run-lock.mjs';
 import { evidenceBinding, reconcileCheckinResult, isConfiguredTerminalCompletion, clearResolvedFailureFields } from './checkin-evidence.mjs';
@@ -31,6 +33,51 @@ export async function guardPageSubmissions(page,target,scope,{readOnly=false}={}
 }
 
 const pending = entry => ['intent','uncertain'].includes(entry.state);
+export function submissionProfileBinding(target, config = {}) {
+  const account = (config.agentrouterAccounts ?? []).find(entry => entry.origin === target.origin
+    && (entry.accountKey ?? entry.accountId ?? entry.id) === (target.accountKey ?? 'default'));
+  const native = (config.nativeChallengePreflight ?? []).find(entry => {
+    try { return new URL(entry.url).origin === target.origin; } catch { return false; }
+  });
+  const profile = target.automationUserDataDir ?? account?.automationUserDataDir ?? config.automationUserDataDir ?? native?.automationUserDataDir;
+  if (typeof profile !== 'string' || !profile) return null;
+  let absolute = path.resolve(path.dirname(path.dirname(fileURLToPath(import.meta.url))), profile);
+  if (process.platform === 'win32') absolute = absolute.toLowerCase();
+  // Include any alternate native profile too: a change to either execution
+  // profile must invalidate the receipt, even when the fallback mode changes.
+  let nativeProfile = typeof native?.automationUserDataDir === 'string'
+    ? path.resolve(path.dirname(path.dirname(fileURLToPath(import.meta.url))), native.automationUserDataDir) : null;
+  if (nativeProfile && process.platform === 'win32') nativeProfile = nativeProfile.toLowerCase();
+  return createHash('sha256').update(JSON.stringify([absolute, nativeProfile, config.browser ?? null, target.accountKey ?? 'default',
+    config.newApiAccountRules?.[target.origin] ?? null, config.ptPassiveReadRules?.[target.origin] ?? null,
+    account?.authoritativeAccountId ?? account?.siteAccountId ?? null])).digest('hex');
+}
+
+function confirmationEvidence(evidence) {
+  const binding = evidence.binding;
+  return { source: evidence.source, authoritative: true, confirmedAt: evidence.confirmedAt,
+    ...(typeof evidence.outcome === 'string' && /^[a-z][a-z0-9_]{0,79}$/.test(evidence.outcome) ? { outcome: evidence.outcome } : {}),
+    binding: Object.fromEntries(['version','siteOrigin','accountKey','actionType','cycleId','observedOrigin'].map(key => [key,binding[key]])) };
+}
+
+export function recoverConfirmedSubmission(journal, target, config = {}, now = new Date()) {
+  const identity = evidenceBinding(target,config,now);
+  if (outstandingSubmissions(journal,identity).length) return null;
+  const profileBinding = submissionProfileBinding(target,config);
+  if (!profileBinding) return null;
+  for (const entry of [...journal.entries].reverse()) {
+    const receipt = entry.receipt;
+    if (entry.state !== 'confirmed' || entry.cycleId !== identity.cycleId || entry.profileBinding !== profileBinding || receipt?.profileBinding !== profileBinding
+      || entry.identity.siteOrigin !== identity.siteOrigin || entry.identity.accountKey !== identity.accountKey || entry.identity.actionType !== identity.actionType
+      || receipt?.evidence?.authoritative !== true || receipt.evidence.source === 'user_rule') continue;
+    const result = reconcileCheckinResult({origin:target.origin,accountKey:target.accountKey ?? 'default',
+      actionType:target.actionType ?? 'checkin',status:'already_signed',evidence:receipt.evidence},receipt.evidence,now,{target,config,requireBinding:true});
+    if (result.status === 'already_signed') return {...result,cycle:checkinCycle(target.origin,config,now),
+      ...(target.allowedOrigins?{allowedOrigins:target.allowedOrigins}:{}),cached:true,observedAt:receipt.evidence.confirmedAt,
+      reason:'当前隔离配置已有本周期的权威确认回执，保留原始观察时间'};
+  }
+  return null;
+}
 export function outstandingSubmissions(journal, identity) {
   return journal.entries.filter(entry => pending(entry) && entry.identity.siteOrigin === identity.siteOrigin
     && entry.identity.accountKey === identity.accountKey && entry.identity.actionType === identity.actionType);
@@ -48,7 +95,8 @@ export async function readSubmissionJournal(file) {
           || !entry.cycleId || !Number.isFinite(Date.parse(entry.startedAt??''))
           || !Array.isArray(entry.history)||!entry.history.length
           || entry.history.some(event=>!event?.event||!Number.isFinite(Date.parse(event.at??'')))
-          || !['intent','uncertain','confirmed','rejected'].includes(entry.state);
+          || !['intent','uncertain','confirmed','rejected'].includes(entry.state)
+          || (entry.profileBinding != null && !/^[a-f0-9]{64}$/.test(entry.profileBinding));
       })) throw new Error('invalid journal');
     return journal;
   } catch (error) {
@@ -146,6 +194,7 @@ export function reconcileSubmissionResult(result,remaining,target,config={},now=
 export function createSubmissionScope(file, target, config={}, {now=()=>new Date()}={}) {
   const base = evidenceBinding(target,config,now());
   const identity = {siteOrigin:base.siteOrigin,accountKey:base.accountKey,actionType:base.actionType};
+  const profileBinding = submissionProfileBinding(target,config);
   let intentId = null;
   const priorCycleEntries = new Set();
   const blockingEntries = journal => outstandingSubmissions(journal,identity)
@@ -163,6 +212,7 @@ export function createSubmissionScope(file, target, config={}, {now=()=>new Date
     async isPending() { return (await this.pending()).length>0; },
     async pending() { return blockingEntries(await readSubmissionJournal(file)); },
     async allPending() { return outstandingSubmissions(await readSubmissionJournal(file),identity); },
+    async confirmedReceipt() { return recoverConfirmedSubmission(await readSubmissionJournal(file),target,config,now()); },
     // Explicit daily continuation only: a fresh negative observation permits a
     // new cycle, never repeats an uncertain action in its original cycle. Old
     // entries remain unresolved and unchanged in the journal.
@@ -194,7 +244,7 @@ export function createSubmissionScope(file, target, config={}, {now=()=>new Date
           throw new Error("Same-cycle or non-historical submissions remain blocked");
         }
         const id = randomUUID();
-        journal.entries.push({id,identity,cycleId:cycle.id,startedAt:at.toISOString(),state:"intent",
+        journal.entries.push({id,identity,cycleId:cycle.id,startedAt:at.toISOString(),state:"intent",...(profileBinding?{profileBinding}:{}),
           history:[{event:"intent",at:at.toISOString()},{event:"verified_daily_cycle_continuation",
             at:at.toISOString(),evidenceSource:evidence.source,priorCyclePendingCount:outstanding.length}]});
         return { id, priorIds: outstanding.map(entry => entry.id) };
@@ -211,7 +261,7 @@ export function createSubmissionScope(file, target, config={}, {now=()=>new Date
         const at = now();
         const id = randomUUID();
         journal.entries.push({id,identity,cycleId:evidenceBinding(target,config,at).cycleId,
-          startedAt:at.toISOString(),state:'intent',history:[{event:'intent',at:at.toISOString()}]});
+          startedAt:at.toISOString(),state:'intent',...(profileBinding?{profileBinding}:{}),history:[{event:'intent',at:at.toISOString()}]});
         return id;
       });
       intentId = reserved;
@@ -237,8 +287,12 @@ export function createSubmissionScope(file, target, config={}, {now=()=>new Date
           const verified = reconcileCheckinResult(result,result?.evidence,now(),
             {target,config,cycleId:entry.cycleId,requireBinding:true});
           const confirmed = ['signed','already_signed'].includes(verified?.status)
-            && verified.evidence?.authoritative === true;
+            && verified.evidence?.authoritative === true
+            && (!entry.profileBinding || entry.profileBinding === profileBinding);
           entry.state = confirmed ? 'confirmed' : 'uncertain';
+          if (confirmed && profileBinding) entry.receipt = {
+            profileBinding, status:verified.status, evidence:confirmationEvidence(verified.evidence),
+          };
           entry.history.push({event:confirmed?'confirmed':'read_only_unconfirmed',at:now().toISOString(),
             status:/^[a-z_]{1,64}$/.test(result?.status??'')?result.status:'unknown',
             ...(!confirmed && !['signed','already_signed'].includes(result?.status) && result?.failureCode!=='submission_quarantined'
@@ -257,6 +311,14 @@ export async function runWithSubmissionJournal(file,target,config,run,{now=()=>n
   const scope = createSubmissionScope(file,target,config,{now});
   const previous = await scope.pending();
   try {
+    // Reuse is private opt-in; explicit read-only verification always rereads
+    // the site, and New API retains its live account/API verification.
+    if (config.reuseConfirmedSubmissionReceipts === true && config.checkinReadOnly !== true
+      && !config.sequentialActionRules?.[target.origin]
+      && !(config.newApiCheckinOrigins ?? []).includes(target.origin)) {
+      const recovered = await scope.confirmedReceipt();
+      if (recovered) return recovered;
+    }
     let result = await run({...config,checkinReadOnly:config.checkinReadOnly===true || previous.length>0,[SUBMISSION_SCOPE]:scope});
     if(previous.length && config.checkinReadOnly!==true && result?.status==="not_signed") {
       const {current}=partitionSubmissions(previous,target,config,now());

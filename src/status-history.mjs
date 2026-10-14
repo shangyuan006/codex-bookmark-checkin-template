@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { completionEvidenceKind, reconcileCheckinResult } from './checkin-evidence.mjs';
 import { mergeAuthoritativeDailyResults } from './logger.mjs';
+import { isConfirmedNotAvailable } from './result-contract.mjs';
+import { loadStatusHistoryArchive } from './status-history-store.mjs';
 
 const dayOf = report => String(report.runId??'').match(/^(\d{8})-/)?.[1];
 const asRows = result => result.accountResults?.length ? result.accountResults.map(account => ({...account,origin:result.origin})) : [result];
@@ -31,10 +33,11 @@ export function historyModel(reports,{now=new Date(),maxDays=31}={}) {
       accounts++;
       // Historical evidence is checked at its report time, not restamped today.
       const verified = reconcileCheckinResult(row,row.evidence,new Date(at));
-      if (row.status === 'not_available') counts.unavailable++;
+      if (row.status === 'not_available' && isConfirmedNotAvailable(row,new Date(at))) counts.unavailable++;
       else if (['signed','already_signed'].includes(row.status)&&verified.status==='unconfirmed') counts.unbound++;
       else counts[completionEvidenceKind(verified,new Date(at))]++;
-      if (row.submissionAttempted || row.failureCode === 'submission_quarantined') counts.uncertain++;
+      if (row.failureCode === 'submission_quarantined' || row.submissionLockWarning?.submissionBlocked === true
+        || row.submissionAttempted && completionEvidenceKind(verified,new Date(at)) !== 'authoritative') counts.uncertain++;
     }
     return {date,finishedAt:new Date(at).toISOString(),accounts,complete:report.isComplete===true&&report.runState==='final',counts};
   });
@@ -56,5 +59,12 @@ export async function loadStatusHistory(root,{maxReports=200,maxDays=31,now=new 
       reports.push(JSON.parse(await fs.readFile(file,'utf8')));
     } catch { unreadableReports++; }
   }
-  return {days:historyModel(reports,{now,maxDays}),unreadableReports,truncated:entries.length===maxReports};
+  const archive = await loadStatusHistoryArchive(root);
+  const days = new Map(archive.days.filter(day => Date.parse(day.finishedAt) <= now.getTime()).map(day => [day.date,day]));
+  for (const day of historyModel(reports,{now,maxDays})) {
+    const saved = days.get(day.date);
+    if (!saved || Date.parse(day.finishedAt) > Date.parse(saved.finishedAt) && (!saved.complete || day.complete)) days.set(day.date,day);
+  }
+  return {days:[...days.values()].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,maxDays),maxDays,
+    unreadableReports,truncated:entries.length===maxReports,archiveRecovered:archive.recovered,archiveUnreadable:archive.unreadable};
 }

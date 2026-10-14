@@ -1,6 +1,8 @@
 import { runCheckinAdapter } from './checkin-adapters.mjs';
-import { successEvidence, dailyReadinessEvidence } from './checkin-evidence.mjs';
+import { dailyReadinessEvidence } from './checkin-evidence.mjs';
 import { SUBMISSION_SCOPE } from './submission-guard.mjs';
+import { runNewApiProtocol } from './new-api-protocol.mjs';
+import { newApiCheckinOptions } from './new-api-policy.mjs';
 
 export function apiFirstAllowed(target,config={}) {
   const origin=target.origin;
@@ -9,16 +11,6 @@ export function apiFirstAllowed(target,config={}) {
     && !['newApiCaptchaRules','newApiSignInRules','bearerCheckinRules','reauthCheckinRules','preCheckinNavigationRules','sequentialActionRules']
       .some(key=>config[key]?.[origin])
     && !(config.nativeChallengePreflight??[]).some(rule=>{try{return new URL(rule.url).origin===origin;}catch{return false;}});
-}
-
-function checked(body) {
-  if(body?.success!==true) return null;
-  const value=body?.data?.stats?.checked_in_today??body?.data?.checked_in_today??body?.data?.checkedInToday;
-  return typeof value==='boolean'?value:null;
-}
-
-function disabled(body) {
-  return body?.success===false&&/未启用|未啟用|not enabled/i.test(String(body.message??''));
 }
 
 export async function tryNewApiHttpFirst(context,target,config={}, {wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
@@ -38,46 +30,21 @@ export async function tryNewApiHttpFirst(context,target,config={}, {wait=ms=>new
       });
       if(new URL(response.url()).origin!==origin) return null;
       const status=response.status();
-      if(status<200||status>=300) return null;
       const text=await response.text();
       if(text.length>1024*1024) return null;
-      return JSON.parse(text);
+      return {httpStatus:status,body:JSON.parse(text)};
     }catch{return null;}
     finally{await response?.dispose().catch(()=>{});}
   };
-  const month=new Intl.DateTimeFormat('en-CA',{timeZone:config.siteCycleRules?.[origin]?.timeZone??'Asia/Shanghai',year:'numeric',month:'2-digit'}).format(new Date());
-  const statusPath=`/api/user/checkin?month=${encodeURIComponent(month)}`;
-  const signed=status=>({status,reason:'签到状态接口明确确认本周期已签到',evidence:successEvidence('status_endpoint','checked_in_today')});
-  const unavailable=()=>({status:'not_available',availabilityKind:'feature_disabled',reason:'站点签到功能未启用',evidence:{source:'new_api_checkin_status',outcome:'message_not_enabled',authoritative:true,confirmedAt:new Date().toISOString()}});
   const adapter={
     id:'new_api_http',
-    detect:async()=>{
-      // The request context shares the isolated browser cookie jar. No cookie or
-      // localStorage export, extra credential store, or caller-supplied token.
-      const self=await read('/api/user/self');
-      const id=self?.data?.id??self?.data?.user?.id;
-      if(self?.success!==true||!/^\d{1,20}$/.test(String(id??''))) return {supported:false,requests};
-      const userId=String(id);
-      const status=await read(statusPath,'GET',userId);
-      return {supported:checked(status)!==null||disabled(status),userId,status,requests};
-    },
-    execute:async(_,capability)=>{
-      if(disabled(capability.status)) return {result:unavailable(),requests};
-      if(checked(capability.status)===true) return {result:signed('already_signed'),requests};
-      if(config.checkinReadOnly) return {result:dailyReadinessEvidence(target,config,{source:"status_endpoint"}),requests};
-      await config[SUBMISSION_SCOPE]?.begin();
-      const response=await read('/api/user/checkin','POST',capability.userId);
-      // Explicit WAF rejection permits the existing interactive page workflow.
-      if(response?.success===false&&/turnstile|captcha|人机|人機/i.test(String(response.message??''))) {
-        await config[SUBMISSION_SCOPE]?.reject('challenge_rejected');
-        return {result:null,submissionAttempted:false,requests};
-      }
-      for(let attempt=0;attempt<4;attempt++){
-        if(attempt) await wait(750);
-        const status=await read(statusPath,'GET',capability.userId);
-        if(checked(status)===true) return {result:signed('signed'),requests};
-      }
-      return {result:{status:'needs_attention',reason:'API 签到请求已发送，复核未取得完成信号，需人工确认',submissionAttempted:true,retryable:false,failureCode:'api_submission_unconfirmed'},submissionAttempted:true,requests};
+    detect:async()=>({supported:true}),
+    execute:async()=>{
+      let result=await runNewApiProtocol({...newApiCheckinOptions(target,config),readOnly:config.checkinReadOnly===true,
+        request:read,wait,fallbackOnChallenge:true,beforeSubmit:()=>config[SUBMISSION_SCOPE]?.begin(),
+        rejectSubmission:code=>config[SUBMISSION_SCOPE]?.reject(code)});
+      if(result?.status==='not_signed') result=dailyReadinessEvidence(target,config,{source:'status_endpoint'});
+      return {result,requests,submissionAttempted:result?.submissionAttempted===true};
     },
     verify:async observation=>observation.result,
   };

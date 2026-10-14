@@ -296,7 +296,7 @@ test("legacy New API POST success requires a confirming status read", async () =
 
   const confirmed = await runLegacyNewApiCheckin([false, true]);
   assert.equal(confirmed.result.status, "signed");
-  assert.equal(confirmed.requests.filter((request) => request.method === "GET").length, 2);
+  assert.equal(confirmed.requests.filter((request) => request.method === "GET").length, 4);
 });
 
 test("legacy New API reports an invalid session instead of no_action", async () => {
@@ -331,7 +331,6 @@ test("API session failures allow a visible check-in page without starting login 
   for (const options of [
     {storageUserId:null,selfStatus:401},
     {statusHttpStatus:403},
-    {postStatus:403},
   ]) {
     const {result} = await runLegacyNewApiCheckin([false], {...options, controls:["立即签到"]});
     assert.equal(result, null);
@@ -340,6 +339,9 @@ test("API session failures allow a visible check-in page without starting login 
   assert.equal(loggedOut.result.status, "login_required");
   const complete = await runLegacyNewApiCheckin([], {statusHttpStatus:403,controls:["已签到"]});
   assert.equal(complete.result.status, "already_signed");
+  const submitted = await runLegacyNewApiCheckin([false], {postStatus:403,controls:["立即签到"]});
+  assert.equal(submitted.result.status,'needs_attention');
+  assert.equal(submitted.result.submissionAttempted,true);
 });
 
 test("a submitted action with unavailable verification must not trigger a second submission", async () => {

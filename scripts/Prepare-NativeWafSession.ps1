@@ -320,6 +320,8 @@ foreach ($item in $items) {
             '原生签到未找到配置的唯一动作'
         } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'action_not_unique') {
             '原生签到发现多个配置动作，已拒绝点击'
+        } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'action_not_actionable') {
+            '原生签到按钮被遮挡或未达到可点击状态，未登记提交意图'
         } elseif ($hasAction -and [string]$reportedInspection.challengeOutcome -eq 'challenge_not_unique') {
             '原生签到发现多个 Cloudflare 验证控件，已拒绝点击'
         } elseif ($hasAction -and [string]$reportedInspection.challengeOutcome -eq 'challenge_click_failed') {

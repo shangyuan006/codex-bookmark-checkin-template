@@ -51,14 +51,18 @@ export async function ensurePrivateDirectory(directory) {
   if (process.platform !== "win32") await fs.chmod(directory, 0o700);
 }
 
-export async function atomicWriteJson(filePath, value, {
+export async function atomicWriteJson(filePath, value, options = {}) {
+  return atomicWriteText(filePath, `${JSON.stringify(value, null, 2)}\n`, options);
+}
+
+export async function atomicWriteText(filePath, text, {
   io = fs, platform = process.platform,
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   await io.mkdir(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await io.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await io.writeFile(temporary, text, { encoding: "utf8", mode: 0o600 });
     const delays = [50, 100, 200, 400, 800];
     for (let attempt = 0; ; attempt += 1) {
       try {
