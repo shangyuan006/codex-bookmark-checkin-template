@@ -26,6 +26,9 @@ export async function continueNativeCheckinAfterLogin(target, config, loginOutco
       cycle: confirmation.cycle,
       submissionAttempted: confirmation.submissionAttempted,
       nativePreflight: true,
+      safeLineDiagnostics: confirmation.safeLineDiagnostics,
+      readOnlyDiagnostics: confirmation.readOnlyDiagnostics,
+      readOnlyRecheck: confirmation.readOnlyRecheck === true,
     };
   }
   if (confirmation?.status === 'interactive_challenge'
@@ -41,11 +44,16 @@ export async function continueNativeCheckinAfterLogin(target, config, loginOutco
       actionAttempted: confirmation.actionAttempted === true,
       actionOutcome: confirmation.actionOutcome,
       nativePreflight: true,
+      safeLineDiagnostics: confirmation.safeLineDiagnostics,
+      readOnlyDiagnostics: confirmation.readOnlyDiagnostics,
+      readOnlyRecheck: confirmation.readOnlyRecheck === true,
     };
   }
   return {
     status: 'needs_attention',
     reason: failed ? '原生登录后的签到流程未完成，需要人工确认' : '原生登录已恢复，但原生签到尚未取得成功证据，需要人工确认',
     failureCode: 'native_checkin_after_login_unconfirmed',
+    ...(confirmation ? { safeLineDiagnostics: confirmation.safeLineDiagnostics,
+      readOnlyDiagnostics: confirmation.readOnlyDiagnostics, readOnlyRecheck: confirmation.readOnlyRecheck === true } : {}),
   };
 }

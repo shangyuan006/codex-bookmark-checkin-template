@@ -168,7 +168,7 @@ test("LinuxDO login-page CF stops account-level OAuth retries", async () => {
   const source = await fs.readFile(new URL("../src/reauth-checkin.mjs", import.meta.url), "utf8");
   assert.match(
     source,
-    /if \(!shouldRetryOAuthFailureStage\(current\.oauthStage\)\) return current/,
+    /if \(!shouldRetryOAuthFailureStage\(current\.oauthStage, current\)\) return current/,
   );
   assert.match(
     source,

@@ -222,16 +222,34 @@ foreach ($item in $items) {
         [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($actionJson))
     }
     else { '' }
-    for ($inspectionAttempt = 1; $inspectionAttempt -le $item.maxAttempts -and $null -eq $inspection; $inspectionAttempt++) {
+    $inspectionLimit = $item.maxAttempts
+    $readOnlyRecheckPending = $false
+    $readOnlyRecheckAttempted = $false
+    $recoveredSafeLineDiagnostics = $null
+    for ($inspectionAttempt = 1; $inspectionAttempt -le $inspectionLimit -and $null -eq $inspection; $inspectionAttempt++) {
+        $readOnlyAttempt = $readOnlyRecheckPending
+        $readOnlyRecheckPending = $false
+        $attemptMode = if ($readOnlyAttempt) { 'verify-checkin' } else { $inspectionMode }
+        $attemptWait = if ($readOnlyAttempt) { [Math]::Min(30, [int]$item.waitSeconds) } else { [int]$item.waitSeconds }
         $attemptFailure = $null
         try {
             $debugPort = Get-Random -Minimum 12000 -Maximum 32000
             & (Join-Path $PSScriptRoot 'Open-PlainLoginChrome.ps1') -Offscreen -NativeMinimal:([bool]$item.nativeMinimal) -RemoteDebuggingPort $debugPort -UserDataDirOverride $profilePath -Urls @($url)
             Start-Sleep -Seconds 2
             try {
-                $inspectionText = & $node $inspector $debugPort $origin ([int]$item.waitSeconds) $inspectionMode $actionConfigBase64 2>$null
+                $inspectionText = & $node $inspector $debugPort $origin $attemptWait $attemptMode $actionConfigBase64 2>$null
                 if ($LASTEXITCODE -eq 0 -and $inspectionText) {
                     $inspection = $inspectionText | ConvertFrom-Json
+                    if ($null -ne $inspection.safeLineDiagnostics -and -not $readOnlyAttempt) {
+                        $recoveredSafeLineDiagnostics = $inspection.safeLineDiagnostics
+                    }
+                    if ($readOnlyAttempt) {
+                        if ($recoveredSafeLineDiagnostics) {
+                            $recoveredSafeLineDiagnostics | Add-Member -MemberType NoteProperty -Name finalStatus -Value ([string]$inspection.status) -Force
+                            $inspection | Add-Member -MemberType NoteProperty -Name safeLineDiagnostics -Value $recoveredSafeLineDiagnostics -Force
+                        }
+                        $inspection | Add-Member -MemberType NoteProperty -Name readOnlyRecheck -Value $true -Force
+                    }
                     $lastInspection = $inspection
                     $attemptExplicit = [string]$inspection.status -in @('signed', 'already_signed') `
                         -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
@@ -254,6 +272,9 @@ foreach ($item in $items) {
                     actionAttempted = [bool]$inspection.actionAttempted
                     actionOutcome = [string]$inspection.actionOutcome
                     challengeOutcome = [string]$inspection.challengeOutcome
+                    safeLineDiagnostics = $inspection.safeLineDiagnostics
+                    readOnlyDiagnostics = $inspection.readOnlyDiagnostics
+                    readOnlyRecheck = $inspection.readOnlyRecheck -eq $true
                     newApiConfirmed = [bool]$inspection.newApiConfirmed
                     evidence = $inspection.evidence
                     cycle = $inspection.cycle
@@ -268,8 +289,18 @@ foreach ($item in $items) {
         finally {
             Complete-NativePreflightAttempt -Cleanup { Close-AutomationBrowser $profilePath } -Failure $attemptFailure
         }
+        if ($null -eq $inspection -and -not $readOnlyRecheckAttempted -and $hasAction `
+            -and [string]$lastInspection.failureCode -eq 'submission_quarantined' `
+            -and [string]$lastInspection.safeLineDiagnostics.outcome -eq 'safeline_resolved') {
+            # Save the native session first, then read it once in a fresh renderer.
+            # verify-checkin cannot click challenges, resume a cycle or submit.
+            $readOnlyRecheckAttempted = $true
+            $readOnlyRecheckPending = $true
+            $inspectionLimit = $inspectionAttempt + 1
+            continue
+        }
         if ([string]$lastInspection.failureCode -in @('safeline_client_challenge','submission_quarantined')) { break }
-        if ($null -eq $inspection -and $inspectionAttempt -lt $item.maxAttempts) { Start-Sleep -Seconds 1 }
+        if ($null -eq $inspection -and $inspectionAttempt -lt $inspectionLimit) { Start-Sleep -Seconds 1 }
     }
     $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed') `
         -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
@@ -344,6 +375,9 @@ foreach ($item in $items) {
         actionOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.actionOutcome } else { 'unavailable' }
         challengeOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.challengeOutcome } else { 'unavailable' }
         challengeDetails = if ($null -ne $reportedInspection) { $reportedInspection.challengeDetails } else { $null }
+        safeLineDiagnostics = if ($null -ne $reportedInspection) { $reportedInspection.safeLineDiagnostics } else { $null }
+        readOnlyDiagnostics = if ($null -ne $reportedInspection) { $reportedInspection.readOnlyDiagnostics } else { $null }
+        readOnlyRecheck = $readOnlyRecheckAttempted
         newApiAttempted = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiAttempted
         newApiConfirmed = $null -ne $reportedInspection -and [bool]$reportedInspection.newApiConfirmed
     }

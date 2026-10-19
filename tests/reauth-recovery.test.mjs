@@ -95,7 +95,7 @@ for (const scenario of ["restart", "complete", "fallback-write-failure", "restar
       ].join("\n"));
       await fs.writeFile(path.join(src, "prepare-native-browser-profile.mjs"), "");
       await fs.writeFile(path.join(src, "oauth-provider-session.mjs"), `console.log(JSON.stringify({status:'valid'}));`);
-      await fs.writeFile(path.join(src, "oauth-login.mjs"), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(calls)},'oauth\\n'); console.log(JSON.stringify({status:'needs_attention',oauthStage:'target_callback'}));`);
+      await fs.writeFile(path.join(src, "oauth-login.mjs"), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(calls)},process.argv.includes('--native-cdp-port')?'native\\n':'oauth\\n'); console.log(JSON.stringify({status:'needs_attention',oauthStage:'target_callback'}));`);
       await fs.writeFile(path.join(src, "probe-agentrouter-session.mjs"), [
         "import fs from 'node:fs';",
         `const calls=${JSON.stringify(calls)};`,
@@ -109,7 +109,7 @@ for (const scenario of ["restart", "complete", "fallback-write-failure", "restar
       if (scenario !== "complete") await fs.writeFile(providerState, JSON.stringify({ accountKey: "linuxdo", profile }));
       const result = spawnSync(powershellExecutable, ["-NoProfile", "-File", path.join(scripts, "Open-AgentRouterLogin.ps1"), "-AccountKey", "linuxdo", "-AgentRouterOnly"], { encoding: "utf8", timeout: 30000 });
       assert.equal(result.status, scenario === "fallback-write-failure" ? 1 : 0, result.stderr + result.stdout);
-      assert.equal(await fs.readFile(calls, "utf8"), scenario === "fallback-write-failure" ? "oauth\nverify\n" : scenario === "restart-manual" ? "full\noauth\nmanual\n" : "full\n");
+      assert.equal(await fs.readFile(calls, "utf8"), scenario === "fallback-write-failure" ? "oauth\nverify\n" : scenario === "restart-manual" ? "full\noauth\nmanual\nnative\n" : "full\n");
       if (scenario === "fallback-write-failure") {
         await fs.access(providerState);
         assert.doesNotMatch(result.stdout, /authoritatively confirms today's check-in/);
@@ -117,6 +117,7 @@ for (const scenario of ["restart", "complete", "fallback-write-failure", "restar
       if (scenario === "restart-manual") {
         const state = JSON.parse(await fs.readFile(path.join(tmp, "agentrouter-manual-state.json"), "utf8"));
         assert.equal(state.stage, "agentrouter");
+        assert.equal(state.handoffStage, "target_callback");
       }
     } finally {
       await fs.rm(directory, { recursive: true, force: true });

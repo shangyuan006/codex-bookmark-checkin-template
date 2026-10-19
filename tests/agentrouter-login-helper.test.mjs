@@ -152,7 +152,7 @@ test("LinuxDO manual recovery uses explicit provider and Agent Router stages", a
   assert.match(open, /'--agent-router-only'/);
   assert.match(open, /'--provider-session-confirmed'/);
   assert.doesNotMatch(open, /'--interactive-attention'/);
-  assert.match(open, /Opening one native no-CDP Edge window for manual completion/);
+  assert.match(open, /Continuing once in one native Edge window before manual takeover/);
   assert.match(open, /\[string\]\$automaticResult\.status -eq 'logged_in'/);
   assert.match(open, /authorizationOutcome/);
   assert.match(open, /authorization_click_failed/);
@@ -163,10 +163,10 @@ test("LinuxDO manual recovery uses explicit provider and Agent Router stages", a
   assert.match(open, /'-ReauthAccountKey', \$requestedAccountKey/);
   assert.match(open, /-PostOAuthVerify/);
   assert.match(open, /'-Attempts', '1'/);
-  assert.match(open, /Opening one native no-CDP Edge window for manual completion/);
+  assert.match(open, /same dedicated window is waiting at stage/);
   assert.match(open, /refusing to open a second window/);
   assert.match(close, /agentrouter-linuxdo-provider-state\.json/);
-  assert.match(readme, /无 CDP、无 Playwright 的原生 Edge 窗口/);
+  assert.match(readme, /带临时本机调试端口的原生 Edge 专用窗口/);
   assert.match(readme, /必须严格分两阶段/);
   assert.match(readme, /三次通过浏览器请求探测/);
   assert.match(readme, /后台页面访问 LinuxDO 首页，再由页面内请求读取该固定端点/);
@@ -174,7 +174,7 @@ test("LinuxDO manual recovery uses explicit provider and Agent Router stages", a
   assert.match(readme, /只有两种探针都明确无效才打开登录页/);
   assert.match(readme, /同一个 OAuth 页面内最多三次重进 Agent Router/);
   assert.match(readme, /登录提交后只等待当前页面/);
-  assert.match(readme, /复核阶段不会发起第二次 OAuth/);
+  assert.match(readme, /定向权威复核，不发起第二次 OAuth/);
   assert.match(readme, /最终账号结果必须为 `signed` 或 `already_signed`/);
   assert.match(readme, /-ProviderOnly/);
   assert.match(readme, /-AgentRouterOnly/);

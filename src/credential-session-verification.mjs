@@ -50,16 +50,70 @@ export function classifyCredentialVerification({
   return { authenticated: true, failureCode: null, dailyCheckin };
 }
 
+export function classifyCredentialApiVerification({ statusCode, body }) {
+  if (!Number.isInteger(statusCode) || statusCode < 200 || statusCode >= 300) {
+    return { authenticated: false, failureCode: "verification_http_error" };
+  }
+  const id = body?.data?.id ?? body?.data?.user?.id;
+  const validId = (typeof id === "string" || (typeof id === "number" && Number.isSafeInteger(id)))
+    && /^[1-9][0-9]{0,19}$/.test(String(id));
+  return body?.success === true && validId
+    ? { authenticated: true, failureCode: null }
+    : { authenticated: false, failureCode: "api_session_unconfirmed" };
+}
+
 export async function verifyCredentialSession(page, {
   origin,
   verificationPath,
+  pageUrl = null,
   navigationTimeoutMs = 20000,
 }) {
   const verificationUrl = credentialVerificationUrl(origin, verificationPath);
+  if (verificationUrl.pathname === "/api/user/self") {
+    // Some frontends keep authentication in memory and add it to their own
+    // API requests. Directly navigating to /self omits those headers. Observe
+    // the frontend's actual read instead of copying or logging its secrets.
+    let current;
+    try { current = new URL(page.url()); } catch { /* fail closed below */ }
+    if (current?.origin !== verificationUrl.origin || current?.protocol !== "https:") {
+      return { authenticated: false, failureCode: "cross_origin", statusCode: 0, passwordVisible: false };
+    }
+    const frontendUrl = pageUrl === null ? null : credentialVerificationUrl(origin, pageUrl);
+    const responsePromise = page.waitForResponse(async candidate => {
+      if (candidate.url() !== verificationUrl.href || candidate.request().method() !== "GET"
+        || candidate.status() < 200 || candidate.status() >= 300) return false;
+      const body = await candidate.json().catch(() => null);
+      return classifyCredentialApiVerification({ statusCode: candidate.status(), body }).authenticated;
+    }, { timeout: Math.max(500, Math.min(Number(navigationTimeoutMs) || 20000, 8000)) })
+      .catch(() => null);
+    const navigationOptions = { waitUntil: "domcontentloaded", timeout: navigationTimeoutMs };
+    if (frontendUrl) await page.goto(frontendUrl.href, navigationOptions).catch(() => {});
+    else await page.reload(navigationOptions).catch(() => {});
+    const observed = await responsePromise;
+    if (observed) {
+      let location;
+      try { location = new URL(page.url()); } catch { /* fail closed below */ }
+      if (location?.origin !== verificationUrl.origin || location?.protocol !== "https:") {
+        return { authenticated: false, failureCode: "cross_origin", statusCode: 0, passwordVisible: false };
+      }
+      return { authenticated: true, failureCode: null, statusCode: observed.status(), passwordVisible: false };
+    }
+  }
   const response = await page.goto(verificationUrl.href, {
     waitUntil: "domcontentloaded",
     timeout: navigationTimeoutMs,
   }).catch(() => null);
+  if (verificationUrl.pathname === "/api/user/self") {
+    let location;
+    try { location = new URL(page.url()); } catch { /* fail closed below */ }
+    if (location?.href !== verificationUrl.href) {
+      return { authenticated: false, failureCode: "invalid_final_url", statusCode: response?.status() ?? 0,
+        passwordVisible: false };
+    }
+    const body = await response?.json().catch(() => null);
+    return { ...classifyCredentialApiVerification({ statusCode: response?.status() ?? 0, body }),
+      statusCode: response?.status() ?? 0, passwordVisible: false };
+  }
   await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
   const bodyText = String(await page.locator("body").innerText().catch(() => ""));
   const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0) > 0;

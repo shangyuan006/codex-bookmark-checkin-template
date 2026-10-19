@@ -1,4 +1,4 @@
-import { sanitizeOAuthPageObservation } from './oauth-target-state.mjs';
+import { sanitizeOAuthPageObservation, sanitizeOAuthCallbackDiagnostics, sanitizeOAuthTimingDiagnostics } from './oauth-target-state.mjs';
 
 const LOGIN_HELPER_STATUSES = new Set([
   "logged_in",
@@ -12,6 +12,7 @@ const LOGIN_HELPER_STATUSES = new Set([
 ]);
 
 export const OAUTH_DIAGNOSTIC_STAGES = new Set([
+  "oauth_retry_budget_exhausted",
   "logout_verification",
   "target_login",
   "provider_button",
@@ -59,6 +60,7 @@ const PROVIDER_AUTHORIZATION_CHALLENGE_OUTCOMES = new Set([
   "clicked_once",
   "clicked_twice",
   "resolved_after_click",
+  "departed_unconfirmed",
   "unresolved_after_click",
 ]);
 
@@ -181,6 +183,8 @@ export function loginHelperOutcome(text, fallback = "failed") {
     status,
     diagnostic: messages[status] ?? messages.failed,
     ...sanitizeOAuthPageObservation(value),
+    ...sanitizeOAuthCallbackDiagnostics(value?.callbackDiagnostics),
+    ...sanitizeOAuthTimingDiagnostics(value),
     ...(["signed", "already_signed"].includes(String(value?.checkinStatus))
       ? { checkinStatus: String(value.checkinStatus) }
       : {}),
@@ -211,6 +215,10 @@ export function loginHelperOutcomeFromStreams(stdout, stderr = "", fallback = "f
     return {
       ...primary,
       ...Object.fromEntries(Object.entries(sanitizeOAuthPageObservation(diagnostic))
+        .filter(([key]) => primary[key] == null)),
+      ...(!primary.callbackDiagnostics && diagnostic.callbackDiagnostics
+        ? { callbackDiagnostics: diagnostic.callbackDiagnostics } : {}),
+      ...Object.fromEntries(Object.entries(sanitizeOAuthTimingDiagnostics(diagnostic))
         .filter(([key]) => primary[key] == null)),
       ...(!primary.oauthStage && diagnostic.oauthStage ? { oauthStage: diagnostic.oauthStage } : {}),
       ...(!primary.loginStage && diagnostic.loginStage ? { loginStage: diagnostic.loginStage } : {}),

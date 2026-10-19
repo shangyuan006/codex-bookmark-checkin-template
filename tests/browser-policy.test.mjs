@@ -504,6 +504,8 @@ test("签到前公告关闭规则可有界处理复用同一关闭控件的连�
   let remaining = 2;
   const candidate = {
     isVisible: async () => remaining > 0,
+    isEnabled: async () => true,
+    evaluate: async () => `notice-${remaining}`,
     click: async () => { remaining -= 1; },
   };
   const locator = {
@@ -513,6 +515,7 @@ test("签到前公告关闭规则可有界处理复用同一关闭控件的连�
   const page = {
     locator: () => locator,
     getByRole: () => ({ count: async () => 0, nth: () => candidate }),
+    evaluate: async () => remaining > 0,
   };
   const target = { origin: "https://bookmark.test", allowedOrigins: ["https://bookmark.test"] };
   const config = {

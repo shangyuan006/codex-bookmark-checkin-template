@@ -76,7 +76,10 @@ test('offline Edge verifies logout transitions and announcement dismissal using 
     await page.goto(`${origin}/login`);
     assert.equal((await readReauthLogoutEvidence(page, rule)).confirmed, false);
     const observation = await prepareOAuthTargetPage(page, origin, config, { dismissOverlay: dismissConfiguredPreCheckinOverlay });
-    assert.deepEqual(observation, { targetSurface: 'target_login', noticeObserved: true, noticeDismissed: true });
+    assert.equal(observation.targetSurface, 'target_login');
+    assert.equal(observation.noticeObserved, true);
+    assert.equal(observation.noticeDismissed, true);
+    assert.equal(observation.noticeDismissDiagnostics.outcome, 'dismissed');
     const provider = await findUniqueOAuthProviderControl(page, 'GitHub');
     assert.ok(provider);
     await provider.click({ trial: true });

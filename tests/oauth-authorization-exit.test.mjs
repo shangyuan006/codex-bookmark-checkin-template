@@ -28,6 +28,7 @@ test('production authorization stage reports a provider login redirect rather th
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const execute = new AsyncFunction('page', 'isConfiguredProviderAuthorizationPage', 'linuxDoAuthorizationRequiresLogin', `
     const provider='LinuxDO', providerWaitMs=1000, privateResult=false, config={};
+    const timeBudget={deadline:(_,ms)=>Date.now()+ms};
     let oauthStage=null, authorizationOutcome=null, providerAuthorizationChallengeOutcome=null, providerAuthorizationChallengeClicks=0;
     const setOAuthStage=value=>{oauthStage=value;};
     const authorizeConfiguredOAuthProvider=async()=>({clicked:true,outcome:'authorization_clicked'});
@@ -64,12 +65,13 @@ test('production OAuth handles consent and approval challenges before entering t
   const execute = new AsyncFunction('page', 'isConfiguredProviderAuthorizationPage', 'authorizeConfiguredOAuthProvider',
     'clickConfiguredLoginChallengeControl', 'describeConfiguredAuthorizationSurface', 'clock', `
     const Date={now:()=>clock.value}, provider='LinuxDO', providerWaitMs=5000, privateResult=false, config={};
+    const timeBudget={deadline:(_,ms)=>Date.now()+ms};
     const linuxDoAuthorizationRequiresLogin=async()=>false;
     let oauthStage=null, authorizationOutcome=null, providerAuthorizationChallengeOutcome=null, providerAuthorizationChallengeClicks=0;
     const setOAuthStage=value=>{oauthStage=value;};
     let failed=false;
     try { ${source.slice(start, end)} } catch {failed=true;}
-    return {failed,oauthStage,authorizationOutcome,providerAuthorizationChallengeClicks};
+    return {failed,oauthStage,authorizationOutcome,providerAuthorizationChallengeClicks,providerAuthorizationChallengeOutcome};
   `);
   for (const blockedApproval of [false, true]) {
     const clock = { value: 0 };
@@ -99,6 +101,7 @@ test('production OAuth handles consent and approval challenges before entering t
     assert.equal(result.providerAuthorizationChallengeClicks, 2);
     assert.equal(result.failed, blockedApproval);
     assert.equal(result.authorizationOutcome, blockedApproval ? 'provider_challenge_unresolved' : 'authorization_departed');
+    assert.equal(result.providerAuthorizationChallengeOutcome, blockedApproval ? 'unresolved_after_click' : 'departed_unconfirmed');
     assert.equal(result.oauthStage, 'provider_authorization');
     assert.ok(clock.value <= 5500, 'Unresolved approval must have a finite wait');
   }

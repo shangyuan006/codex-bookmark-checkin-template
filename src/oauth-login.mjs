@@ -4,7 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { findBookmarkTarget } from "./bookmarks.mjs";
 import { launchAutomationContext, processCandidate, dismissConfiguredPreCheckinOverlay } from "./browser.mjs";
-import { prepareOAuthTargetPage, readOAuthTargetSurface } from './oauth-target-state.mjs';
+import { prepareOAuthTargetPage, readOAuthTargetSurface, describeOAuthFlowPages } from './oauth-target-state.mjs';
+import { waitForOAuthTargetSession, waitForOAuthTargetReturn } from './oauth-target-completion.mjs';
 import { connectOverCdpWithRetry } from "./native-cdp.mjs";
 import { selectPreferredOAuthTargetPage } from "./oauth-page-selection.mjs";
 import { linuxDoProbeFailureStage, probeProviderSessionInContext } from "./oauth-provider-session.mjs";
@@ -19,7 +20,6 @@ import {
 import { findUniqueOAuthProviderControl } from "./oauth-provider-control.mjs";
 import {
   waitForFirstTransition,
-  waitForOriginPage,
   waitForUsableHttpsPage,
 } from "./oauth-transition.mjs";
 import {
@@ -42,6 +42,9 @@ import {
   restoreSavedGitHubLogin,
 } from "./github-saved-login.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
+import { getConfiguredReauthAccounts, inspectConfiguredReauthRecovery } from './reauth-checkin.mjs';
+import { oauthRetryBudgetBinding, updateOAuthRetryBudget } from './oauth-retry-budget.mjs';
+import { createOAuthTimeBudget, OAuthTimeBudgetError } from './oauth-time-budget.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
@@ -106,7 +109,12 @@ const runtimeConfig = {
 let connectedNativeBrowser = null;
 
 async function openOAuthContext() {
-  if (!useNativeCdp) return launchAutomationContext(runtimeConfig);
+  if (!useNativeCdp) {
+    const context = await launchAutomationContext(runtimeConfig);
+    try { timeBudget.assertActive(); }
+    catch (error) { await context.close().catch(() => {}); throw error; }
+    return context;
+  }
   connectedNativeBrowser = await connectOverCdpWithRetry(chromium, nativeCdpPort, {
     timeoutMs: 15_000,
     attemptTimeoutMs: 2_000,
@@ -114,6 +122,8 @@ async function openOAuthContext() {
   });
   const contexts = connectedNativeBrowser.contexts();
   if (contexts.length !== 1) throw new Error("Native OAuth browser context is not unique");
+  try { timeBudget.assertActive(); }
+  catch (error) { await closeOAuthContext(contexts[0]); throw error; }
   return contexts[0];
 }
 
@@ -123,7 +133,7 @@ async function closeOAuthContext(context) {
     connectedNativeBrowser = null;
     return;
   }
-  await context.close();
+  if (context) await context.close();
 }
 
 async function acquireTargetPage(context) {
@@ -151,7 +161,8 @@ async function runConfiguredTargetCheckin(page) {
 }
 
 async function reuseExistingNativeTargetSession(page) {
-  if (!useNativeCdp || !Object.hasOwn(config.savedLoginSessionRules ?? {}, origin)) return null;
+  if (!useNativeCdp || !(Object.hasOwn(config.savedLoginSessionRules ?? {}, origin)
+    || config.reauthCheckinRules?.[origin]?.accountMenuSelector)) return null;
   await navigateNativeTargetCandidate(page);
   if (!isTargetOriginPage(page) || isTargetLoginPage(page)) return null;
   if (checkinAfterLogin) {
@@ -163,6 +174,15 @@ async function reuseExistingNativeTargetSession(page) {
     return null;
   }
   setOAuthStage("session_verification");
+  if (config.reauthCheckinRules?.[origin]?.accountMenuSelector) {
+    const completion = await waitForOAuthTargetSession(page.context(), origin, config, {
+      timeoutMs: Math.min(5000, providerWaitMs), preferredPage: page,
+      acceptPage: candidate => candidate === page,
+      hasProviderControl: async candidate => Boolean(await findUniqueOAuthProviderControl(candidate, provider)),
+      onObservation: observeTargetPage,
+    });
+    return completion.loggedIn ? { checkinStatus: null } : null;
+  }
   const verifiedSession = await verifyConfiguredSavedLoginSession(page, origin, config);
   return verifiedSession?.status === "valid" ? { checkinStatus: null } : null;
 }
@@ -177,15 +197,26 @@ let experimentalSsoChallengeOutcome = experimentalSsoFrameClick ? "not_exercised
 let providerAuthorizationChallengeOutcome = null;
 let providerAuthorizationChallengeClicks = 0;
 const oauthFlowStartedAt = Date.now();
+const timeBudget = createOAuthTimeBudget();
 const oauthStageHistory = [];
 let targetSurface = 'unavailable';
 let noticeObserved = false;
 let noticeDismissed = false;
+let noticeDismissDiagnostics = null;
+let callbackDiagnostics = null;
+let callbackWaitDiagnostics = null;
+let terminationReason = null;
+let timeoutPhase = null;
+let lastProgressAt = -Infinity;
+let retryBudgetBinding = null;
+let retryBudgetReserved = false;
+let readFlowPageObservation = () => ({});
 
 function observeTargetPage(observation) {
   targetSurface = observation.targetSurface;
   noticeObserved ||= observation.noticeObserved === true;
   noticeDismissed ||= observation.noticeDismissed === true;
+  noticeDismissDiagnostics = observation.noticeDismissDiagnostics ?? noticeDismissDiagnostics;
 }
 
 async function prepareTargetPage(page) {
@@ -195,29 +226,67 @@ async function prepareTargetPage(page) {
 }
 
 function setOAuthStage(value) {
+  timeBudget.assertActive();
   oauthStage = value;
   if (oauthStageHistory.at(-1)!==value) oauthStageHistory.push(value);
-  if (privateResult) process.stderr.write(`${JSON.stringify({ oauthStage })}\n`);
+  emitOAuthProgress(true);
+}
+
+function oauthProgress() {
+  return { oauthStage, stages: oauthStageHistory, elapsedMs: Date.now() - oauthFlowStartedAt,
+    targetSurface, noticeObserved, noticeDismissed,
+    ...(noticeDismissDiagnostics ? { noticeDismissDiagnostics } : {}),
+    ...(callbackDiagnostics ? { callbackDiagnostics } : {}),
+    ...(callbackWaitDiagnostics ? { callbackWaitDiagnostics } : {}),
+    ...readFlowPageObservation(),
+    ...(terminationReason ? { terminationReason, ...(timeoutPhase ? { timeoutPhase } : {}) } : {}),
+    ...(authorizationOutcome ? { authorizationOutcome } : {}),
+    ...(providerAuthorizationChallengeOutcome ? { providerAuthorizationChallengeOutcome, providerAuthorizationChallengeClicks } : {}),
+  };
+}
+
+function emitOAuthProgress(force = false) {
+  if (!privateResult || (!force && Date.now() - lastProgressAt < 1000)) return;
+  lastProgressAt = Date.now();
+  process.stderr.write(`${JSON.stringify(oauthProgress())}\n`);
+}
+
+function observeOAuthTimeout(error) {
+  if (!(error instanceof OAuthTimeBudgetError)) return false;
+  terminationReason = 'flow_timeout';
+  timeoutPhase = error.phase;
+  emitOAuthProgress(true);
+  return true;
+}
+
+function observeCallbackWait(value, budgetMs) {
+  callbackWaitDiagnostics = { ...value, budgetMs };
+  emitOAuthProgress(value.outcome !== 'waiting');
+}
+
+function observeSessionProgress(value, budgetMs) {
+  callbackDiagnostics = { outcome: value.outcome, polls: value.polls, elapsedMs: value.elapsedMs, budgetMs };
+  emitOAuthProgress(value.outcome === 'session_confirmed');
 }
 setOAuthStage("target_login");
 
 async function printResult(status, details = {}) {
+  if (retryBudgetReserved) {
+    await updateOAuthRetryBudget(retryBudgetBinding, useNativeCdp ? 'native' : 'automatic', {
+      status, oauthStage, callbackWaitDiagnostics, authorizationOutcome, providerAuthorizationChallengeOutcome,
+    });
+    retryBudgetReserved = false;
+  }
   await writeOAuthFlowDiagnostic({
     flow:diagnosticStageIndex>=0 ? process.argv[diagnosticStageIndex+1]
       : providerOnly ? 'automatic_provider' : 'automatic_target',
     provider:/linux\s*do/i.test(provider) ? 'LinuxDO' : /github/i.test(provider) ? 'GitHub' : 'other',
-    status, oauthStage, stages:oauthStageHistory, elapsedMs:Date.now()-oauthFlowStartedAt,
-    authorizationOutcome, providerAuthorizationChallengeOutcome, providerAuthorizationChallengeClicks,
-    targetSurface, noticeObserved, noticeDismissed,
+    status, ...oauthProgress(),
   });
   console.log(JSON.stringify({
     status,
-    oauthStage,
-    targetSurface, noticeObserved, noticeDismissed,
-    ...(authorizationOutcome ? { authorizationOutcome } : {}),
+    ...oauthProgress(),
     ...(experimentalSsoChallengeOutcome ? { experimentalSsoChallengeOutcome } : {}),
-    ...(providerAuthorizationChallengeOutcome ? { providerAuthorizationChallengeOutcome } : {}),
-    ...(providerAuthorizationChallengeOutcome ? { providerAuthorizationChallengeClicks } : {}),
     ...details,
   }, null, privateResult ? 0 : 2));
 }
@@ -239,41 +308,16 @@ function isTargetOriginPage(page) {
   }
 }
 
-async function isConfirmedTargetSessionPage(page) {
-  if (!isTargetOriginPage(page) || isTargetLoginPage(page)) return false;
-  if (await page.locator('input[type="password"]:visible').count() > 0) return false;
-  if (await findUniqueOAuthProviderControl(page, provider)) return false;
-  return true;
-}
-
 async function waitForInteractiveTargetSession(context) {
-  const deadline = Date.now() + interactiveAttentionWaitMs;
-  let stablePage = null;
-  let stableSince = 0;
-  while (Date.now() < deadline) {
-    const pages = context.pages().filter((candidate) => !candidate.isClosed());
-    if (pages.length === 0) return false;
-    let candidate = null;
-    for (const currentPage of pages) {
-      if (await isConfirmedTargetSessionPage(currentPage)) {
-        candidate = currentPage;
-        break;
-      }
-    }
-    if (candidate) {
-      if (candidate !== stablePage) {
-        stablePage = candidate;
-        stableSince = Date.now();
-      } else if (Date.now() - stableSince >= 1_500) {
-        return true;
-      }
-    } else {
-      stablePage = null;
-      stableSince = 0;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  return false;
+  timeBudget.beginInteractiveWait();
+  const completion = await waitForOAuthTargetSession(context, origin, config, {
+    timeoutMs: interactiveAttentionWaitMs, stableMs: 1500,
+    hasProviderControl: async candidate => Boolean(await findUniqueOAuthProviderControl(candidate, provider)),
+    onObservation: observeTargetPage,
+    onProgress: observation => observeSessionProgress(observation, interactiveAttentionWaitMs),
+  });
+  callbackDiagnostics = { outcome: completion.outcome, polls: completion.polls, elapsedMs: completion.elapsedMs };
+  return completion.loggedIn;
 }
 
 async function navigateNativeTargetCandidate(page) {
@@ -282,14 +326,6 @@ async function navigateNativeTargetCandidate(page) {
   const candidateUrl = assertBookmarkNavigation(bookmarkTarget.candidates[0], allowedOrigins);
   await page.goto(candidateUrl, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
   await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
-}
-
-async function waitForTargetCallback(preferredPage) {
-  return waitForOriginPage(context, origin, {
-    timeoutMs: providerWaitMs,
-    preferredPage,
-    acceptPage: (candidate) => oauthFlowPages.has(candidate) && !isTargetLoginPage(candidate),
-  });
 }
 
 async function probeLinuxDoSession(context, attempts = 3) {
@@ -305,7 +341,7 @@ async function probeLinuxDoSession(context, attempts = 3) {
     result = await probeProviderSessionInContext(
       context,
       "https://linux.do/session/current.json",
-      config.navigationTimeoutMs,
+      timeBudget.timeoutMs('provider', config.navigationTimeoutMs),
       {
         retryDelaysMs,
         // The target-only context starts immediately after the provider
@@ -347,11 +383,11 @@ async function runProviderOnlyFlow() {
     if (initialSession !== "invalid") return false;
     await providerPage.goto("https://linux.do/login", {
       waitUntil: "commit",
-      timeout: config.navigationTimeoutMs,
+      timeout: timeBudget.timeoutMs('provider', config.navigationTimeoutMs),
     });
     await providerPage.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
     if (isLinuxDoLoginPage(providerPage)) {
-      const recovery = await recoverSavedLinuxDoLogin(providerPage, providerWaitMs);
+      const recovery = await recoverSavedLinuxDoLogin(providerPage, timeBudget.timeoutMs('provider', providerWaitMs));
       if (recovery.challengeObserved && !recovery.recovered) {
         setOAuthStage("linuxdo_login_challenge");
       }
@@ -373,18 +409,39 @@ async function runProviderOnlyFlow() {
 
 if (providerOnly) {
   try {
-    const succeeded = await runProviderOnlyFlow();
+    const succeeded = await timeBudget.run(() => runProviderOnlyFlow());
     await printResult(succeeded ? "logged_in" : "needs_attention");
     if (!succeeded) process.exitCode = 2;
-  } catch {
+  } catch (error) {
+    observeOAuthTimeout(error);
     await printResult("needs_attention");
     process.exitCode = 2;
   }
 } else {
-  const context = await openOAuthContext();
+  if (/linux\s*do/i.test(provider)) {
+    const budgetAccount = getConfiguredReauthAccounts({ origin, candidates: [origin], allowedOrigins: [origin] }, config)
+      .find(account => account.accountKey === accountId);
+    if (budgetAccount) {
+      if (path.resolve(budgetAccount.automationUserDataDir).toLowerCase()
+        !== path.resolve(runtimeConfig.automationUserDataDir).toLowerCase()) throw new Error('OAuth budget profile mismatch');
+      const recovery = await inspectConfiguredReauthRecovery(budgetAccount);
+      retryBudgetBinding = oauthRetryBudgetBinding(budgetAccount, recovery.previous);
+      const reservation = await updateOAuthRetryBudget(retryBudgetBinding, useNativeCdp ? 'native' : 'automatic');
+      if (!reservation.allowed) {
+        setOAuthStage('oauth_retry_budget_exhausted');
+        await printResult('needs_attention');
+        process.exitCode = 2;
+      } else retryBudgetReserved = retryBudgetBinding !== null;
+    }
+  }
+  if (process.exitCode !== 2) {
+  let context;
+  let flowResult;
   const oauthFlowPages = new Set();
-  context.on("page", (candidate) => oauthFlowPages.add(candidate));
   try {
+  await timeBudget.run(async () => {
+  context = await openOAuthContext();
+  context.on("page", (candidate) => oauthFlowPages.add(candidate));
   oauthFlow: {
   if (agentRouterOnly) {
     // The provider-only phase established the session before this context was
@@ -400,14 +457,17 @@ if (providerOnly) {
   }
   let page = await acquireTargetPage(context);
   oauthFlowPages.add(page);
+  readFlowPageObservation = () => describeOAuthFlowPages(context, origin, provider, {
+    acceptPage: candidate => oauthFlowPages.has(candidate), currentPage: page,
+  });
   const reusedSession = await reuseExistingNativeTargetSession(page);
   if (reusedSession) {
     setOAuthStage("completed");
-    await printResult("logged_in", {
+    flowResult = { status: 'logged_in', details: {
       finalOriginMatchesTarget: true,
       loginFormVisible: false,
       ...(reusedSession.checkinStatus ? { checkinStatus: reusedSession.checkinStatus } : {}),
-    });
+    } };
     break oauthFlow;
   }
   const configuredLoginUrl = loginUrlIndex >= 0
@@ -415,7 +475,7 @@ if (providerOnly) {
     : (config.oauthLoginUrls?.[origin] ?? `${origin}/login`);
   const loginUrl = new URL(configuredLoginUrl);
   if (loginUrl.origin !== origin || loginUrl.protocol !== "https:") throw new Error("OAuth 登录入口不属于目标站点");
-  await page.goto(loginUrl.href, { waitUntil: "commit", timeout: config.navigationTimeoutMs });
+  await page.goto(loginUrl.href, { waitUntil: "commit", timeout: timeBudget.timeoutMs('provider', config.navigationTimeoutMs) });
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
   const providerVariants = [...new Set([provider, provider.replace(/linuxdo/i, "Linux DO")])];
   const providerLabels = providerVariants.flatMap((name) => [
@@ -428,7 +488,7 @@ if (providerOnly) {
     : [provider, `${provider}登录`, `${provider}登入`];
   async function findProviderButton(currentPage) {
     setOAuthStage("provider_button");
-    const providerDeadline = Date.now() + providerWaitMs;
+    const providerDeadline = timeBudget.deadline('provider', providerWaitMs);
     while (Date.now() < providerDeadline) {
       const observation = await prepareTargetPage(currentPage);
       if (config.reauthCheckinRules?.[origin] && observation.targetSurface === 'authenticated_target') {
@@ -460,7 +520,7 @@ if (providerOnly) {
     const providerButton = await findProviderButton(currentPage);
     setOAuthStage("provider_transition");
     const previousUrl = currentPage.url();
-    const transitionTimeout = Math.min(20_000, providerWaitMs);
+    const transitionTimeout = timeBudget.timeoutMs('provider', Math.min(20_000, providerWaitMs));
     const existingPages = new Set(context.pages());
     const popupPromise = currentPage.waitForEvent("popup", { timeout: transitionTimeout })
       .then((popup) => waitForUsableHttpsPage(popup, { timeoutMs: transitionTimeout }))
@@ -494,7 +554,7 @@ if (providerOnly) {
     if (/linux\s*do/i.test(provider) && isLinuxDoSsoProviderPage(page.url())) {
       const ssoChallengeRule = configuredLinuxDoSsoChallengeRule(config, provider);
       const ssoTransition = await waitForLinuxDoSsoTransition(page, {
-        timeoutMs: providerWaitMs,
+        timeoutMs: timeBudget.timeoutMs('provider', providerWaitMs),
         onChallengeObserved: () => setOAuthStage("linuxdo_login_challenge"),
         allowFrameCoordinateFallback: allowLinuxDoSsoFrameClick,
         frameStableMs: ssoChallengeRule.frameStableMs,
@@ -532,13 +592,13 @@ if (providerOnly) {
         throw new Error("GitHub OAuth repeatedly resumed outside authorization");
       }
       setOAuthStage("provider_transition");
-      await page.goto(loginUrl.href, { waitUntil: "commit", timeout: config.navigationTimeoutMs });
+      await page.goto(loginUrl.href, { waitUntil: "commit", timeout: timeBudget.timeoutMs('provider', config.navigationTimeoutMs) });
       await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
       continue;
     }
     for (let attempt = 0; attempt < 2 && isLinuxDoLoginPage(page); attempt += 1) {
       setOAuthStage("linuxdo_session");
-      const recovery = await recoverSavedLinuxDoLogin(page, providerWaitMs);
+      const recovery = await recoverSavedLinuxDoLogin(page, timeBudget.timeoutMs('provider', providerWaitMs));
       if (recovery.challengeObserved && !recovery.recovered) {
         setOAuthStage("linuxdo_login_challenge");
       }
@@ -558,7 +618,7 @@ if (providerOnly) {
     // resuming the original OAuth request. Re-enter Agent Router in the same
     // page after the navigation settles; never open a parallel provider page.
     setOAuthStage("provider_transition");
-    await page.goto(loginUrl.href, { waitUntil: "commit", timeout: config.navigationTimeoutMs });
+    await page.goto(loginUrl.href, { waitUntil: "commit", timeout: timeBudget.timeoutMs('provider', config.navigationTimeoutMs) });
     await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
   }
 
@@ -568,14 +628,14 @@ if (providerOnly) {
     if (override.origin !== origin || override.protocol !== "https:") throw new Error("OAuth 回调覆盖地址不属于目标站点");
     const authorizeUrl = new URL(page.url());
     authorizeUrl.searchParams.set("redirect_uri", override.href);
-    await page.goto(authorizeUrl.href, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
+    await page.goto(authorizeUrl.href, { waitUntil: "domcontentloaded", timeout: timeBudget.timeoutMs('provider', config.navigationTimeoutMs) });
   }
 
   if (isConfiguredProviderAuthorizationPage(page.url(), provider)) {
     setOAuthStage("provider_authorization");
     providerAuthorizationChallengeOutcome = "not_observed";
     providerAuthorizationChallengeClicks = 0;
-    const authorizationDeadline = Date.now() + providerWaitMs;
+    const authorizationDeadline = timeBudget.deadline('provider', providerWaitMs);
     let authorization = null;
     let authorizationSubmitted = false;
     let providerChallengeObserved = false;
@@ -636,9 +696,7 @@ if (providerOnly) {
       throw new Error("configured OAuth provider authorization did not complete");
     }
     if (providerChallengeObserved) {
-      providerAuthorizationChallengeOutcome = providerChallengeClicked
-        ? "resolved_after_click"
-        : "observed_auto_resolved";
+      providerAuthorizationChallengeOutcome = "departed_unconfirmed";
     }
     await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
     if (await linuxDoAuthorizationRequiresLogin(page, provider)) {
@@ -659,55 +717,39 @@ if (providerOnly) {
   if (rewrittenCallback) {
     await page.goto(rewrittenCallback, {
       waitUntil: "domcontentloaded",
-      timeout: config.navigationTimeoutMs,
+      timeout: timeBudget.timeoutMs('callback', config.navigationTimeoutMs),
     });
   }
-  if (new URL(page.url()).origin !== origin) {
-    const callbackPage = await waitForTargetCallback(page);
-    if (callbackPage) {
-      if (callbackPage !== page) await page.close({ runBeforeUnload: false }).catch(() => {});
-      page = callbackPage;
-    }
-  }
-  await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(1500);
   if (await linuxDoAuthorizationRequiresLogin(page, provider)) {
     authorizationOutcome = "provider_login_required";
     setOAuthStage("linuxdo_provider_login_required");
     throw new Error("LinuxDO callback did not proceed beyond the provider login form");
   }
-  const finalUrl = page.url();
-  observeTargetPage({ targetSurface: (await readOAuthTargetSurface(page, origin, config)).kind });
-  const finalLocation = new URL(finalUrl);
-  const visiblePassword = await page.locator('input[type="password"]:visible').count() > 0;
-  let visibleProviderLogin = false;
-  for (const label of providerLabels) {
-    const candidate = page.getByText(label, { exact: true });
-    if (await candidate.count() === 1 && await candidate.isVisible()) {
-      visibleProviderLogin = true;
-      break;
-    }
+  const completion = await waitForOAuthTargetReturn(context, origin, config, {
+    timeBudget, waitMs: providerWaitMs, preferredPage: page,
+    acceptPage: candidate => oauthFlowPages.has(candidate),
+    acceptCallbackPage: candidate => !isTargetLoginPage(candidate),
+    onCallbackPage: async callbackPage => {
+      if (callbackPage !== page) await page.close({ runBeforeUnload: false }).catch(() => {});
+      page = callbackPage;
+    },
+    hasProviderControl: async candidate => Boolean(await findUniqueOAuthProviderControl(candidate, provider)),
+    onPhase: setOAuthStage,
+    onCallbackProgress: observation => observeCallbackWait(observation, observation.budgetMs),
+    onObservation: observeTargetPage,
+    onProgress: observation => observeSessionProgress(observation, observation.budgetMs),
+  });
+  page = completion.page ?? page;
+  if (!completion.loggedIn && await linuxDoAuthorizationRequiresLogin(page, provider)) {
+    authorizationOutcome = 'provider_login_required';
+    setOAuthStage('linuxdo_provider_login_required');
+    throw new Error('LinuxDO callback returned to the provider login form');
   }
-  if (!visibleProviderLogin) {
-    for (const label of providerAltLabels) {
-      const candidate = page.locator(`img[alt="${label}"]`);
-      if (await candidate.count() === 1 && await candidate.isVisible()) {
-        visibleProviderLogin = true;
-        break;
-      }
-    }
-  }
-  if (!visibleProviderLogin) {
-    visibleProviderLogin = Boolean(await findUniqueOAuthProviderControl(page, provider));
-  }
-  let loggedIn = finalLocation.origin === origin
-    && !/\/(?:log[-_]?in|sign[-_]?in)(?:[/?#]|$)/i.test(finalLocation.href)
-    && !visiblePassword
-    && !visibleProviderLogin;
-  if (loggedIn && Object.hasOwn(config.savedLoginSessionRules ?? {}, origin)) {
-    setOAuthStage("session_verification");
-    const verifiedSession = await verifyConfiguredSavedLoginSession(page, origin, config);
-    loggedIn = verifiedSession?.status === "valid";
+  let loggedIn = completion.loggedIn;
+  if (!loggedIn) {
+    terminationReason = completion.terminationReason;
+    timeoutPhase = completion.timeoutPhase ?? null;
+    emitOAuthProgress(true);
   }
   let checkinStatus = null;
   if (loggedIn && checkinAfterLogin) {
@@ -723,26 +765,35 @@ if (providerOnly) {
     loggedIn = await waitForInteractiveTargetSession(context);
   }
   if (loggedIn) {
+    terminationReason = timeoutPhase = null;
     if (authorizationOutcome === "authorization_departed") authorizationOutcome = "authorization_completed";
+    if (providerAuthorizationChallengeOutcome === 'departed_unconfirmed') {
+      providerAuthorizationChallengeOutcome = providerAuthorizationChallengeClicks > 0
+        ? 'resolved_after_click' : 'observed_auto_resolved';
+    }
     setOAuthStage("completed");
   }
-  await printResult(loggedIn ? "logged_in" : "needs_attention", {
-    finalOriginMatchesTarget: loggedIn || finalLocation.origin === origin,
-    loginFormVisible: loggedIn ? false : visiblePassword || visibleProviderLogin,
+  flowResult = { status: loggedIn ? 'logged_in' : 'needs_attention', details: {
+    finalOriginMatchesTarget: loggedIn || isTargetOriginPage(page),
+    loginFormVisible: loggedIn ? false : isTargetLoginPage(page),
     ...(checkinStatus ? { checkinStatus } : {}),
-  });
+  } };
   if (!loggedIn) process.exitCode = 2;
   }
-} catch {
-  const interactivelyRecovered = interactiveAttention
+  });
+  await printResult(flowResult.status, flowResult.details);
+} catch (error) {
+  const timedOut = observeOAuthTimeout(error);
+  const interactivelyRecovered = interactiveAttention && !timedOut && context
     ? await waitForInteractiveTargetSession(context)
     : false;
   if (interactivelyRecovered) {
-    if (oauthStage === "provider_authorization") {
+    terminationReason = timeoutPhase = null;
+    if (oauthStage === "provider_authorization" || authorizationOutcome === 'authorization_departed') {
       authorizationOutcome = "authorization_completed";
       if (providerAuthorizationChallengeClicks > 0) {
         providerAuthorizationChallengeOutcome = "resolved_after_click";
-      } else if (providerAuthorizationChallengeOutcome === "observed_not_clickable") {
+      } else if (['observed_not_clickable', 'departed_unconfirmed'].includes(providerAuthorizationChallengeOutcome)) {
         providerAuthorizationChallengeOutcome = "observed_auto_resolved";
       }
     }
@@ -757,5 +808,6 @@ if (providerOnly) {
   }
 } finally {
   await closeOAuthContext(context);
+}
 }
 }

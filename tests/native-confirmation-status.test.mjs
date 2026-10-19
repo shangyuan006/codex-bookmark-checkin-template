@@ -60,6 +60,12 @@ for (const fixture of [
   {name:'confirmed click',inspection:{status:'already_signed',actionAttempted:true,actionOutcome:'clicked'},expected:'signed',action:true},
   {name:'New API no-op',inspection:{status:'already_signed',newApiAttempted:true,newApiConfirmed:true},expected:'already_signed',newApi:true},
   {name:'unconfirmed click',inspection:{status:'unconfirmed',actionAttempted:true,actionOutcome:'clicked'},expected:'unconfirmed',action:true},
+  {name:'SafeLine completion diagnostics',inspection:{status:'already_signed',actionAttempted:false,
+    safeLineDiagnostics:{observed:true,submissionBlocked:true,attempted:true,probeCount:1,clickCount:1,
+      outcome:'safeline_resolved',elapsedMs:500,finalStatus:'already_signed'}},expected:'already_signed',action:true},
+  {name:'SafeLine handoff diagnostics',inspection:{status:'interactive_challenge',failureCode:'safeline_client_challenge',
+    safeLineDiagnostics:{observed:true,submissionBlocked:true,attempted:true,probeCount:1,clickCount:1,
+      outcome:'safeline_rejected',elapsedMs:500,finalStatus:'interactive_challenge'}},expected:'interactive_challenge',action:true},
   {name:'configured endpoint completion',inspection:{status:'ready',siteBodyLoaded:true,attendanceEndpoint:true},expected:'signed',endpoint:true},
   {name:'sequential completion',inspection:{status:'already_signed',actionResults:[{origin:'https://one.example',
     actionType:'daily_checkin',status:'already_signed',evidence:{source:'page_text',authoritative:true,
@@ -71,7 +77,7 @@ for (const fixture of [
     const dir=await fs.mkdtemp(path.join(os.tmpdir(),'native-status-'));
     try {
       const source=await fs.readFile(new URL('../scripts/Prepare-NativeWafSession.ps1',import.meta.url),'utf8');
-      const start=source.indexOf('    for ($inspectionAttempt = 1;');
+      const start=source.indexOf('    $inspectionLimit =');
       const end=source.indexOf('\n}\n\nWrite-Output',start);
       assert.ok(start>0&&end>start);
       await fs.writeFile(path.join(dir,'Open-PlainLoginChrome.ps1'),'$global:opened=$true');
@@ -98,6 +104,9 @@ for (const fixture of [
       assert.equal(finalResult.finalStatus,fixture.expected);
       assert.equal(finalResult.inspectionStatus,fixture.inspection.status);
       assert.equal(persisted.results[0].status,fixture.expected);
+      if (fixture.inspection.safeLineDiagnostics) {
+        assert.deepEqual(persisted.results[0].safeLineDiagnostics,fixture.inspection.safeLineDiagnostics);
+      }
       if (fixture.inspection.actionResults) {
         assert.deepEqual(persisted.results[0].actionResults,fixture.inspection.actionResults);
         assert.deepEqual(persisted.results[0].requiredActionTypes,fixture.inspection.requiredActionTypes);
@@ -107,6 +116,9 @@ for (const fixture of [
         const [progress]=nativePreflightProgress([{origin:'https://one.example'}],
           new Map([['https://one.example',persisted.results[0]]]));
         assert.equal(progress.status,'already_signed');
+        if (fixture.inspection.safeLineDiagnostics) {
+          assert.deepEqual(progress.safeLineDiagnostics,fixture.inspection.safeLineDiagnostics);
+        }
       }
     } finally {await fs.rm(dir,{recursive:true,force:true});}
   });

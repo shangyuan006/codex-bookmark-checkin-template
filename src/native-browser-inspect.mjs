@@ -3,10 +3,10 @@ import fs from "node:fs/promises";
 import { runNewApiCheckinInBrowser, tryConfiguredSequentialActions } from "./browser.mjs";
 import { bindNativeCompletion } from './native-completion-evidence.mjs';
 import { readNativeCheckinState, waitForNativeReadOnlyCompletion, resumeNativeDailyCycle } from "./native-checkin-state.mjs";
+import { createNativeSafeLineReader } from './native-safeline-recovery.mjs';
 import { connectOverCdpWithRetry, evaluateOverRawCdp } from "./native-cdp.mjs";
 import {
   clickVisibleNativeChallengeControl,
-  clickVisibleNativeSafeLineControl,
   normalizeNativeCheckinActionRule,
   waitForNativeCheckinAction,
 } from "./native-checkin-action.mjs";
@@ -26,7 +26,8 @@ const expectedOrigin = new URL(process.argv[3]).origin;
 const maxWaitSeconds = Math.max(0, Math.min(120, Number.parseInt(process.argv[4] || "0", 10) || 0));
 const inspectionMode = process.argv[5] || "require-confirmed";
 const allowEndpointReady = inspectionMode === "allow-endpoint";
-const executeCheckin = inspectionMode === "execute-checkin";
+const forceReadOnly = inspectionMode === 'verify-checkin';
+const executeCheckin = inspectionMode === "execute-checkin" || forceReadOnly;
 const executeNewApiCheckin = inspectionMode === "execute-new-api";
 const encodedActionRule = process.argv[6] || "";
 const actionRule = executeCheckin
@@ -45,7 +46,7 @@ const retryableChallengeOutcomes = new Set([
 config.submissionJournalPath = path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))),'data/submission-journal.json');
 const scope = createSubmissionScope(config.submissionJournalPath,{origin:expectedOrigin},config);
 const outstanding = await scope.pending();
-let mayExecuteCheckin = executeCheckin && outstanding.length===0;
+let mayExecuteCheckin = executeCheckin && !forceReadOnly && outstanding.length===0;
 async function nativeEvidence(result,source='page_text',page=null) {
   if(result.status==="not_signed" && result.dailyUnsigned===true) return dailyReadinessEvidence({origin:expectedOrigin},config,{source:"status_endpoint"});
   if (source==='status_endpoint'&&/页面签到控件/.test(result.reason??'')) source='page_text';
@@ -61,7 +62,7 @@ async function nativeEvidence(result,source='page_text',page=null) {
 if (!Number.isInteger(port) || port <= 0) {
   throw new Error("usage: node src/native-browser-inspect.mjs <port> <origin> [max-wait-seconds] [mode] [action-rule-base64]");
 }
-if (!new Set(["require-confirmed", "allow-endpoint", "execute-checkin", "execute-new-api"]).has(inspectionMode)) {
+if (!new Set(["require-confirmed", "allow-endpoint", "execute-checkin", "verify-checkin", "execute-new-api"]).has(inspectionMode)) {
   throw new Error("native browser inspection mode is invalid");
 }
 
@@ -149,20 +150,29 @@ async function inspectWithPlaywright() {
   let actionOutcome = executeCheckin ? "not_attempted" : "not_configured";
   let challengeOutcome = executeCheckin && actionRule.clickChallenge ? "pending" : "not_configured";
   let challengeDetails = null;
-  let safeLineAttempted = false;
   let confirmationDeadline = pageDeadline;
+  let readOnlyDiagnostics = null;
+  const safeLine = createNativeSafeLineReader(expectedOrigin, {
+    readState: readPageState,
+    enabled: executeCheckin && !forceReadOnly,
+    submissionBlocked: () => !mayExecuteCheckin,
+    deadline: () => confirmationDeadline,
+    now: () => Date.now(),
+  });
+  const readInspectionState = activePage => safeLine.read(activePage);
   let current = executeCheckin && !mayExecuteCheckin
     ? await waitForNativeReadOnlyCompletion(page, expectedOrigin, config, {
       timeoutMs: Math.max(0, pageDeadline - Date.now()),
-      readState: readPageState,
+      readState: readInspectionState,
+      onObservation: observation => { readOnlyDiagnostics = observation; },
     })
-    : await readPageState(page);
-  if (executeCheckin && !mayExecuteCheckin) {
+    : await readInspectionState(page);
+  if (executeCheckin && !mayExecuteCheckin && !forceReadOnly) {
     mayExecuteCheckin = await resumeNativeDailyCycle(scope, current, expectedOrigin, config);
   }
   if (mayExecuteCheckin && !["signed", "already_signed"].includes(current.state.status)) {
     const action = await waitForNativeCheckinAction(page, expectedOrigin, actionRule, {
-      readState: async activePage => (await readPageState(activePage)).state,
+      readState: async activePage => (await readInspectionState(activePage)).state,
       timeoutMs: maxWaitSeconds * 1000,
     });
     actionAttempted = action.clicked;
@@ -174,18 +184,8 @@ async function inspectWithPlaywright() {
   do {
     try {
       await page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
-      current = await readPageState(page);
+      current = await readInspectionState(page);
       const canInteract = !["signed", "already_signed", "login_required"].includes(current.state.status);
-      if (mayExecuteCheckin && canInteract && !safeLineAttempted) {
-        const safeLine = await clickVisibleNativeSafeLineControl(page, expectedOrigin, {
-          waitMs: Math.min(30_000, Math.max(5_000, confirmationDeadline - Date.now())),
-        });
-        if (safeLine.attempted) {
-          safeLineAttempted = true;
-          challengeDetails = safeLine;
-          challengeOutcome = safeLine.outcome;
-        }
-      }
       // Cloudflare may render its checkbox several seconds after the sign-in
       // click. Keep polling boundedly after an empty or failed probe so a late
       // challenge can still be clicked, while ambiguous controls remain fail-closed.
@@ -194,16 +194,16 @@ async function inspectWithPlaywright() {
         challengeDetails = challenge.details ?? challengeDetails;
         challengeOutcome = challenge.outcome;
       }
-      current = await readPageState(page);
+      current = await readInspectionState(page);
       if (mayExecuteCheckin && !actionAttempted && current.state.status === "ready") {
         const action = await waitForNativeCheckinAction(page, expectedOrigin, actionRule, {
-          readState: async activePage => (await readPageState(activePage)).state,
+          readState: async activePage => (await readInspectionState(activePage)).state,
           timeoutMs: Math.max(0, confirmationDeadline - Date.now()),
         });
         actionAttempted = action.clicked;
         actionOutcome = action.outcome;
         if (actionAttempted) confirmationDeadline = Date.now() + maxWaitSeconds * 1000;
-        current = await readPageState(page);
+        current = await readInspectionState(page);
       }
       output = {
         status: current.state.status,
@@ -215,6 +215,8 @@ async function inspectWithPlaywright() {
         actionOutcome,
         challengeOutcome,
         challengeDetails,
+        safeLineDiagnostics: safeLine.diagnostics(),
+        ...(readOnlyDiagnostics ? { readOnlyDiagnostics } : {}),
         newApiAttempted: false,
         newApiConfirmed: false,
       };

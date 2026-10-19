@@ -1429,24 +1429,81 @@ async function waitForConfiguredDismissCandidates(selectorLocators, textLocators
   } while (true);
 }
 
-export async function dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config) {
+async function dismissCandidateFingerprint(candidate) {
+  return candidate.evaluate(element => {
+    const key = Symbol.for('bookmark-checkin.overlay-identity');
+    const ids = window[key] ??= { map: new WeakMap(), roots: new Map(), next: 0 };
+    const root = element.closest('.semi-modal-wrap, [role="dialog"], [aria-modal="true"], dialog')
+      || element.parentElement || element;
+    if (!ids.map.has(root)) ids.map.set(root, ++ids.next);
+    ids.roots.set(ids.map.get(root), root);
+    // The text never leaves the page. This transient fingerprint is not logged.
+    let hash = 2166136261;
+    for (const char of String(root.innerText || '').replace(/\s+/g, ' ').trim()) {
+      hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+    }
+    return `${ids.map.get(root)}:${hash >>> 0}`;
+  });
+}
+
+async function dismissedRootIsVisible(page, fingerprint) {
+  return page.evaluate(id => {
+    const root = window[Symbol.for('bookmark-checkin.overlay-identity')]?.roots.get(id);
+    if (!root?.isConnected) return false;
+    const rect = root.getBoundingClientRect(), style = getComputedStyle(root);
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  }, Number(fingerprint.split(':')[0]));
+}
+
+export async function dismissConfiguredPreCheckinOverlay(page, target, activeOrigin, config, {
+  onObservation = () => {}, now = Date.now, wait = sleep,
+} = {}) {
   const rule = getConfiguredPreCheckinDismissRule(target, activeOrigin, config);
   if (!rule) return false;
   const selectorLocators = rule.selectors.map((selector) => page.locator(selector));
   const textLocators = rule.buttonTexts.map((text) => page.getByRole("button", { name: text, exact: true }));
-  let dismissed = 0;
-  for (; dismissed < rule.maxDismissals; dismissed += 1) {
+  let dismissed = 0, clicks = 0;
+  const startedAt = now();
+  const report = outcome => {
+    const diagnostics = { outcome, clicks, transitions: dismissed, elapsedMs: Math.max(0, now() - startedAt) };
+    onObservation(diagnostics);
+    return diagnostics;
+  };
+  const fail = outcome => {
+    const error = new Error('签到前公告关闭未取得页面确认，需要人工处理');
+    error.noticeDismissDiagnostics = report(outcome);
+    throw error;
+  };
+  for (; dismissed < rule.maxDismissals;) {
     const candidates = await waitForConfiguredDismissCandidates(
       selectorLocators,
       textLocators,
       rule.waitMs,
     );
-    if (candidates.length === 0) break;
+    if (candidates.length === 0) { report(clicks ? 'dismissed' : 'not_observed'); return dismissed > 0; }
     // Announcement stacks commonly reuse one close button or expose more than
     // one exact close control. Work from the topmost DOM candidate and keep the
     // operation bounded by maxDismissals.
-    await candidates[candidates.length - 1].click({ timeout: 10_000 });
-    await sleep(Math.max(500, Number(config.actionWaitMs) || 0));
+    const candidate = candidates[candidates.length - 1];
+    if (!await candidate.isEnabled().catch(() => false)) fail('control_disabled');
+    const before = await dismissCandidateFingerprint(candidate).catch(() => null);
+    if (before === null) fail('observation_failed');
+    try { await candidate.click({ timeout: 10_000 }); clicks++; }
+    catch { fail('click_failed'); }
+    const deadline = now() + Math.max(1000, Math.min(10_000, Number(config.actionWaitMs) || 3000));
+    let changed = false;
+    do {
+      await wait(Math.min(250, Math.max(1, deadline - now())));
+      const visible = await waitForConfiguredDismissCandidates(selectorLocators, textLocators, 0);
+      if (!visible.length && await dismissedRootIsVisible(page, before).catch(() => null) === false) {
+        changed = true; break;
+      }
+      const after = visible.length ? await dismissCandidateFingerprint(visible.at(-1)).catch(() => null) : null;
+      if (after !== null && after !== before) { changed = true; break; }
+    } while (now() < deadline);
+    if (!changed) fail('no_progress');
+    dismissed++;
+    report('transition_confirmed');
   }
   const remaining = await waitForConfiguredDismissCandidates(
     selectorLocators,
@@ -1454,8 +1511,9 @@ export async function dismissConfiguredPreCheckinOverlay(page, target, activeOri
     rule.waitMs,
   );
   if (remaining.length > 0) {
-    throw new Error(`签到前公告在有限的 ${rule.maxDismissals} 次关闭后仍然可见`);
+    fail('dismissal_limit');
   }
+  report('dismissed');
   return dismissed > 0;
 }
 

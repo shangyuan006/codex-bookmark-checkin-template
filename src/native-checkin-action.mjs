@@ -102,6 +102,7 @@ function isNativeSafeLinePrompt(value) {
 // iframe.  Treat the button as a bounded interaction only; the caller still
 // has to read an authoritative signed/already-signed state afterwards.
 export async function clickVisibleNativeSafeLineControl(page, expectedOrigin, { waitMs = 30_000 } = {}) {
+  const deadline = Date.now() + Math.max(0, Math.min(30_000, Number(waitMs) || 0));
   assertBookmarkNavigation(page.url(), [expectedOrigin]);
   const button = page.locator("button#sl-check");
   const description = page.locator("#sl-text");
@@ -111,28 +112,34 @@ export async function clickVisibleNativeSafeLineControl(page, expectedOrigin, { 
   if (!await button.isVisible().catch(() => false) || !await description.isVisible().catch(() => false)) {
     return { attempted: false, resolved: false, outcome: "safeline_not_visible" };
   }
-  const initialText = await description.innerText().catch(() => "");
+  const initialText = await description.innerText({ timeout: Math.max(1, deadline - Date.now()) }).catch(() => "");
   if (!isNativeSafeLinePrompt(initialText)) {
     return { attempted: false, resolved: false, outcome: "safeline_not_active" };
   }
+  if (Date.now() >= deadline) {
+    return { attempted: false, resolved: false, outcome: "safeline_deadline_expired" };
+  }
 
   try {
-    await button.click({ timeout: 10_000 });
+    await button.click({ timeout: Math.max(1, Math.min(10_000, deadline - Date.now())) });
   } catch {
     return { attempted: true, resolved: false, outcome: "safeline_click_failed" };
   }
 
-  const deadline = Date.now() + Math.max(1_000, Math.min(30_000, Number(waitMs) || 30_000));
   while (Date.now() < deadline) {
-    await page.waitForTimeout(500).catch(() => {});
+    await page.waitForTimeout(Math.min(500, deadline - Date.now())).catch(() => {});
+    assertBookmarkNavigation(page.url(), [expectedOrigin]);
     const visible = await button.isVisible().catch(() => false);
-    const currentText = await description.innerText().catch(() => "");
+    if (!visible) {
+      return { attempted: true, resolved: true, outcome: "safeline_resolved" };
+    }
+    const currentText = await description.innerText({ timeout: Math.max(1, deadline - Date.now()) }).catch(() => "");
     const stillPrompt = isNativeSafeLinePrompt(currentText);
     const explicitFailure = /失败|错误|异常/.test(normalizeText(currentText)) && !stillPrompt;
     if (explicitFailure) {
       return { attempted: true, resolved: false, outcome: "safeline_rejected" };
     }
-    if (!visible || !stillPrompt) {
+    if (!stillPrompt) {
       return { attempted: true, resolved: true, outcome: "safeline_resolved" };
     }
   }

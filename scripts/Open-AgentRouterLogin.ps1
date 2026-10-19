@@ -183,7 +183,10 @@ function Get-AgentRouterRecoveryAction {
     for ($index = $probeOutput.Count - 1; $index -ge 0; $index--) {
         try {
             $probe = [string]$probeOutput[$index] | ConvertFrom-Json
-            if ([string]$probe.action -in @('restart', 'resume', 'complete')) { return [string]$probe.action }
+            if ([string]$probe.action -in @('restart', 'resume', 'complete')) {
+                $script:oauthAutomaticAllowed = $probe.automaticAllowed -ne $false
+                return [string]$probe.action
+            }
         }
         catch { }
     }
@@ -332,7 +335,10 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         # oauth-login emits private stage markers on stderr; they are progress,
         # not PowerShell failures. The final JSON status remains authoritative.
         $ErrorActionPreference = 'Continue'
-        $automaticOutput = @(& $node @oauthArguments 2>$null)
+        $automaticOutput = @(if ($script:oauthAutomaticAllowed -eq $false) {
+            '{"status":"needs_attention","oauthStage":"oauth_retry_budget_exhausted"}'
+        }
+        else { & $node @oauthArguments 2>$null })
     }
     finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -361,7 +367,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     if ($provider -eq 'LinuxDO') {
         $safeProviderAuthorizationChallengeOutcomes = @(
             'not_observed', 'observed_not_clickable', 'observed_auto_resolved',
-            'clicked_once', 'clicked_twice', 'resolved_after_click', 'unresolved_after_click'
+            'clicked_once', 'clicked_twice', 'resolved_after_click', 'unresolved_after_click', 'departed_unconfirmed'
         )
         $providerAuthorizationChallengeOutcome = if (
             [string]$automaticResult.providerAuthorizationChallengeOutcome -in $safeProviderAuthorizationChallengeOutcomes
@@ -391,6 +397,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         return
     }
     $safeOAuthStages = @(
+        'oauth_retry_budget_exhausted',
         'target_login', 'logout_verification', 'provider_button', 'login_challenge', 'provider_transition',
         'linuxdo_session', 'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'provider_session',
         'provider_authorization', 'target_callback',
@@ -438,10 +445,14 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         Write-Warning 'LinuxDO authorization returned to its login form. Opening only the provider login window; target OAuth will continue after verified provider recovery.'
     }
     else {
-        Write-Warning "Agent Router OAuth ended without a confirmed target session (stage=$failedStage, authorization=$failedAuthorization). Opening one native no-CDP Edge window for manual completion."
+        Write-Warning "Agent Router OAuth ended without a confirmed target session (stage=$failedStage, authorization=$failedAuthorization). Continuing once in one native Edge window before manual takeover."
     }
 }
 
+# Continue LinuxDO in the actual native OAuth page before human takeover.
+# GitHub keeps its existing manual entrance without remote debugging.
+$nativeOAuthHandoff = $provider -eq 'LinuxDO' -and -not $ProviderOnly
+$nativeDebugPort = if ($nativeOAuthHandoff) { Get-Random -Minimum 12000 -Maximum 32000 } else { 0 }
 $launchMarker = [guid]::NewGuid().ToString('N')
 $loginUrls = @('https://agentrouter.org/login')
 if ($provider -eq 'LinuxDO' -and $ProviderOnly) {
@@ -460,6 +471,7 @@ $arguments = @(
     '--window-size=1400,900'
 )
 $arguments += $loginUrls
+if ($nativeOAuthHandoff) { $arguments += "--remote-debugging-port=$nativeDebugPort" }
 $process = Start-Process -FilePath ([string]$browser.Executable) -ArgumentList $arguments -PassThru
 $stableWindow = Wait-CheckinVisibleBrowserWindow `
     -Config $config `
@@ -495,6 +507,51 @@ $state = [ordered]@{
     ($state | ConvertTo-Json -Depth 4),
     [System.Text.UTF8Encoding]::new($false)
 )
+if ($nativeOAuthHandoff) {
+    $nativeArguments = @(
+        (Join-Path $root 'src\oauth-login.mjs'), 'https://agentrouter.org', $provider,
+        '--login-url', 'https://agentrouter.org/login',
+        '--automation-user-data-dir', $profile, '--account-id', $requestedAccountKey,
+        '--native-cdp-port', [string]$nativeDebugPort,
+        '--diagnostic-stage', 'manual_target_oauth', '--private-result'
+    )
+    if ($null -ne $account.oauthWaitMs) { $nativeArguments += @('--wait-ms', [string]$account.oauthWaitMs) }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $nativeOutput = @(& $node @nativeArguments 2>$null)
+    }
+    finally { $ErrorActionPreference = $previousErrorActionPreference }
+    $nativeResult = $null
+    for ($index = $nativeOutput.Count - 1; $index -ge 0; $index--) {
+        try {
+            $candidate = [string]$nativeOutput[$index] | ConvertFrom-Json
+            if ([string]$candidate.status -in @('logged_in', 'needs_attention')) { $nativeResult = $candidate; break }
+        }
+        catch { }
+    }
+    if ([string]$nativeResult.status -eq 'logged_in') {
+        & (Join-Path $PSScriptRoot 'Close-AgentRouterLogin.ps1') -AccountKey $requestedAccountKey
+        $checkinExitCode = Invoke-AgentRouterAccountCheckin -VerifyOnly
+        if ($checkinExitCode -ne 0) { exit $checkinExitCode }
+        Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
+        Write-Output "Native Agent Router OAuth completed and today's account reward was authoritatively verified."
+        return
+    }
+    $handoffStages = @('target_login', 'provider_button', 'provider_transition', 'login_challenge',
+        'oauth_retry_budget_exhausted',
+        'linuxdo_session', 'linuxdo_login_challenge', 'linuxdo_provider_login_required',
+        'provider_authorization', 'target_callback', 'session_verification')
+    $handoffStage = if ([string]$nativeResult.oauthStage -in $handoffStages) { [string]$nativeResult.oauthStage } else { 'unknown' }
+    $state.handoffStage = $handoffStage
+    [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    if ($handoffStage -eq 'oauth_retry_budget_exhausted') {
+        Write-Output 'The automatic OAuth budget for this logout is exhausted. This dedicated window is for manual login only; no further automatic OAuth was attempted.'
+    }
+    else {
+        Write-Output "Native OAuth attempted login; the same dedicated window is waiting at stage '$handoffStage'. No second login page was opened."
+    }
+}
 if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     Mark-LinuxDoProviderStageForAgentRouter
 }

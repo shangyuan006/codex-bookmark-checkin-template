@@ -14,8 +14,11 @@ import { dailyReadinessEvidence } from "./checkin-evidence.mjs";
 import { successEvidence, bindSuccessEvidence } from './checkin-evidence.mjs';
 import { runWithSubmissionJournal, SUBMISSION_SCOPE } from './submission-guard.mjs';
 import { waitForReauthLogout } from './reauth-logout.mjs';
-import { oauthTargetPageObservation, readOAuthTargetSurface, sanitizeOAuthPageObservation } from './oauth-target-state.mjs';
-import { writeOAuthFlowDiagnostic } from './oauth-flow-diagnostics.mjs';
+import { oauthTargetPageObservation, readOAuthTargetSurface, sanitizeOAuthPageObservation,
+  sanitizeOAuthCallbackDiagnostics, sanitizeOAuthTimingDiagnostics } from './oauth-target-state.mjs';
+import { writeOAuthFlowDiagnostic, recoverOAuthProgressDiagnostic } from './oauth-flow-diagnostics.mjs';
+import { isUnresolvedOAuthChallenge, isStalledOAuthCallback } from './oauth-retry-budget.mjs';
+import { OAUTH_HELPER_TIMEOUT_MS } from './oauth-time-budget.mjs';
 
 const execFileAsync = promisify(execFile);
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -437,6 +440,7 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
     session_verification: "目标站权威会话验证未通过",
     timeout: "登录流程超时",
     helper_failed: "登录助手执行失败",
+    oauth_retry_budget_exhausted: "本轮自动验证预算已用尽，保留人工接管",
   };
   const detail = stageReasons[oauthStage];
   return detail
@@ -444,8 +448,8 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
     : `${normalized} 重新登录未完成，需要人工处理`;
 }
 
-export function shouldRetryOAuthFailureStage(oauthStage) {
-  return !['logout_verification', 'linuxdo_session_challenge', 'linuxdo_session_rate_limited',
+export function shouldRetryOAuthFailureStage(oauthStage, diagnostics = {}) {
+  return !isUnresolvedOAuthChallenge(diagnostics) && !['oauth_retry_budget_exhausted', 'logout_verification', 'linuxdo_session_challenge', 'linuxdo_session_rate_limited',
     'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'github_autofill_missing', 'github_account_selection',
     'github_interactive_verification', 'github_form_not_unique', 'github_submit_not_unique',
     'github_login_not_completed'].includes(oauthStage);
@@ -453,14 +457,19 @@ export function shouldRetryOAuthFailureStage(oauthStage) {
 
 export function reauthLoginFailureResult(provider, oauthStage, { beforeLogout = false, diagnostics = null } = {}) {
   const providerBlocked = ['linuxdo_session_challenge', 'linuxdo_session_rate_limited',
-    'linuxdo_login_challenge', 'linuxdo_provider_login_required'].includes(oauthStage);
+    'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'oauth_retry_budget_exhausted'].includes(oauthStage)
+    || isUnresolvedOAuthChallenge(diagnostics)
+    || (normalizeProviderLabel(provider) === 'linuxdo' && isStalledOAuthCallback(diagnostics));
   return {
     status: "needs_attention",
     reason: reauthLoginFailureReason(provider, oauthStage)
       + (beforeLogout ? "；未退出 Agent Router，请先完成提供方会话恢复" : ""),
-    ...(providerBlocked ? { failureCode: `oauth_${oauthStage}`, retryable: false } : {}),
+    ...(providerBlocked ? { failureCode: oauthStage === 'oauth_retry_budget_exhausted'
+      ? oauthStage : `oauth_${oauthStage}`, retryable: false } : {}),
     ...(diagnostics ? {oauthStage:diagnostics.oauthStage,
       ...sanitizeOAuthPageObservation(diagnostics),
+      ...sanitizeOAuthCallbackDiagnostics(diagnostics.callbackDiagnostics),
+      ...sanitizeOAuthTimingDiagnostics(diagnostics),
       ...(diagnostics.authorizationOutcome ? {authorizationOutcome:diagnostics.authorizationOutcome} : {}),
       ...(diagnostics.providerAuthorizationChallengeOutcome
         ? {providerAuthorizationChallengeOutcome:diagnostics.providerAuthorizationChallengeOutcome,
@@ -759,9 +768,12 @@ async function waitForUniqueVisibleLocator(locator, waitMs) {
   return null;
 }
 
-async function runOAuthHelper(rule, config, account, phaseArgs = []) {
+export async function runOAuthHelper(rule, config, account, phaseArgs = [], {
+  execute = execFileAsync, writeDiagnostic = writeOAuthFlowDiagnostic, now = Date.now,
+} = {}) {
+  const startedAt = now();
   try {
-    const result = await execFileAsync(process.execPath, [
+    const result = await execute(process.execPath, [
       path.join(sourceDirectory, "oauth-login.mjs"),
       rule.origin,
       rule.provider,
@@ -777,18 +789,43 @@ async function runOAuthHelper(rule, config, account, phaseArgs = []) {
     ], {
       cwd: rootDirectory,
       windowsHide: true,
-      timeout: 180_000,
+      timeout: OAUTH_HELPER_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
       env: process.env,
     });
     const outcome = loginHelperOutcomeFromStreams(result.stdout, result.stderr);
+    if (!["logged_in", "needs_attention"].includes(outcome.status)) {
+      throw Object.assign(new Error('OAuth helper did not return a terminal result'), {
+        stdout: result.stdout, stderr: result.stderr,
+      });
+    }
     return { ...outcome, oauthStage: outcome.oauthStage ?? null };
   } catch (error) {
-    const fallback = error?.code === "ETIMEDOUT" ? "timeout" : "failed";
+    // execFile's watchdog normally reports killed/SIGTERM, not ETIMEDOUT.
+    const timedOut = error?.code === 'ETIMEDOUT'
+      || (error?.killed === true && error?.signal === 'SIGTERM' && error?.code == null);
+    const fallback = timedOut ? "timeout" : "failed";
     const outcome = loginHelperOutcomeFromStreams(error?.stdout, error?.stderr, fallback);
+    const progress = recoverOAuthProgressDiagnostic(error?.stderr);
+    if (timedOut || !["logged_in", "needs_attention"].includes(outcome.status)) {
+      const diagnosticStageIndex = phaseArgs.indexOf('--diagnostic-stage');
+      await writeDiagnostic({
+        flow: diagnosticStageIndex >= 0 ? phaseArgs[diagnosticStageIndex + 1]
+          : phaseArgs.includes('--provider-only') ? 'automatic_provider' : 'automatic_target',
+        provider: rule.provider,
+        ...progress,
+        ...outcome,
+        status: timedOut ? 'timeout' : 'failed',
+        oauthStage: outcome.oauthStage ?? progress.oauthStage ?? (timedOut ? 'timeout' : 'helper_failed'),
+        elapsedMs: now() - startedAt,
+        terminationReason: timedOut ? 'helper_timeout' : 'helper_failed',
+      });
+    }
     return {
+      ...progress,
       ...outcome,
       succeeded: false,
+      ...(timedOut ? { status: 'timeout', diagnostic: '登录恢复流程超时', terminationReason: 'helper_timeout' } : {}),
       oauthStage: outcome.oauthStage ?? (fallback === "timeout" ? "timeout" : "helper_failed"),
     };
   }
@@ -823,7 +860,8 @@ async function retryOAuthOperation(rule, config, account, operation) {
       succeeded: false,
       oauthStage: preferOAuthFailureStage(latest.oauthStage, current.oauthStage),
     };
-    if (!shouldRetryOAuthFailureStage(current.oauthStage)) return current;
+    if (rule.provider === 'LinuxDO' && isStalledOAuthCallback(current)) return current;
+    if (!shouldRetryOAuthFailureStage(current.oauthStage, current)) return current;
     if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
   }
   return latest;
@@ -1152,7 +1190,12 @@ async function runReauthCheckinForAccountInternal(target, config, account, optio
       logoutConfirmed: true,
     });
   } catch (error) {
-    return { status: "needs_attention", reason: safeErrorMessage(error) };
+    const diagnostic = sanitizeOAuthPageObservation(error);
+    if (diagnostic.noticeDismissDiagnostics) {
+      await writeOAuthFlowDiagnostic({ flow: 'automatic_logout', provider: rule.provider,
+        status: 'needs_attention', oauthStage: 'target_login', ...diagnostic });
+    }
+    return { status: "needs_attention", reason: safeErrorMessage(error), ...diagnostic };
   } finally {
     await beforeSession?.context.close().catch(() => {});
   }

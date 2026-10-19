@@ -63,22 +63,33 @@ export async function waitForOriginPage(context, expectedOrigin, {
   pollMs = 250,
   preferredPage = null,
   acceptPage = () => true,
+  onObservation = () => {},
+  now = Date.now,
+  wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
 } = {}) {
   const origin = new URL(expectedOrigin).origin;
-  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  const startedAt = now(), deadline = startedAt + Math.max(0, Number(timeoutMs) || 0);
   const interval = Math.max(10, Number(pollMs) || 250);
+  let polls = 0;
+  const observe = outcome => onObservation({ outcome, polls, elapsedMs: now() - startedAt });
 
   do {
+    polls++;
     const pages = context.pages().filter((page) => !page.isClosed?.());
     const candidates = preferredPage
       ? [preferredPage, ...pages.filter((page) => page !== preferredPage).reverse()]
       : pages.reverse();
     for (const page of candidates) {
-      if (pageOrigin(page) === origin && await acceptPage(page)) return page;
+      if (pageOrigin(page) === origin && await acceptPage(page)) {
+        observe('target_returned');
+        return page;
+      }
     }
-    if (Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(interval, Math.max(0, deadline - Date.now()))));
+    observe('waiting');
+    if (now() >= deadline) break;
+    await wait(Math.min(interval, Math.max(0, deadline - now())));
   } while (true);
 
+  observe('target_not_returned');
   return null;
 }

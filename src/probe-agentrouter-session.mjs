@@ -7,6 +7,7 @@ import {
   inspectConfiguredReauthRecovery,
   classifyReauthSessionAfterOAuthFailure,
 } from "./reauth-checkin.mjs";
+import { oauthRetryBudgetBinding, inspectOAuthRetryBudget } from './oauth-retry-budget.mjs';
 
 const rootDirectory = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const originArgument = process.argv[2];
@@ -30,7 +31,8 @@ try {
   if (!account) throw new Error("configured Agent Router account was not found");
   const recovery = await inspectConfiguredReauthRecovery(account);
   if (process.argv.includes("--recovery-state")) {
-    process.stdout.write(`${JSON.stringify({ action: recovery.action })}\n`);
+    const budget = await inspectOAuthRetryBudget(oauthRetryBudgetBinding(account, recovery.previous));
+    process.stdout.write(`${JSON.stringify({ action: recovery.action, ...budget })}\n`);
   } else if (recovery.action === "complete") {
     print("already_signed");
   } else if (recovery.action !== "resume") {

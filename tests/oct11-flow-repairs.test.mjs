@@ -11,6 +11,7 @@ import {loginHelperOutcome, loginHelperOutcomeFromStreams} from '../src/login-re
 import {reauthLoginFailureResult} from '../src/reauth-checkin.mjs';
 import {sanitizeOAuthFlowDiagnostic, writeOAuthFlowDiagnostic} from '../src/oauth-flow-diagnostics.mjs';
 import {nativePreflightProgress} from '../src/native-preflight-state.mjs';
+import {createNativeSafeLineReader} from '../src/native-safeline-recovery.mjs';
 
 const origin='https://daily.example';
 const target={origin};
@@ -110,10 +111,10 @@ test('native inspector executes the recovered daily action with its durable inte
   const deps={
     connectOverCdpWithRetry:async()=>({contexts:()=>[{pages:()=>[page]}],close:async()=>{closed++;}}),
     chromium:{},port:12345,maxWaitSeconds:30,expectedOrigin:origin,scope,
-    attachSubmissionScope:()=>{},guardPageSubmissions,executeCheckin:true,mayExecuteCheckin:false,
+    attachSubmissionScope:()=>{},guardPageSubmissions,executeCheckin:true,forceReadOnly:false,mayExecuteCheckin:false,
     selectNewestOriginPage:()=>page,pagesForOrigin:()=>[page],readPageState:readState,config:{},
     actionRule:{clickChallenge:false},retryableChallengeOutcomes:new Set(),allowEndpointReady:false,
-    waitForNativeReadOnlyCompletion,resumeNativeDailyCycle,
+    waitForNativeReadOnlyCompletion,resumeNativeDailyCycle,createNativeSafeLineReader,
     waitForNativeCheckinAction:async()=>{
       await scope.begin();
       const entries=(await readSubmissionJournal(file)).entries;

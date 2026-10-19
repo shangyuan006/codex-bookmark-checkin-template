@@ -3,7 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { findBookmarkTarget } from "./bookmarks.mjs";
-import { launchAutomationContext } from "./browser.mjs";
+import { launchAutomationContext, dismissConfiguredPreCheckinOverlay } from "./browser.mjs";
 import { expandSavedPasswordLogin } from "./login-form.mjs";
 import { acceptConfiguredLoginTerms, waitForLoginSubmitEnabled } from "./protected-login-flow.mjs";
 import {
@@ -71,6 +71,9 @@ try {
   await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
   await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
   if (!pageMatchesOrigin(page)) throw new Error("受保护登录页面离开目标 origin");
+  loginStage = "announcement_dismiss";
+  await dismissConfiguredPreCheckinOverlay(page, target, origin, config);
+  if (!pageMatchesOrigin(page)) throw new Error("受保护登录公告处理后离开目标 origin");
   loginStage = "form_expand";
   await expandSavedPasswordLogin(page, origin, config);
   await acceptConfiguredLoginTerms(page, origin, config);
@@ -149,6 +152,7 @@ try {
     const verification = await verifyCredentialSession(page, {
       origin,
       verificationPath,
+      pageUrl: target.candidates[0],
       navigationTimeoutMs: config.navigationTimeoutMs,
     });
     authCheckStatus = verification.statusCode;

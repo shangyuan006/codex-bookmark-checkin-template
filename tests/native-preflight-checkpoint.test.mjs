@@ -82,7 +82,8 @@ test('a new invocation preserves same-day confirmations across scope changes and
 test('native progress contains selected confirmations before OAuth and browser startup',async()=>{
   const one={origin:'https://one.example',title:'Example',folderNames:['test']};
   const confirmations=new Map([
-    [one.origin,{status:'signed',url:`${one.origin}/profile`,observedAt:'2026-09-14T00:00:00Z'}],
+    [one.origin,{status:'signed',url:`${one.origin}/profile`,observedAt:'2026-09-14T00:00:00Z',
+      safeLineDiagnostics:{observed:true,submissionBlocked:true,attempted:true,clickCount:1,outcome:'safeline_resolved',finalStatus:'already_signed'}}],
     ['https://outside.example',{status:'signed'}],
   ]);
   const results=nativePreflightProgress([one,{origin:'https://pending.example'}],confirmations);
@@ -90,6 +91,7 @@ test('native progress contains selected confirmations before OAuth and browser s
   assert.equal(results[0].origin,one.origin);
   assert.equal(results[0].nativePreflight,true);
   assert.equal(results[0].observedAt,'2026-09-14T00:00:00Z');
+  assert.deepEqual(results[0].safeLineDiagnostics,confirmations.get(one.origin).safeLineDiagnostics);
   const index=await fs.readFile(new URL('../src/index.mjs',import.meta.url),'utf8');
   const seed=index.indexOf('results.push(...nativeCompletedResults)');
   const progress=index.indexOf('await writeProgress("initial")');
@@ -105,7 +107,7 @@ for (const failure of ['launch','persist','persist-and-close','close']) {
     try {
       // Execute the production attempt loop with only browser I/O replaced by fixtures.
       const script=await fs.readFile(new URL('../scripts/Prepare-NativeWafSession.ps1',import.meta.url),'utf8');
-      const start=script.indexOf('    for ($inspectionAttempt = 1;');
+      const start=script.indexOf('    $inspectionLimit =');
       const end=script.indexOf('    $explicitlyConfirmed =',start);
       assert.ok(start>0&&end>start);
       await fs.writeFile(path.join(dir,'Open-PlainLoginChrome.ps1'),failure==='launch'?"throw 'launch failed'":"$global:opened = $true");
