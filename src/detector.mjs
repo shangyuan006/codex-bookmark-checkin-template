@@ -1,3 +1,5 @@
+import { siteMigrationResult } from './site-migration.mjs';
+
 const CHECKIN_EXACT = new Set([
   "签到", "簽到", "立即签到", "立即簽到", "每日签到", "每日簽到", "提交签到", "提交簽到",
   "今日签到", "今日簽到", "去签到", "去簽到", "签到得魔力", "簽到得魔力", "打卡", "立即打卡",
@@ -41,6 +43,9 @@ export function classifyPageText({
   const unsignedPattern = /(?:尚未|还未|還未|未|没有|沒有|not|hasn['’]?t|haven['’]?t)\s*(?:完成)?\s*(?:签到|簽到|打卡|checked[ -]?in|signed[ -]?in)/i;
   const explicitlyUnsigned = unsignedPattern.test(text);
   const lowerUrl = String(url).toLowerCase();
+
+  const migration = siteMigrationResult({url, title, bodyText});
+  if (migration) return migration;
 
   if (/雷池|safeline/i.test(text) && /客户端异常.*确认.*合法用户/.test(text)) {
     return { status: 'interactive_challenge', reason: '雷池 WAF 要求合法用户确认', failureCode: 'safeline_client_challenge', retryable: false };

@@ -23,10 +23,11 @@ import { runConfiguredDailyDashboardCheckin } from "./daily-dashboard-checkin.mj
 import { reconcileSubmissionResult, partitionSubmissions } from "./submission-guard.mjs";
 import { verifyConfiguredSavedLoginSession } from "./saved-login-session.mjs";
 import { readAfterNavigation } from "./page-state-read.mjs";
+import { inspectSiteMigrationPage, unapprovedBookmarkRedirect } from './site-migration.mjs';
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
 import { readCloudflareFrameEvidence } from "./challenge-frame-state.mjs";
 import { getCloudflareRecoveryRule, continueCloudflareRecovery, cloudflareRecoveryHandoff } from './cloudflare-recovery.mjs';
-import { readSequentialDailyQuota, sequentialCompletionKind, sequentialActionType } from "./sequential-action-evidence.mjs";
+import { readSequentialDailyQuota, sequentialCompletionKind, sequentialActionType, normalizeSequentialCompletedControl, sequentialCompletedControlMatches } from "./sequential-action-evidence.mjs";
 import {
   getConfiguredPreCheckinNavigationRule,
   getConfiguredPreCheckinTerminalPath,
@@ -413,6 +414,7 @@ export function getConfiguredSequentialActionRule(target, config = {}) {
       actionTags: normalizedSequentialTags(step?.actionTags, `顺序动作第 ${index + 1} 步控件标签`),
       preferInteractive: step?.preferInteractive === true,
       completedTexts: normalizedSequentialTexts(step?.completedTexts, `顺序动作第 ${index + 1} 步完成文本`),
+      completedControl: normalizeSequentialCompletedControl(step?.completedControl),
       successTexts: normalizedSequentialTexts(step?.successTexts, `顺序动作第 ${index + 1} 步成功文本`),
       completedIncludes: normalizedSequentialTexts(step?.completedIncludes, `顺序动作第 ${index + 1} 步完成关键词`),
       successIncludes: normalizedSequentialTexts(step?.successIncludes, `顺序动作第 ${index + 1} 步成功关键词`),
@@ -1699,7 +1701,7 @@ export async function clickConfiguredSequentialAction(page, step, allowedOrigins
 
 async function readConfiguredSequentialStepEvidence(page, step, phase, responseConfirmed = false) {
   const state = await snapshotState(page);
-  const evidence = await page.evaluate(({ actionTexts, completedTexts, successTexts, completedIncludes, successIncludes,dailyQuotaPattern,dailyQuotaMinimum }) => {
+  const evidence = await page.evaluate(({ actionTexts, completedTexts, completedControl, successTexts, completedIncludes, successIncludes,dailyQuotaPattern,dailyQuotaMinimum }) => {
     const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
     const visible = (element) => {
       const style = getComputedStyle(element);
@@ -1721,6 +1723,15 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
       hasHandler: Boolean(element.form || element.getAttribute("onclick") || element.getAttribute("data-action")),
     }));
     return {
+      completedControls: completedControl ? (() => {
+        const elements = [...document.querySelectorAll(completedControl.selector)];
+        if (elements.length > 20) return [];
+        return elements.map(element => ({
+          text: normalize(element.innerText || element.value || element.getAttribute('aria-label') || ''),
+          visible: visible(element),
+          interactive: element.matches('button, a, [role="button"], input[type="button"], input[type="submit"]'),
+        }));
+      })() : [],
       completedTextPresent: completedTexts.some((text) => bodyLineSet.has(text))
         || completedIncludes.some((text) => bodyLines.some((line) => line.includes(text))),
       successTextPresent: successTexts.some((text) => bodyLineSet.has(text))
@@ -1736,6 +1747,7 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
   }, {
     actionTexts: step.actionTexts,
     completedTexts: step.completedTexts,
+    completedControl: step.completedControl,
     successTexts: step.successTexts,
     completedIncludes: step.completedIncludes,
     successIncludes: step.successIncludes,
@@ -1744,7 +1756,9 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
   });
 
   const quota = readSequentialDailyQuota(evidence.bodyLines.join(" "), step);
-  const kind = sequentialCompletionKind({ ...evidence, stateStatus: state.status, quota }, step, phase, responseConfirmed);
+  const kind = sequentialCompletionKind({ ...evidence,
+    completedTextPresent: evidence.completedTextPresent || sequentialCompletedControlMatches(evidence.completedControls, step.completedControl),
+    stateStatus: state.status, quota }, step, phase, responseConfirmed);
   if (kind === "generic") {
     return { done: true, status: state.status, reason: state.reason };
   }
@@ -2530,8 +2544,24 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
   if (destinationTerminalPath) {
     return stopAtConfiguredTerminal(destination, config, 'terminal_path');
   }
-  await page.goto(destination, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
+  try {
+    await page.goto(destination, { waitUntil: "domcontentloaded", timeout: config.navigationTimeoutMs });
+  } catch (error) {
+    const redirect = unapprovedBookmarkRedirect(page.url(), target);
+    // A navigation failure that leaves the page on about:blank is still an
+    // ordinary load error. Only an observed HTTP(S) destination proves drift.
+    if (redirect?.migration?.destinationOrigin) return redirect;
+    throw error;
+  }
+  const migration = await inspectSiteMigrationPage(page, target);
+  if (migration) return migration;
   if (config.checkinReadOnly) {
+    // Handoff observations must not click navigation, overlays, challenges,
+    // login controls or actions, even when an adapter normally uses them.
+    if (config.checkinObservationOnly === true) {
+      const state = await waitForConfirmedCheckinState(page, config, config.checkinStateWaitMs);
+      return { ...verifiedAdapterCompletion(state, "page_text", "page_completion_text"), url: safeLogUrl(page.url()) };
+    }
     if (useExtendedDiscovery) await waitForExtendedDiscoveryContent(page,config);
     let currentUrl=assertBookmarkNavigation(page.url(),allowedOrigins);
     const navigationRule=getConfiguredPreCheckinNavigationRule(target,new URL(currentUrl).origin,config);

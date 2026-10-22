@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readBookmarkPlan } from "./bookmarks.mjs";
 import { isTerminalResult } from "./result-contract.mjs";
+import { requiresBookmarkReview } from './site-migration.mjs';
 
 export const ATTENTION_STATUSES = new Set([
   "error",
@@ -18,11 +19,13 @@ export const ATTENTION_STATUSES = new Set([
 
 const MANUAL_DEFERRED_CAUSES = new Set(["login_required", "managed_challenge_timeout"]);
 export function requiresManualAttention(result) {
+  if (requiresBookmarkReview(result)) return false;
   if (result?.status === "deferred") return MANUAL_DEFERRED_CAUSES.has(result.retryCause);
   return ATTENTION_STATUSES.has(result?.status);
 }
 
 export function canExplicitlyRequestManualAttention(result) {
+  if (requiresBookmarkReview(result)) return false;
   if (!result) return true;
   return requiresManualAttention(result) || ["no_action", "clicked"].includes(result.status);
 }
@@ -187,6 +190,9 @@ export function buildAttentionHandoff({
   if (requestedOrigins.length > 0) {
     selectionMode = "origins";
     const normalized = [...new Set(requestedOrigins.map(normalizeRequestedOrigin))];
+    if (!forAbandonment && normalized.some(origin => requiresBookmarkReview(resultByOrigin.get(origin)))) {
+      throw new Error('所选站点提示迁移或跳转到未授权域名；请先核对并更新收藏地址，再重新运行签到，不打开人工登录窗口。');
+    }
     const selected = normalized.map((origin) => {
       const target = targetByOrigin.get(origin);
       const previous = resultByOrigin.get(origin);

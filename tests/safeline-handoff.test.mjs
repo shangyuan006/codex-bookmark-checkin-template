@@ -63,6 +63,7 @@ test('generic SafeLine failure closes once without opening other candidates or r
       opens++;
       return {
         goto: async () => { visits++; }, url: () => `${origin}/`, close: async () => { closes++; },
+        evaluate: async () => ({title:'',bodyText:'雷池 WAF 客户端异常，请确认您是合法用户'}),
         locator: selector => ({
           count: async () => ['button#sl-check', '#sl-text'].includes(selector) ? 1 : 0,
           innerText: async () => '客户端异常，请确认您是合法用户',

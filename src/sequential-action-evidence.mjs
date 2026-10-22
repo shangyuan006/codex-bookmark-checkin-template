@@ -11,6 +11,27 @@ export function configuredSequentialActionTypes(origin, config = {}) {
   return Array.isArray(steps) && steps.length ? steps.map(sequentialActionType) : null;
 }
 
+export function normalizeSequentialCompletedControl(raw) {
+  if (raw == null) return null;
+  const selector = String(raw.selector ?? '').trim();
+  const textPattern = String(raw.textPattern ?? '');
+  if (!selector || selector.length > 300 || !textPattern.startsWith('^') || !textPattern.endsWith('$')
+    || textPattern.length > 200 || /[\r\n]/.test(textPattern)) {
+    throw new Error('Sequential completed control requires a bounded selector and anchored text pattern');
+  }
+  try { new RegExp(textPattern, 'u'); }
+  catch { throw new Error('Invalid sequential completed control text pattern'); }
+  return { selector, textPattern };
+}
+
+export function sequentialCompletedControlMatches(observations, rule) {
+  if (!rule || !Array.isArray(observations)) return false;
+  const visible = observations.filter(control => control?.visible === true);
+  if (visible.length !== 1 || visible[0].interactive !== true) return false;
+  const text = normalizeText(visible[0].text);
+  return text.length <= 120 && new RegExp(rule.textPattern, 'u').test(text);
+}
+
 export function readSequentialDailyQuota(text, step) {
   if (!step.dailyQuotaPattern) return { matched: false, eligible: false, empty: false };
   const matches = [...String(text ?? "").replace(/\s+/g, " ").matchAll(new RegExp(step.dailyQuotaPattern, "g"))];

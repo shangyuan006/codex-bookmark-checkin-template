@@ -61,6 +61,7 @@ import {
 import { checkinCycle, expireCycleResult } from './checkin-cycle.mjs';
 import { closeAutomationContext, automationCleanupAllowsRecovery } from "./automation-context-close.mjs";
 import { normalizeBoundEvidenceResult } from './checkin-evidence.mjs';
+import { recheckBeforeManualHandoff } from './pre-handoff-recheck.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
@@ -633,6 +634,19 @@ try {
         await closeRunAutomationContext(recoveryContext, `recovery-${round + 1}`);
       }
     }
+
+    await recheckBeforeManualHandoff(results, selectedTargets, config, {
+      launchContext: launchAutomationContext,
+      processTarget: (recheckContext, target, readOnlyConfig) =>
+        processTarget(recheckContext, target, readOnlyConfig, qaRules, runLog.directory),
+      closeContext: recheckContext => closeRunAutomationContext(recheckContext, 'pre-handoff-read-only'),
+      canLaunch: () => !automationContextCleanupFailed,
+      wait,
+      onResult: async (result, index) => {
+        results[index] = result;
+        await writeProgress('pre_handoff_read_only');
+      },
+    });
 
     const finishedAt = new Date();
     const assembledResults = resumeBase

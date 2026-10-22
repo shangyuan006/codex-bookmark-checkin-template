@@ -143,6 +143,7 @@ function Test-ManualVerificationImmediateResult($Result, [datetime]$RetryAt) {
 
 function Test-ManualVerificationHandoffResult($Result) {
     if ($null -eq $Result -or (Test-ManualVerificationResultTerminal $Result)) { return $false }
+    if ([string]$Result.failureCode -in @('site_migration', 'bookmark_origin_changed')) { return $false }
     if ([string]$Result.status -eq 'deferred') {
         return [string]$Result.retryCause -in $script:ManualVerificationHandoffDeferredCauses
     }

@@ -538,6 +538,18 @@ async function writeState(statePath, state, key, entry) {
   });
 }
 
+export async function persistVerifiedReauthCompletion(statePath, stateKey, previous, currentLogin, now = new Date()) {
+  if (!hasCurrentReauthEvidence(currentLogin, previous, now)) return false;
+  const refreshed = await readState(statePath);
+  const current = refreshed.entries?.[stateKey];
+  // Evidence belongs to this account's verified logout. Never complete a newer
+  // logout (or another day) with an observation from the previous checkpoint.
+  if (current?.updatedAt !== previous.updatedAt || current?.date !== previous.date
+    || !hasCurrentReauthEvidence(currentLogin, current, now)) return false;
+  await writeState(statePath, refreshed, stateKey, buildReauthStateEntry(localRunDate(now), "completed", now));
+  return true;
+}
+
 async function openRulePage(config, rule) {
   const context = await launchAutomationContext({ ...config, backgroundWindowMode: "offscreen" });
   const page = await context.newPage();
@@ -1032,9 +1044,12 @@ export async function runConfiguredReauthCheckinForAccount(target, config, accou
     return bindSuccessEvidence(withReauthAccountMetadata({...result,
       evidence:result.evidence??successEvidence('reauth_state','quota_reward_confirmed',at)},account),identity,activeConfig,options.now??new Date(),'reauth');
   };
+  // Post-OAuth verification must reach the account state machine instead of
+  // taking a cached journal receipt that leaves its checkpoint stale.
+  const activeConfig = options.postOAuthVerify ? {...config, checkinReadOnly:true} : config;
   return config.submissionJournalPath
-    ? runWithSubmissionJournal(config.submissionJournalPath,identity,config,run,{now:()=>options.now??new Date()})
-    : run(config);
+    ? runWithSubmissionJournal(config.submissionJournalPath,identity,activeConfig,run,{now:()=>options.now??new Date()})
+    : run(activeConfig);
 }
 
 async function runReauthCheckinForAccountInternal(target, config, account, options = {}) {
@@ -1064,7 +1079,7 @@ async function runReauthCheckinForAccountInternal(target, config, account, optio
   }
   if (config.checkinReadOnly) {
     const currentLogin = await inspectCurrentLogin(accountConfig,rule);
-    if (reauthRecoveryAction(previous,now)==='resume' && hasCurrentReauthEvidence(currentLogin,previous)) {
+    if (await persistVerifiedReauthCompletion(statePath, stateKey, previous, currentLogin, options.now ?? new Date())) {
       return {status:'signed',reason:'只读核验确认本次重新认证的额度证据'};
     }
     if(rule.allowCycleContinuation && previous?.date!==date && currentLogin.valid===true) {
