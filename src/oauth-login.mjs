@@ -18,6 +18,7 @@ import {
   isConfiguredProviderAuthorizationPage,
 } from "./oauth-provider-authorization.mjs";
 import { findUniqueOAuthProviderControl } from "./oauth-provider-control.mjs";
+import { waitForStableOAuthProviderControl } from './oauth-provider-readiness.mjs';
 import {
   waitForFirstTransition,
   waitForUsableHttpsPage,
@@ -488,31 +489,38 @@ if (providerOnly) {
     : [provider, `${provider}登录`, `${provider}登入`];
   async function findProviderButton(currentPage) {
     setOAuthStage("provider_button");
-    const providerDeadline = timeBudget.deadline('provider', providerWaitMs);
-    while (Date.now() < providerDeadline) {
-      const observation = await prepareTargetPage(currentPage);
-      if (config.reauthCheckinRules?.[origin] && observation.targetSurface === 'authenticated_target') {
-        setOAuthStage('logout_verification');
-        throw new Error('Target session is still authenticated; no provider login was attempted');
-      }
-      const agreementCheckbox = currentPage.locator('input[type="checkbox"]:visible');
-      if (await agreementCheckbox.count() === 1 && !await agreementCheckbox.isChecked()) {
-        await agreementCheckbox.check({ force: true, timeout: 5000 });
-      }
-      for (const label of providerLabels) {
-        const candidate = currentPage.getByText(label, { exact: true });
-        if (await candidate.count() === 1 && await candidate.isVisible()) return candidate;
-      }
-      for (const label of providerAltLabels) {
-        const candidate = currentPage.locator(`img[alt="${label}"]`);
-        if (await candidate.count() === 1 && await candidate.isVisible()) return candidate;
-      }
-      const semanticFallback = await findUniqueOAuthProviderControl(currentPage, provider);
-      if (semanticFallback) return semanticFallback;
-      const challengeClicked = await clickConfiguredLoginChallengeControl(currentPage, origin, config);
-      if (challengeClicked) setOAuthStage("login_challenge");
-      await currentPage.waitForTimeout(500);
-    }
+    const control = await waitForStableOAuthProviderControl(currentPage, {
+      timeoutMs: timeBudget.timeoutMs('provider', providerWaitMs),
+      assertActive: () => { timeBudget.timeoutMs('provider', 1); },
+      preparePage: async () => {
+        assertBookmarkNavigation(currentPage.url(), [origin]);
+        const observation = await prepareTargetPage(currentPage);
+        if (config.reauthCheckinRules?.[origin] && observation.targetSurface === 'authenticated_target') {
+          setOAuthStage('logout_verification');
+          throw new Error('Target session is still authenticated; no provider login was attempted');
+        }
+        const agreementCheckbox = currentPage.locator('input[type="checkbox"]:visible');
+        if (await agreementCheckbox.count() === 1 && !await agreementCheckbox.isChecked()) {
+          await agreementCheckbox.check({ force: true, timeout: 5000 });
+        }
+      },
+      findControl: async () => {
+        for (const label of providerLabels) {
+          const candidate = currentPage.getByText(label, { exact: true });
+          if (await candidate.count() === 1 && await candidate.isVisible()) return candidate;
+        }
+        for (const label of providerAltLabels) {
+          const candidate = currentPage.locator(`img[alt="${label}"]`);
+          if (await candidate.count() === 1 && await candidate.isVisible()) return candidate;
+        }
+        return findUniqueOAuthProviderControl(currentPage, provider);
+      },
+      handleChallenge: async () => {
+        const challengeClicked = await clickConfiguredLoginChallengeControl(currentPage, origin, config);
+        if (challengeClicked) setOAuthStage("login_challenge");
+      },
+    });
+    if (control) return control;
     throw new Error("configured OAuth provider control was not found");
   }
 
@@ -534,7 +542,13 @@ if (providerOnly) {
     const navigationPromise = currentPage.waitForURL((url) => url.href !== previousUrl, { timeout: transitionTimeout })
       .then(() => waitForUsableHttpsPage(currentPage, { timeoutMs: transitionTimeout }))
       .catch(() => null);
-    await providerButton.click();
+    try {
+      assertBookmarkNavigation(currentPage.url(), [origin]);
+      timeBudget.assertActive();
+      await providerButton.click({ timeout: timeBudget.timeoutMs('provider', 5_000), noWaitAfter: true });
+    } finally {
+      await providerButton.dispose().catch(() => {});
+    }
     const destinationPage = await waitForFirstTransition([
       popupPromise,
       contextPagePromise,

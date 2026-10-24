@@ -114,6 +114,10 @@ export function loginRecoveryRequiresManualHandoff(attempts) {
 }
 
 export function applyLoginRecoveryHandoff(result, loginOutcome) {
+  if (result?.status === 'login_required' && loginOutcome?.attempts?.some(attempt => attempt.failureCode === 'two_factor_required')) {
+    return {...result,status:'needs_attention',failureCode:'two_factor_required',retryableLoginRecovery:false,
+      reason:'站点要求人工完成二次验证，不再重复自动登录'};
+  }
   // Always recheck the page after the helpers: their failure must not override
   // a restored session, a check-in result, or a transient navigation error.
   if (result?.status !== "login_required" || loginOutcome?.succeeded
@@ -181,6 +185,8 @@ export function loginHelperOutcome(text, fallback = "failed") {
   return {
     succeeded: status === "logged_in",
     status,
+    ...(status !== 'logged_in' && value?.failureCode === 'two_factor_required'
+      ? {failureCode:'two_factor_required',retryableLoginRecovery:false} : {}),
     diagnostic: messages[status] ?? messages.failed,
     ...sanitizeOAuthPageObservation(value),
     ...sanitizeOAuthCallbackDiagnostics(value?.callbackDiagnostics),

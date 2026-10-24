@@ -256,23 +256,18 @@ async function runLegacyNewApiCheckin(statuses, {
         value: async (url, options = {}) => {
           requests.push({ url: String(url), method: options.method ?? "GET" });
           if (String(url).includes("/api/user/self")) {
-            return {
-              status: selfStatus,
-              json: async () => selfStatus === 200
-                ? { success: true, data: { id: 42 } }
-                : { success: false, message: "unauthorized" },
-            };
+            return Response.json(selfStatus === 200
+              ? { success: true, data: { id: 42 } }
+              : { success: false, message: "unauthorized" }, { status: selfStatus });
           }
           if (options.method === "POST") {
-            return { status: postStatus, json: async () => postMessage ? ({success:false,message:postMessage}) : ({ success: true }) };
+            return Response.json(postMessage ? {success:false,message:postMessage} : { success: true }, { status: postStatus });
           }
           const checked = statusQueue.shift() ?? false;
-          return {
-            status: Array.isArray(statusHttpStatus) ? statusHttpStatus.shift() : statusHttpStatus,
-            json: async () => statusMessage
-              ? ({ success: false, message: statusMessage })
-              : ({ success: true, data: { stats: { checked_in_today: checked } } }),
-          };
+          return Response.json(statusMessage
+            ? { success: false, message: statusMessage }
+            : { success: true, data: { stats: { checked_in_today: checked } } },
+          { status: Array.isArray(statusHttpStatus) ? statusHttpStatus.shift() : statusHttpStatus });
         },
       },
     });
@@ -307,7 +302,7 @@ test("legacy New API reports an invalid session instead of no_action", async () 
   assert.equal(missingStorage.result.status, "login_required");
   assert.equal(missingStorage.requests.at(-1).url, "/api/user/self");
 
-  const staleStorage = await runLegacyNewApiCheckin([], { statusHttpStatus: 403 });
+  const staleStorage = await runLegacyNewApiCheckin([], { statusHttpStatus: 403, statusMessage: 'not logged in' });
   assert.equal(staleStorage.result.status, "login_required");
   assert.equal(staleStorage.requests.filter((request) => request.method === "POST").length, 0);
 });

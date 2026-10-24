@@ -81,7 +81,7 @@ test('strict browser proof cannot fall back to page text when the identity endpo
   const context = vm.createContext({ Date,Intl,AbortSignal,setTimeout,
     document:{querySelectorAll:()=>[{innerText:'已签到',getBoundingClientRect:()=>({width:100,height:30})}]},
     getComputedStyle:()=>({display:'block',visibility:'visible'}),
-    fetch:async()=>({status:401,json:async()=>({})}) });
+    fetch:async()=>new Response('{}',{status:401}) });
   const serialized=`(${runNewApiProtocol.toString()})`;
   const legacy=await vm.runInContext(`${serialized}()`,context);
   assert.equal(legacy.status,'already_signed');
@@ -104,7 +104,7 @@ test('legacy nested-storage and visible-page IDs remain untrusted hints until th
       localStorage:storage?{length:1,key:()=> 'user',getItem:()=>JSON.stringify({data:{user:{id:'12345'}}})}:undefined,
       document:{body:{innerText:'用户 ID: 12345'}},
       fetch:async(path,options)=>{calls.push(options.headers);const authorized=options.headers['New-Api-User']==='12345';
-        return {status:authorized?200:401,json:async()=>path==='/api/user/self'?self('12345').body:state(true,[record]).body};},
+        return new Response(JSON.stringify(path==='/api/user/self'?self('12345').body:state(true,[record]).body),{status:authorized?200:401});},
     });
     const result=await vm.runInContext(`(${runNewApiProtocol.toString()})({readOnly:true,clock:()=>new Date('2026-10-13T04:00Z')})`,context);
     assert.equal(result.status,'already_signed');assert.equal(calls.length,3);

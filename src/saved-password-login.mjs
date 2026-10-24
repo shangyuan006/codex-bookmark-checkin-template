@@ -7,6 +7,8 @@ import { acceptConfiguredLoginTerms, waitForLoginSubmitEnabled } from "./protect
 import { expandSavedPasswordLogin } from "./login-form.mjs";
 import { verifyConfiguredSavedLoginSession } from "./saved-login-session.mjs";
 import { assertBookmarkNavigation, safeLogUrl } from "./security.mjs";
+import { classifyPageText } from './detector.mjs';
+import { readPageSnapshot, PAGE_CHALLENGE_SELECTOR } from './page-snapshot.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
@@ -65,8 +67,16 @@ try {
   const username = page.locator('input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"])').first();
   await username.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
   const initialSession = await verifyConfiguredSavedLoginSession(page, origin, config);
+  const readGate = async () => {
+    const snapshot = await page.evaluate(readPageSnapshot, PAGE_CHALLENGE_SELECTOR);
+    return classifyPageText({url:page.url(),title:await page.title(),bodyText:snapshot.bodyText,
+      hasPassword:snapshot.hasPassword,hasTwoFactorControl:snapshot.hasTwoFactorControl});
+  };
+  const initialGate = await readGate();
   let status = initialSession?.status === "valid" ? "logged_in" : "unsupported";
-  if (status !== "logged_in" && await password.count() >= 1 && await username.count() >= 1) {
+  if (initialGate.failureCode === 'two_factor_required') status = 'needs_attention';
+  if (status !== "logged_in" && initialGate.failureCode !== 'two_factor_required'
+    && await password.count() >= 1 && await username.count() >= 1) {
     const fieldsFilled = async () => Boolean(
       await username.evaluate((element) => Boolean(element.value))
       && await password.evaluate((element) => Boolean(element.value))
@@ -129,9 +139,13 @@ try {
     }
   }
 
+  const finalGate = await readGate();
+  if (finalGate.failureCode === 'two_factor_required') status = 'needs_attention';
   console.log(JSON.stringify({
     origin,
     status,
+    ...(finalGate.failureCode === 'two_factor_required'
+      ? {failureCode:'two_factor_required',retryableLoginRecovery:false} : {}),
     finalUrl: safeLogUrl(page.url()),
     title: await page.title(),
   }, null, 2));

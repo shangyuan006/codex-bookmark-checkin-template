@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { ptPassiveReadPolicy,classifyPtPassiveState,readPtPassiveState } from '../src/pt-passive-read.mjs';
+import { ptPassiveReadPolicy,classifyPtPassiveState,readPtPassiveState,ptSelfProfileUrl } from '../src/pt-passive-read.mjs';
 import { processTarget } from '../src/browser.mjs';
 
 const target={origin:'https://pt.example',accountKey:'primary'},now=new Date('2026-10-13T04:00Z');
@@ -9,6 +9,17 @@ const rule={url:'/index.php',selector:'#daily',authenticatedSelector:'#logout',
   signedTextPattern:'{date} 已签到',unsignedTextPattern:'{date} 未签到'};
 const config={ptPassiveReadRules:{[target.origin]:rule}};
 const observation=text=>({authenticated:true,sectionCount:1,text});
+
+test('self-profile links require a unique same-origin numeric identity and no other query',()=>{
+  assert.equal(ptSelfProfileUrl(['/userdetails.php?id=123','/userdetails.php?id=123'],target.origin),target.origin+'/userdetails.php?id=123');
+  for(const links of [[],['/userdetails.php?id=123','/userdetails.php?id=456'],['https://other.example/userdetails.php?id=123'],
+    ['/userdetails.php?id=123&action=checkin'],['/userdetails.php?id=123&id=123'],['/attendance.php?id=123'],['/userdetails.php?id=name'],
+    ['/userdetails.php?id=123#submit']]) {
+    assert.equal(ptSelfProfileUrl(links,target.origin),null);
+  }
+  assert.equal(ptSelfProfileUrl(['https://user:placeholder@example.com/userdetails.php?id=123'],'https://example.com'),null);
+  assert.throws(()=>ptPassiveReadPolicy(target,{ptPassiveReadRules:{[target.origin]:{...rule,selfProfile:{linkSelector:'a',path:'/attendance.php'}}}},now));
+});
 
 test('PT policy rejects action URLs, redirects, cross-origin reads and undated signals before requesting',()=>{
   assert.equal(ptPassiveReadPolicy(target,{}),null);
@@ -41,6 +52,13 @@ test('PT reader sends one bounded GET and disposes redirect/error responses',asy
   }
 });
 
+test('PT passive reads stop if the cycle changes before requesting',async()=>{
+  let calls=0,requests=0;
+  const context={request:{fetch:async()=>{requests++;throw new Error('unexpected request');}}};
+  const result=await readPtPassiveState(context,target,config,{now:()=>calls++===0?now:new Date('2026-10-14T04:00Z')});
+  assert.equal(result.failureCode,'site_cycle_expired');assert.equal(requests,0);
+});
+
 test('unconfirmed PT passive result stops the normal target before any action page is opened',async()=>{
   let pages=0;
   const context={request:{fetch:async url=>({url:()=>url,status:()=>302,dispose:async()=>{}})},newPage:async()=>{pages++;throw new Error('unexpected action');}};
@@ -65,4 +83,33 @@ test('offline Edge PT reader disables scripts, subresource traffic and credentia
   assert.equal(result.status,'already_signed');assert.equal(reads,1);assert.equal(disposed,1);
   assert.deepEqual(created,[{javaScriptEnabled:false,serviceWorkers:'block',acceptDownloads:false}]);
   assert.equal(browser.contexts().length,0);assert.doesNotMatch(JSON.stringify(result),/退出|2026-10-13 已签到/);
+});
+
+test('offline self-profile fallback verifies current identity and date without visiting the check-in endpoint',{
+  skip:process.env.CHECKIN_BROWSER_FIXTURES!=='1',timeout:30000,
+},async t=>{
+  const {chromium}=createRequire(import.meta.url)('playwright-core');
+  const browser=await chromium.launch({channel:'msedge',headless:true});t.after(()=>browser.close());
+  const privateConfig={ptPassiveReadRules:{[target.origin]:{...rule,selfProfile:{linkSelector:'#identity a'}}}};
+  const html=(id,text)=>`<a id="logout">退出</a><header id="identity"><a href="/userdetails.php?id=${id}">本人</a></header><section id="daily">${text}</section>`;
+  for(const scenario of [
+    {profileId:'123',date:now.toUTCString(),text:'2026-10-13 已签到',status:'already_signed',reads:2},
+    {profileId:'456',date:now.toUTCString(),text:'2026-10-13 已签到',status:'unconfirmed',reads:2},
+    {profileId:'123',date:'Mon, 12 Oct 2026 04:00:00 GMT',text:'2026-10-13 已签到',status:'unconfirmed',reads:1},
+    {profileId:'123',date:now.toUTCString(),text:'2026-10-12 已签到',status:'unconfirmed',reads:2},
+    {profileId:'123',date:now.toUTCString(),text:'2026-10-13 已签到 2026-10-13 未签到',status:'unconfirmed',reads:2},
+  ]) {
+    const requests=[];let disposed=0;
+    const context={browser:()=>browser,request:{fetch:async(url,options)=>{
+      requests.push(url);assert.equal(options.method,'GET');assert.equal(options.maxRedirects,0);
+      return {url:()=>url,status:()=>200,headers:()=>({date:scenario.date}),
+        text:async()=>requests.length===1?html('123','每日状态请查看本人资料'):html(scenario.profileId,scenario.text),
+        dispose:async()=>{disposed++;}};
+    }}};
+    const result=await readPtPassiveState(context,target,privateConfig,{now:()=>now});
+    assert.equal(result.status,scenario.status);assert.equal(requests.length,scenario.reads);assert.equal(disposed,scenario.reads);
+    assert.ok(requests.every(url=>!url.includes('attendance')));
+    assert.doesNotMatch(JSON.stringify(result),/123|456|本人资料/);
+  }
+  assert.equal(browser.contexts().length,0);
 });

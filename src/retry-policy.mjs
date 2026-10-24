@@ -3,6 +3,7 @@ export const RECOVERABLE_STATUSES = new Set(CHECKIN_CONTRACT.recoverableStatuses
 
 import { isTerminalResult } from "./result-contract.mjs";
 import { compatiblePriorResult, resultIdentity } from "./result-identity.mjs";
+import { pausesUntilNextDay } from './site-availability.mjs';
 
 export const TERMINAL_STATUSES = new Set(CHECKIN_CONTRACT.successStatuses);
 
@@ -108,6 +109,7 @@ function configuredOAuthProvider(result, config, origin) {
 
 export function upstreamRetryGroup(result, config = {}) {
   if (result?.retryCause !== "upstream_unavailable") return null;
+  if (pausesUntilNextDay(result)) return null;
   let origin;
   try { origin = new URL(String(result.origin)).origin; }
   catch { return null; }
@@ -135,6 +137,7 @@ export function applyUpstreamGroupCircuitBreakers(results, config = {}, now = ne
   });
   const nextDayTime = configuredShanghaiTime([config.rateLimitNextDayTime, config.schedule], "08:05");
   return annotated.map((result) => {
+    if (pausesUntilNextDay(result)) return result;
     const attempts = result.retryGroup ? groups.get(result.retryGroup) ?? 0 : 0;
     if (!result.retryGroup || attempts < limit) return result;
     if (!result.lateRetryPending) {
@@ -168,6 +171,10 @@ export function applyUpstreamGroupCircuitBreakers(results, config = {}, now = ne
 
 export function withRetrySchedule(result, config = {}, now = new Date()) {
   if (result?.status !== "deferred") return result;
+  if (pausesUntilNextDay(result)) return {
+    ...result, retryExhaustedForDay: true, lateRetryPending: false,
+    nextEligibleAt: nextShanghaiTimeNextDay(configuredShanghaiTime([config.schedule], '08:05'), now),
+  };
   const existing = Date.parse(result.nextEligibleAt ?? "");
   if (Number.isFinite(existing)) return result;
   const requestedTime = String(result.reason ?? "").match(/(?:要求|需在)\s*([0-2]\d:[0-5]\d)\s*后/)?.[1];
@@ -187,6 +194,8 @@ export function withRetrySchedule(result, config = {}, now = new Date()) {
 
 export function advanceDeferredRetry(result, previous, config = {}, now = new Date()) {
   if (result?.status !== "deferred") return result;
+  if (pausesUntilNextDay(result)) return { ...withRetrySchedule(result, config, now),
+    retrySequenceDate: localRunDate(now), retrySequence: 1 };
   const sameCause = previous?.status === "deferred"
     && String(previous.retryCause || "") === String(result.retryCause || "");
   const currentDate = localRunDate(now);
@@ -305,6 +314,7 @@ export function advanceAttemptedDeferredRetries(results, attemptedOrigins, previ
 
 export function deferUnresolvedLogin(result, config = {}, now = new Date()) {
   if (result?.status !== "login_required") return result;
+  if (result.retryableLoginRecovery === false) return { ...result, status: 'needs_attention' };
   const oauthFailure = String(result.failureCode ?? "");
   const retryCause = oauthFailure === "oauth_upstream_unavailable"
     ? "upstream_unavailable"
@@ -325,6 +335,7 @@ export function deferUnresolvedLogin(result, config = {}, now = new Date()) {
 }
 
 export function isRetryEligible(result, now = new Date()) {
+  if (result?.status === 'login_required' && result.retryableLoginRecovery === false) return false;
   if (result?.retryable === false || result?.submissionAttempted === true) return false;
   if (result?.status === "not_available" && !isTerminalResult(result)) return true;
   if (!RECOVERABLE_STATUSES.has(result?.status)) return false;
@@ -334,6 +345,7 @@ export function isRetryEligible(result, now = new Date()) {
 }
 
 export function isResumeRetryEligible(result, reauthOrigins, now = new Date()) {
+  if (['login_required', 'needs_attention'].includes(result?.status) && result.retryableLoginRecovery === false) return false;
   if (result?.retryable === false || result?.submissionAttempted === true) return false;
   if (isRetryEligible(result, now)) return true;
   return result?.status === "needs_attention"
@@ -342,7 +354,8 @@ export function isResumeRetryEligible(result, reauthOrigins, now = new Date()) {
 }
 
 export function filterAutomaticRetryOrigins(origins, results) {
-  const blocked = new Set(results.filter(result => result.retryable === false || result.submissionAttempted === true)
+  const blocked = new Set(results.filter(result => result.retryable === false || result.submissionAttempted === true
+    || (['login_required','needs_attention'].includes(result.status) && result.retryableLoginRecovery === false))
     .map(result => result.origin));
   return new Set([...origins].filter(origin => !blocked.has(origin)));
 }

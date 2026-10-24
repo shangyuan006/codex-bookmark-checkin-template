@@ -1,4 +1,5 @@
 import { siteMigrationResult } from './site-migration.mjs';
+import { isActiveSiteMaintenance } from './site-availability.mjs';
 
 const CHECKIN_EXACT = new Set([
   "签到", "簽到", "立即签到", "立即簽到", "每日签到", "每日簽到", "提交签到", "提交簽到",
@@ -37,11 +38,15 @@ export function classifyPageText({
   challengeSelectors = false,
   resolvedChallengeSelectors = false,
   confirmedCheckinControl = false,
+  confirmedDailyText = false,
+  unsignedTextObserved = false,
+  hasTwoFactorControl = false,
+  loginRequiredTextObserved = false,
 }) {
   const normalizedBodyText = normalizeText(bodyText).slice(0, 30000);
   const text = normalizeText(`${title}\n${normalizedBodyText}`).slice(0, 30000);
   const unsignedPattern = /(?:尚未|还未|還未|未|没有|沒有|not|hasn['’]?t|haven['’]?t)\s*(?:完成)?\s*(?:签到|簽到|打卡|checked[ -]?in|signed[ -]?in)/i;
-  const explicitlyUnsigned = unsignedPattern.test(text);
+  const explicitlyUnsigned = unsignedTextObserved || unsignedPattern.test(text);
   const lowerUrl = String(url).toLowerCase();
 
   const migration = siteMigrationResult({url, title, bodyText});
@@ -49,6 +54,21 @@ export function classifyPageText({
 
   if (/雷池|safeline/i.test(text) && /客户端异常.*确认.*合法用户/.test(text)) {
     return { status: 'interactive_challenge', reason: '雷池 WAF 要求合法用户确认', failureCode: 'safeline_client_challenge', retryable: false };
+  }
+
+  const twoFactorPrompt = /异地登录安全验证|異地登錄安全驗證|(?:请输入|請輸入|需要|要求).{0,12}(?:二级|二級|两步|兩步|双重|雙重)验证(?:代码|碼)?|(?:2fa|two[- ]factor|two[- ]step) verification required|enter.{0,20}(?:2fa|two[- ]factor|authentication) (?:code|token)/i.test(text);
+  const twoFactorForm = hasTwoFactorControl && /二级验证|二級驗證|两步验证|兩步驗證|双重验证|雙重驗證|\b2fa\b|two[- ]factor|two[- ]step/i.test(text);
+  const explicitTwoFactorPage = /^(?:异地登录安全验证|異地登錄安全驗證|请输入二级验证代码|請輸入二級驗證碼|2fa verification required)[。！!]?$/i;
+  if (twoFactorForm || (twoFactorPrompt && (hasTwoFactorControl
+    || explicitTwoFactorPage.test(normalizedBodyText) || explicitTwoFactorPage.test(normalizeText(title))))) {
+    return { status: 'needs_attention', reason: '站点要求人工完成二次验证',
+      failureCode: 'two_factor_required', retryableLoginRecovery: false };
+  }
+  if (!hasPassword && !challengeSelectors && !confirmedCheckinControl && !confirmedDailyText
+    && isActiveSiteMaintenance({ title, bodyText })) {
+    return { status: 'deferred', retryCause: 'upstream_unavailable', failureCode: 'site_maintenance',
+      siteCondition: 'site_maintenance', retryableLoginRecovery: false,
+      reason: '站点明确维护中，今日暂停自动操作，次日再核验' };
   }
 
   // A login form can legitimately contain an image CAPTCHA.  Treating every
@@ -64,16 +84,12 @@ export function classifyPageText({
   if (confirmedCheckinControl) {
     return { status: "already_signed", reason: "签到控件确认今日已签到" };
   }
-  if (/(未登录|尚未登录|请先登录|請先登入|not logged in|sign in to continue)/i.test(text)) {
+  if (loginRequiredTextObserved || /(未登录|尚未登录|请先登录|請先登入|not logged in|sign in to continue)/i.test(text)) {
     return { status: "login_required", reason: "页面要求先登录" };
   }
   if (/(?:使用|用)\s*linux\s*do\s*(?:账号|帳號)?\s*(?:登录|登入)|use\s+linux\s*do\s+to\s+(?:log|sign)\s*in/i.test(text)) {
     return { status: "login_required", reason: "页面要求通过 Linux DO 登录" };
   }
-  if (/(?:异地登录安全验证|異地登錄安全驗證|忘记二级验证|忘記二級驗證|二级验证代码|二級驗證碼|\b2fa\b)/i.test(text)) {
-    return { status: "login_required", reason: "站点要求完成异地登录 2FA 验证" };
-  }
-
   if (/(操作过于频繁|操作過於頻繁|请求过于频繁|請求過於頻繁|too many requests|rate limit|try again later|请稍后再试|請稍後再試)/i.test(text)) {
     return { status: "deferred", retryCause: "rate_limit", reason: "站点触发频率限制，请稍后重试" };
   }
@@ -100,6 +116,9 @@ export function classifyPageText({
   }
   if (explicitlyUnsigned) {
     return { status: "ready", reason: "页面明确显示尚未签到" };
+  }
+  if (confirmedDailyText) {
+    return { status: 'already_signed', reason: '页面当日状态确认已签到' };
   }
   if (/^(?:已签到|已簽到)$/i.test(normalizedBodyText)
     || /(?:今日\s*已\s*(?:签到|簽到)|今天\s*已\s*(?:签到|簽到)|今天\s*已经\s*(?:签到|簽到)过|\[\s*已(?:签到|簽到)\s*\]|签到已得\s*\d*|簽到已得\s*\d*|查看(?:签到|簽到)(?:记录|記錄).{0,20}\d{1,2}(?:点|點)|無需重複簽到|无需重复签到|codex\s*(?:权益|權益)\s*已(?:领取|領取)|already checked[ -]?in|checked in today)/i.test(text)) {

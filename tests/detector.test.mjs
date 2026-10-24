@@ -109,11 +109,12 @@ test("识别 Linux DO 登录入口", () => {
   assert.equal(classifyPageText({ bodyText: "使用 Linux DO 登录" }).status, "login_required");
 });
 
-test("异地登录和二级验证不能被当作已登录页面", () => {
+test("异地登录和二级验证直接转人工，不重复密码恢复", () => {
   for (const bodyText of ["异地登录安全验证", "请输入二级验证代码", "2FA verification required"]) {
     const result = classifyPageText({ bodyText });
-    assert.equal(result.status, "login_required");
-    assert.match(result.reason, /2FA/);
+    assert.equal(result.status, "needs_attention");
+    assert.equal(result.failureCode, 'two_factor_required');
+    assert.equal(result.retryableLoginRecovery, false);
   }
 });
 

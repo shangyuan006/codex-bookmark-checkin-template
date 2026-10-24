@@ -3,7 +3,7 @@
 export async function runNewApiProtocol({ readOnly = false, expectedAccountId = null,
   requireCalendarRecord = false, timeZone = 'Asia/Shanghai', checkinDate = null,
   cycleEndAt = null, request = null, beforeSubmit = null, rejectSubmission = null,
-  fallbackOnChallenge = false, wait = null, clock = null } = {}) {
+  fallbackOnChallenge = false, wait = null, clock = null, onFailure = null } = {}) {
   const now = () => clock ? clock() : new Date();
   const pause = wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const normalizeId = value => (typeof value !== 'number' || Number.isSafeInteger(value))
@@ -26,14 +26,36 @@ export async function runNewApiProtocol({ readOnly = false, expectedAccountId = 
         && /^(?:(?:今日|今天|当日|當日)\s*)?已\s*(?:签到|簽到)$|签到成功|簽到成功/i.test(text);
     });
   const failure = (status, reason, failureCode, extra = {}) => ({ status, reason, ...(failureCode ? { failureCode } : {}), ...extra });
+  // Only fixed categories may leave this function. In particular, server
+  // messages and HTML can contain account details and must not become logs.
+  const failureKind = response => {
+    if (!response) return 'network_error';
+    if (response.httpStatus === 429) return 'rate_limit';
+    if (response.challengePresent) return 'challenge';
+    if (response.blockedRedirect || response.httpStatus >= 300 && response.httpStatus < 400) return 'redirect';
+    if (response.httpStatus >= 500) return 'upstream_unavailable';
+    if ([404, 405].includes(response.httpStatus)) return 'route_unavailable';
+    if (response.responseKind !== 'json') return 'non_json';
+    const message = String(response.body?.message ?? response.body?.error?.message ?? response.body?.error ?? '').slice(0, 4_096);
+    if (/new[-_ ]?api[-_ ]?user/i.test(message)
+      && /not provided|required|missing|缺少|缺失|未提供|不能为空|不能為空/i.test(message)) return 'user_header_required';
+    if (response.body?.success === false && /turnstile|captcha|人机|人機/i.test(message)) return 'challenge';
+    if (response.body?.success === false
+      && /access[ _-]?token|bearer/i.test(message) && /invalid|expired|无效|失效|过期|無效|過期/i.test(message)) return 'token_invalid';
+    if (response.httpStatus === 401 || response.body?.success === false
+      && /not logged in|unauthenticated|unauthori[sz]ed|login required|未登录|未登入|未登錄|请先登录|請先登入|登录已过期|会话已失效/i.test(message)) return 'session_invalid';
+    if (response.httpStatus === 403) return 'access_denied';
+    return null;
+  };
+  const completedPageResult = () => ({
+    status: 'already_signed', reason: '页面签到控件确认已签到，接口登录探测不可用',
+    evidence: { source: 'page_text', outcome: 'page_completion_control', authoritative: true, confirmedAt: now().toISOString() },
+  });
   const sessionFailure = () => {
     if (request && !strict) return null;
     // A configured identity must be verified by the API even if the page has a
     // completion control. Existing single-account page verification is retained.
-    if (!strict && completedControl()) return {
-      status: 'already_signed', reason: '页面签到控件确认已签到，接口登录探测不可用',
-      evidence: { source: 'page_text', outcome: 'page_completion_control', authoritative: true, confirmedAt: now().toISOString() },
-    };
+    if (!strict && completedControl()) return completedPageResult();
     if (!request && !strict) {
       const controls = [...(globalThis.document?.querySelectorAll?.('button, [role=button], input[type=submit], a') ?? [])];
       const visible = element => {
@@ -69,13 +91,66 @@ export async function runNewApiProtocol({ readOnly = false, expectedAccountId = 
     try {
       const response = await fetch(path, { method, credentials: 'include', cache: 'no-store', redirect: 'error',
         headers: { Accept: 'application/json', ...(userId ? { 'New-Api-User': userId } : {}) }, signal: AbortSignal.timeout(8000) });
-      return { httpStatus: response.status, body: await response.json().catch(() => null) };
+      return { httpStatus: response.status, bodyText: await response.text(),
+        contentType: response.headers.get('content-type') ?? '', cfMitigated: response.headers.get('cf-mitigated') ?? '' };
     } catch { return null; }
   });
-  const read = async (...args) => { try { return await transport(...args); } catch { return null; } };
+  const read = async (...args) => {
+    let response;
+    try { response = await transport(...args); } catch { response = null; }
+    if (response) {
+      let body = response.body;
+      const text = typeof response.bodyText === 'string' ? response.bodyText : '';
+      const html = /text\/html|application\/xhtml/i.test(response.contentType ?? '')
+        || /^\s*<(?:!doctype|html|head|body|title)\b/i.test(text);
+      if (text && text.length <= 1024 * 1024 && !html) {
+        try { body = JSON.parse(text); } catch { body = null; }
+      }
+      if (html || text.length > 1024 * 1024) body = null;
+      response = { httpStatus: response.httpStatus, body,
+        responseKind: body && typeof body === 'object' && !Array.isArray(body) ? 'json' : 'non_json',
+        blockedRedirect: response.blockedRedirect === true,
+        challengePresent: String(response.cfMitigated ?? '').toLowerCase() === 'challenge'
+          || html && /challenge-platform|cf-chl-|just a moment|verify you are human|正在进行安全验证/i.test(text.slice(0, 65_536)) };
+    }
+    const kind = failureKind(response);
+    if (kind) {
+      try { onFailure?.({ kind, phase: args[1] === 'POST' ? 'submission' : args[0] === '/api/user/self' ? 'identity' : 'status' }); }
+      catch { /* optional diagnostics must never change execution */ }
+    }
+    return response;
+  };
+  const preSubmitFailure = response => {
+    const kind = failureKind(response);
+    const extra = { apiFailureKind: kind };
+    // A browser can obtain the header hint from its own storage. Do that
+    // before deciding that a user must repair a still-valid session.
+    if (kind === 'user_header_required' && request && !strict && fallbackOnChallenge) return null;
+    if (kind === 'user_header_required') return failure('needs_attention',
+      '接口要求当前账号的用户 ID，未据此判定登录失效', 'new_api_user_header_required',
+      { ...extra, retryable: false, retryableLoginRecovery: false });
+    if (kind === 'rate_limit') return failure('deferred', '接口触发限流', null, { ...extra, retryCause: 'rate_limit' });
+    if (kind === 'upstream_unavailable' || kind === 'network_error') return failure('deferred',
+      '接口暂时不可用，未据此判定登录失效', kind === 'network_error' ? 'network_error' : 'site_server_error',
+      { ...extra, retryCause: 'upstream_unavailable' });
+    if (kind === 'challenge') return request && fallbackOnChallenge ? null
+      : failure('interactive_challenge', '接口被人机验证拦截，未据此判定登录失效', null, extra);
+    if (kind === 'session_invalid' || kind === 'token_invalid') {
+      const result = sessionFailure();
+      return result?.status === 'login_required' ? { ...result, ...extra } : result;
+    }
+    if (strict && ['access_denied', 'route_unavailable'].includes(kind)) return failure('needs_attention',
+      kind === 'access_denied' ? '接口拒绝访问，尚不能确认登录状态' : '站点接口路径不可用，未据此判定登录失效',
+      kind === 'access_denied' ? 'new_api_access_denied' : 'new_api_route_unavailable',
+      { ...extra, retryable: false, retryableLoginRecovery: false });
+    if (!strict && ['access_denied', 'route_unavailable', 'non_json', 'redirect'].includes(kind)
+      && completedControl()) return completedPageResult();
+    return null;
+  };
   const self = await read('/api/user/self', 'GET', seedId);
-  if ([401, 403].includes(self?.httpStatus)) return sessionFailure();
-  if (self?.httpStatus === 429) return failure('deferred', '账号接口触发限流', null, { retryCause: 'rate_limit' });
+  if (failureKind(self)) return preSubmitFailure(self)
+    ?? (strict && !['challenge', 'session_invalid', 'token_invalid'].includes(failureKind(self))
+      ? failure('needs_attention', '未能核验预期账号，未提交签到', 'account_identity_unconfirmed', { retryable: false, apiFailureKind: failureKind(self) }) : null);
   const userId = normalizeId(self?.body?.data?.id ?? self?.body?.data?.user?.id);
   if (self?.httpStatus < 200 || self?.httpStatus >= 300 || self?.body?.success !== true || !userId) {
     return strict ? failure('needs_attention', '未能核验预期账号，未提交签到', 'account_identity_unconfirmed', { retryable: false }) : null;
@@ -121,8 +196,9 @@ export async function runNewApiProtocol({ readOnly = false, expectedAccountId = 
   const disabled = source => ({ status: 'not_available', reason: '站点签到功能未启用', availabilityKind: 'feature_disabled',
     evidence: { source, outcome: 'message_not_enabled', authoritative: true, confirmedAt: now().toISOString() } });
   const initial = await read(statusPath, 'GET', userId);
-  if ([401, 403].includes(initial?.httpStatus)) return sessionFailure();
-  if (initial?.httpStatus === 429) return failure('deferred', '签到接口触发限流', null, { retryCause: 'rate_limit' });
+  if (failureKind(initial)) return preSubmitFailure(initial)
+    ?? (strict && !['challenge', 'session_invalid', 'token_invalid'].includes(failureKind(initial))
+      ? failure('unconfirmed', '未取得可核验的签到状态，未提交签到', 'new_api_proof_inconsistent', { retryable: false, apiFailureKind: failureKind(initial) }) : null);
   if (unavailable(initial)) return disabled('new_api_checkin_status');
   if (checked(initial) === true) {
     const evidence = proof(initial);
@@ -166,5 +242,5 @@ export async function runNewApiProtocol({ readOnly = false, expectedAccountId = 
     };
   }
   return failure('needs_attention', '签到请求已发出，但账号或完成证据未确认，禁止重复提交', 'api_submission_unconfirmed',
-    { submissionAttempted: true, retryable: false });
+    { submissionAttempted: true, retryable: false, ...(failureKind(action) ? { apiFailureKind: failureKind(action) } : {}) });
 }

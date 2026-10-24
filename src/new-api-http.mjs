@@ -17,7 +17,7 @@ export async function tryNewApiHttpFirst(context,target,config={}, {wait=ms=>new
   if(!apiFirstAllowed(target,config)||!context?.request) return null;
   const origin=new URL(target.origin).origin;
   if(!origin.startsWith('https://')) return null;
-  let requests=0;
+  let requests=0, lastFailure=null;
   const read=async(path,method='GET',userId=null)=>{
     const url=new URL(path,origin);
     if(url.origin!==origin) throw new Error('API adapter attempted cross-origin request');
@@ -28,11 +28,11 @@ export async function tryNewApiHttpFirst(context,target,config={}, {wait=ms=>new
         method,maxRedirects:0,timeout:8000,failOnStatusCode:false,
         headers:{Accept:'application/json',...(userId?{'New-Api-User':userId}:{})},
       });
-      if(new URL(response.url()).origin!==origin) return null;
+      if(new URL(response.url()).origin!==origin) return {httpStatus:response.status(),blockedRedirect:true};
       const status=response.status();
       const text=await response.text();
-      if(text.length>1024*1024) return null;
-      return {httpStatus:status,body:JSON.parse(text)};
+      const headers=response.headers?.()??{};
+      return {httpStatus:status,bodyText:text,contentType:headers['content-type']??'',cfMitigated:headers['cf-mitigated']??''};
     }catch{return null;}
     finally{await response?.dispose().catch(()=>{});}
   };
@@ -41,7 +41,8 @@ export async function tryNewApiHttpFirst(context,target,config={}, {wait=ms=>new
     detect:async()=>({supported:true}),
     execute:async()=>{
       let result=await runNewApiProtocol({...newApiCheckinOptions(target,config),readOnly:config.checkinReadOnly===true,
-        request:read,wait,fallbackOnChallenge:true,beforeSubmit:()=>config[SUBMISSION_SCOPE]?.begin(),
+        request:read,wait,fallbackOnChallenge:true,onFailure:observation=>{lastFailure=observation;},
+        beforeSubmit:()=>config[SUBMISSION_SCOPE]?.begin(),
         rejectSubmission:code=>config[SUBMISSION_SCOPE]?.reject(code)});
       if(result?.status==='not_signed') result=dailyReadinessEvidence(target,config,{source:'status_endpoint'});
       return {result,requests,submissionAttempted:result?.submissionAttempted===true};
@@ -49,5 +50,6 @@ export async function tryNewApiHttpFirst(context,target,config={}, {wait=ms=>new
     verify:async observation=>observation.result,
   };
   const outcome=await runCheckinAdapter(adapter,{});
-  return {...outcome,metrics:{...outcome.metrics,requests}};
+  return {...outcome,metrics:{...outcome.metrics,requests,
+    ...(lastFailure?{failureKind:lastFailure.kind,failurePhase:lastFailure.phase}:{})}};
 }

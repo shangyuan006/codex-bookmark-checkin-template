@@ -19,7 +19,9 @@
     "account_mismatch": "账号不匹配", "account_identity_unconfirmed": "账号尚未核验",
     "new_api_proof_inconsistent": "账号或当日证据不一致", "pt_passive_unconfirmed": "每日状态尚未核验",
     "tls_certificate_invalid": "站点证书无效", "tls_handshake_failed": "站点 TLS 连接失败",
-    "site_server_error": "站点服务异常"
+    "site_server_error": "站点服务异常", "two_factor_required": "需人工二次验证",
+    "new_api_user_header_required": "接口缺少账号标识", "new_api_access_denied": "接口拒绝访问",
+    "new_api_route_unavailable": "接口路径不可用"
   },
   "featureDisabledEvidence": {
     "bmapi_checkin_status": ["enabled_false"],
@@ -45,6 +47,10 @@
     "site_maintenance": "upstream",
     "site_server_error": "upstream",
     "tls_certificate_invalid": "upstream",
-    "tls_handshake_failed": "upstream"
+    "tls_handshake_failed": "upstream",
+    "two_factor_required": "identity",
+    "new_api_user_header_required": "identity",
+    "new_api_access_denied": "upstream",
+    "new_api_route_unavailable": "navigation"
   }
 }

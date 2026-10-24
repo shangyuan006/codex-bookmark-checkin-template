@@ -400,6 +400,10 @@ test("LinuxDO diagnostic file allowlists fields and rotates old daily files", as
     assert.equal(record.observations[0].httpStatus, 403);
     assert.equal(record.observations[0].challenge, true);
     assert.equal(record.observations[0].error, null);
+    assert.deepEqual(record.sessionPreflight,{
+      request:{attempts:1,status:'invalid',challengeObserved:true,rateLimited:false},
+      page:{attempts:0,status:'unknown',challengeObserved:false,rateLimited:false},
+    });
     assert.doesNotMatch(saved, /private-cookie|private-secret|private-error/);
     await assert.rejects(fs.access(oldFile), { code: "ENOENT" });
     assert.equal(await writeLinuxDoProbeDiagnostic({ stage: "arbitrary", status: "valid" },

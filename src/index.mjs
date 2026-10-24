@@ -529,6 +529,7 @@ try {
             });
             const outcome = loginHelperOutcomeFromStreams(helperOutput.stdout, helperOutput.stderr);
             attempts.push({ method: method.method, ...outcome });
+            if (outcome.retryableLoginRecovery === false) break;
             if (outcome.succeeded) {
               succeeded = true;
               authoritativeCheckinStatus = outcome.checkinStatus ?? null;
@@ -544,6 +545,7 @@ try {
               ...failedOutcome,
               succeeded: false,
             });
+            if (failedOutcome.retryableLoginRecovery === false) break;
           }
         }
         loginOutcomes.set(current.origin, {
@@ -575,6 +577,7 @@ try {
       if (delayMs > 0) await wait(delayMs);
       const needsRecoveryBrowser = recoveryEntries.some(({ target }) => {
         const origin = target.origin;
+        if (loginOutcomes.get(origin)?.attempts?.some(attempt=>attempt.failureCode==='two_factor_required')) return false;
         return !nativeContinuations.has(origin)
           && !["signed", "already_signed"].includes(loginOutcomes.get(origin)?.authoritativeCheckinStatus);
       });
@@ -586,7 +589,9 @@ try {
           console.log(`[recovery ${round + 1}.${recoveryIndex + 1}/${recoveryEntries.length}] ${target.origin}`);
           const loginOutcome = loginOutcomes.get(target.origin);
           const sameSessionStatus = loginOutcome?.authoritativeCheckinStatus;
-          let recoveredResult = nativeContinuations.get(target.origin) ?? (["signed", "already_signed"].includes(sameSessionStatus)
+          const loginGate = applyLoginRecoveryHandoff({status:'login_required'},loginOutcome);
+          let recoveredResult = (loginGate.failureCode === 'two_factor_required' ? loginGate : null)
+            ?? nativeContinuations.get(target.origin) ?? (["signed", "already_signed"].includes(sameSessionStatus)
             ? {
                 status: sameSessionStatus,
                 reason: sameSessionStatus === "signed"

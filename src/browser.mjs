@@ -26,8 +26,11 @@ import { readAfterNavigation } from "./page-state-read.mjs";
 import { inspectSiteMigrationPage, unapprovedBookmarkRedirect } from './site-migration.mjs';
 import { clickVisibleNativeChallengeControl } from "./native-checkin-action.mjs";
 import { readCloudflareFrameEvidence } from "./challenge-frame-state.mjs";
+import { readPageSnapshot, PAGE_CHALLENGE_SELECTOR } from './page-snapshot.mjs';
+import { classifyNavigationFailure, pausesUntilNextDay } from './site-availability.mjs';
 import { getCloudflareRecoveryRule, continueCloudflareRecovery, cloudflareRecoveryHandoff } from './cloudflare-recovery.mjs';
 import { readSequentialDailyQuota, sequentialCompletionKind, sequentialActionType, normalizeSequentialCompletedControl, sequentialCompletedControlMatches } from "./sequential-action-evidence.mjs";
+import { normalizeSequentialStatusCheck, readSequentialStatus } from './sequential-status.mjs';
 import {
   getConfiguredPreCheckinNavigationRule,
   getConfiguredPreCheckinTerminalPath,
@@ -65,7 +68,7 @@ const CANDIDATE_STATUS_PRIORITY = new Map([
   ["error", 30],
   ["no_action", 20],
 ]);
-export const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, .cap-verify, altcha-widget, .altcha, [data-altcha], [data-cap-api-endpoint], [class*="captcha" i]';
+export const CHALLENGE_SELECTOR = PAGE_CHALLENGE_SELECTOR;
 const CALENDAR_DAY_ACTION_SELECTOR = 'button, [role="button"], a[href], input[type="button"], input[type="submit"], [onclick], [tabindex]:not([tabindex="-1"]), [role="gridcell"], td, li, [data-date], [aria-current="date"], [data-today], [data-is-today]';
 
 function sleep(ms) {
@@ -415,6 +418,7 @@ export function getConfiguredSequentialActionRule(target, config = {}) {
       preferInteractive: step?.preferInteractive === true,
       completedTexts: normalizedSequentialTexts(step?.completedTexts, `顺序动作第 ${index + 1} 步完成文本`),
       completedControl: normalizeSequentialCompletedControl(step?.completedControl),
+      statusCheck: normalizeSequentialStatusCheck(step?.statusCheck, url),
       successTexts: normalizedSequentialTexts(step?.successTexts, `顺序动作第 ${index + 1} 步成功文本`),
       completedIncludes: normalizedSequentialTexts(step?.completedIncludes, `顺序动作第 ${index + 1} 步完成关键词`),
       successIncludes: normalizedSequentialTexts(step?.successIncludes, `顺序动作第 ${index + 1} 步成功关键词`),
@@ -603,71 +607,7 @@ async function snapshotState(page) {
 }
 
 async function snapshotStateOnce(page) {
-  const state = await page.evaluate((challengeSelector) => {
-    const bodyText = String(document.body?.innerText ?? "").slice(0, 30000);
-    const passwordInputs = [...document.querySelectorAll('input[type="password"]')]
-      .some((element) => {
-        const style = getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-      });
-    const challengeMatches = [...document.querySelectorAll(challengeSelector)];
-    const challengeRoots = challengeMatches.filter((element) => !challengeMatches.some((candidate) => (
-      candidate !== element && candidate.contains(element)
-    )));
-    const challengeEvidence = challengeRoots.map((element) => {
-      const style = getComputedStyle(element);
-      const rect = element.getBoundingClientRect();
-      const visible = style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-      const roots = [element, element.shadowRoot].filter(Boolean);
-      const stateElements = [element, ...roots.flatMap((root) => [...root.querySelectorAll(
-        'input[type="checkbox"], [aria-checked], [data-state], [data-status], [class*="success" i], [class*="verified" i], [class*="solved" i], [class*="complete" i], [class*="passed" i]',
-      )])];
-      const resolvedState = stateElements.some((candidate) => {
-        const className = typeof candidate.className === "string" ? candidate.className : "";
-        const stateText = [
-          candidate.getAttribute("data-state"),
-          candidate.getAttribute("data-status"),
-          className,
-        ].filter(Boolean).join(" ");
-        return candidate.checked === true
-          || candidate.getAttribute("aria-checked") === "true"
-          || /(?:^|[-_\s])(?:success|verified|solved|complete|completed|passed)(?:$|[-_\s])/i.test(stateText);
-      });
-      const responseElements = roots.flatMap((root) => [...root.querySelectorAll(
-        'textarea[name*="response" i], input[name*="response" i], textarea[name*="captcha" i], input[name*="captcha" i], input[name="altcha" i], [data-response]',
-      )]);
-      const responsePresent = responseElements.some((candidate) => {
-        const value = "value" in candidate ? candidate.value : candidate.getAttribute("data-response");
-        return String(value || "").trim().length > 0;
-      });
-      const explicitWidget = element.matches(
-        'iframe, .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, .cap-verify, altcha-widget, [data-altcha], [data-cap-api-endpoint]',
-      );
-      const challengeLike = explicitWidget || responseElements.length > 0 || roots.some((root) => root.querySelector(
-        'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], img[src*="captcha" i], img[alt*="captcha" i], canvas, input[type="checkbox"], [role="checkbox"], input[type="text"][name*="captcha" i], input[type="text"][id*="captcha" i], [data-sitekey]',
-      ));
-      let cloudflare = element.matches('.cf-turnstile');
-      try {
-        const url = new URL(element.getAttribute('src'));
-        cloudflare ||= url.protocol === 'https:' && (url.hostname === 'challenges.cloudflare.com'
-          || url.hostname.endsWith('.challenges.cloudflare.com'));
-      } catch { /* Non-frame widgets keep their existing evidence. */ }
-      return { visible, challengeLike, resolvedState, responsePresent, cloudflare };
-    });
-    const confirmedCheckinControl = [...document.querySelectorAll(
-      'button, [role="button"], input[type="button"], input[type="submit"]',
-    )].some((element) => {
-      const style = getComputedStyle(element);
-      const rect = element.getBoundingClientRect();
-      if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return false;
-      const text = String(
-        element.innerText || element.value || element.getAttribute("aria-label") || "",
-      ).replace(/\s+/g, " ").trim();
-      return /^(?:(?:今日|今天|当日|當日)\s*)?已\s*(?:完成\s*)?(?:签到|簽到)$/i.test(text);
-    });
-    return { bodyText, passwordInputs, challengeEvidence, confirmedCheckinControl };
-  }, CHALLENGE_SELECTOR);
+  const state = await page.evaluate(readPageSnapshot, CHALLENGE_SELECTOR);
   const frameEvidence = await readCloudflareFrameEvidence(page, new URL(page.url()).origin);
   const frameResolved = frameEvidence.length === 1 && (frameEvidence[0].resolvedState || frameEvidence[0].responsePresent);
   const challengeEvidence = [
@@ -688,6 +628,10 @@ async function snapshotStateOnce(page) {
     challengeSelectors: unresolvedChallenge,
     resolvedChallengeSelectors: resolvedChallenge && !unresolvedChallenge,
     confirmedCheckinControl: state.confirmedCheckinControl,
+    confirmedDailyText: state.confirmedDailyText,
+    unsignedTextObserved: state.unsignedTextObserved,
+    hasTwoFactorControl: state.hasTwoFactorControl,
+    loginRequiredTextObserved: state.loginRequiredTextObserved,
   });
   if (["signed", "already_signed"].includes(classification.status)) {
     const bodyClassification = classifyPageText({
@@ -695,6 +639,10 @@ async function snapshotStateOnce(page) {
       challengeSelectors: unresolvedChallenge,
       resolvedChallengeSelectors: resolvedChallenge && !unresolvedChallenge,
       confirmedCheckinControl: state.confirmedCheckinControl,
+      confirmedDailyText: state.confirmedDailyText,
+      unsignedTextObserved: state.unsignedTextObserved,
+      hasTwoFactorControl: state.hasTwoFactorControl,
+      loginRequiredTextObserved: state.loginRequiredTextObserved,
     });
     if (!["signed", "already_signed"].includes(bodyClassification.status)) return bodyClassification;
     classification.evidence = successEvidence("page_text", "page_completion_text");
@@ -1775,7 +1723,7 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
     return { done: true, status: phase === "before" ? "already_signed" : "signed", reason: "步骤动作控件确认已完成" };
   }
   if (kind === "response") {
-    return { done: true, status: "signed", reason: "步骤接口确认成功" };
+    return { done: true, status: "signed", evidenceSource: 'status_endpoint', reason: "步骤接口确认成功" };
   }
   return { done: false, state,explicitDailyUnsigned:evidence.explicitDailyUnsigned,eligibleDailyQuota:quota.eligible };
 }
@@ -1783,13 +1731,17 @@ async function readConfiguredSequentialStepEvidence(page, step, phase, responseC
 function watchConfiguredSequentialResponses(page, step, expectedOrigin) {
   let confirmed = false;
   let requestObserved = false;
+  let responseStatus = null;
+  let requestFailed = false;
   const pending = new Set();
   const matches = request => {
     try { const url = new URL(request.url()); return url.origin === expectedOrigin && step.responseEvidence.some(rule =>
       url.pathname.toLowerCase().includes(rule.urlIncludes) && rule.methods.includes(request.method().toUpperCase())); }
     catch { return false; }
   };
-  const requestHandler = request => { requestObserved ||= matches(request); };
+  const isSubmission = request => !['GET', 'HEAD', 'OPTIONS'].includes(request.method().toUpperCase()) && matches(request);
+  const requestHandler = request => { requestObserved ||= isSubmission(request); };
+  const failureHandler = request => { requestFailed ||= isSubmission(request); };
   const handler = (response) => {
     const task = (async () => {
       const request = response.request();
@@ -1805,6 +1757,7 @@ function watchConfiguredSequentialResponses(page, step, expectedOrigin) {
         }
       });
       if (!pathMatches) return;
+      if (isSubmission(request)) responseStatus = response.status();
       const json = await response.json().catch(() => null);
       confirmed ||= step.responseEvidence.some((rule) => configuredSequentialResponseProvesSuccess({
         url,
@@ -1818,12 +1771,18 @@ function watchConfiguredSequentialResponses(page, step, expectedOrigin) {
   };
   page.on("response", handler);
   page.on("request", requestHandler);
+  page.on("requestfailed", failureHandler);
   return {
     confirmed: () => confirmed,
     requestObserved: () => requestObserved,
+    diagnostics: () => ({ submissionRequestObserved: requestObserved,
+      submissionEvidenceConfigured: step.responseEvidence.length > 0,
+      ...(responseStatus === null ? {} : { submissionResponseStatus: responseStatus }),
+      ...(requestFailed ? { submissionRequestFailed: true } : {}) }),
     async stop() {
       page.off("response", handler);
       page.off("request", requestHandler);
+      page.off("requestfailed", failureHandler);
       await Promise.allSettled([...pending]);
       return confirmed;
     },
@@ -1833,10 +1792,17 @@ function watchConfiguredSequentialResponses(page, step, expectedOrigin) {
 async function waitForConfiguredSequentialStep(page, target, config, step, watcher) {
   const allowedOrigins = target.allowedOrigins ?? [target.origin];
   const deadline = Date.now() + step.waitMs;
+  let nextStatusRead = 0;
   do {
     assertBookmarkNavigation(page.url(), allowedOrigins);
     const evidence = await readConfiguredSequentialStepEvidence(page, step, "after", watcher.confirmed());
     if (evidence.done) return evidence;
+    if (step.statusCheck && Date.now() >= nextStatusRead) {
+      const status = await readSequentialStatus(page.request, step.statusCheck);
+      if (status.status === 'already_signed') return { done: true, status: 'signed',
+        evidenceSource: 'status_endpoint', reason: '步骤只读接口确认今日已签到' };
+      nextStatusRead = Date.now() + 1500;
+    }
     if (["login_required", "interactive_challenge", "managed_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(evidence.state?.status)) {
       return { done: false, terminal: evidence.state };
     }
@@ -1879,7 +1845,7 @@ export async function tryConfiguredSequentialActions(page, target, config) {
     const pending = await stepScope?.pending() ?? [];
     let continuationNeeded = false;
     const stepEvidence = observation => bindSuccessEvidence({...observation,url:page.url(),
-      evidence:successEvidence(observation.reason==='步骤动作控件确认已完成'?'user_rule':'page_text','sequential_step_confirmed'),
+      evidence:successEvidence(observation.evidenceSource ?? (observation.reason==='步骤动作控件确认已完成'?'user_rule':'page_text'),'sequential_step_confirmed'),
     },stepIdentity,config);
     await page.goto(assertBookmarkNavigation(step.url, allowedOrigins), {
       waitUntil: "domcontentloaded",
@@ -1896,6 +1862,17 @@ export async function tryConfiguredSequentialActions(page, target, config) {
         return partial(challengeState, step);
       }
       before = await readConfiguredSequentialStepEvidence(page, step, "before");
+    }
+    if (!before.done && step.statusCheck) {
+      const status = await readSequentialStatus(page.request, step.statusCheck);
+      if (status.status === 'already_signed') before = { done: true, status: 'already_signed',
+        evidenceSource: 'status_endpoint', reason: '步骤只读接口确认今日已签到' };
+      else if (status.status === 'not_signed') before.explicitDailyUnsigned = true;
+      else {
+        const unresolved = { status: status.status === 'login_required' ? 'login_required' : 'needs_attention',
+          failureCode: status.failureCode, reason: '步骤只读状态接口未确认当前每日状态，未执行提交', submissionAttempted: false };
+        return partial(reconcileSubmissionResult(unresolved, pending, stepIdentity, config), step);
+      }
     }
     if (before.done) {
       completionUsesUserRule ||= before.reason==='步骤动作控件确认已完成';
@@ -1930,10 +1907,14 @@ export async function tryConfiguredSequentialActions(page, target, config) {
       const clicked = await clickConfiguredSequentialAction(page, step, allowedOrigins, async () => {
         if (continuationNeeded) {
           const fresh = await readConfiguredSequentialStepEvidence(page, step, "before");
+          const endpoint = step.statusCheck ? await readSequentialStatus(page.request, step.statusCheck) : null;
+          if (endpoint && endpoint.status !== 'not_signed') throw new Error('只读接口未确认当前周期仍可提交，取消动作');
+          if (endpoint) fresh.explicitDailyUnsigned = true;
           if (fresh.done || !(step.dailyCheckin && fresh.explicitDailyUnsigned || step.dailyQuotaPattern && fresh.eligibleDailyQuota)) {
             throw new Error("当前周期动作状态已变化，取消提交");
           }
           await stepScope.beginNewCycleAfterVerifiedReadiness(dailyReadinessEvidence(stepIdentity,config,{
+            ...(endpoint ? { source: 'status_endpoint' } : {}),
             outcome:step.dailyCheckin ? "daily_checkin_not_signed" : "daily_quota_available",observedOrigin:new URL(page.url()).origin}));
         }
         attachSubmissionScope(page,stepScope??config[SUBMISSION_SCOPE]);
@@ -1949,19 +1930,19 @@ export async function tryConfiguredSequentialActions(page, target, config) {
         const activeOrigin = new URL(page.url()).origin;
         const challengeState = await runConfiguredChallengePhase(page, target, activeOrigin, config, "after");
         if (challengeState && ["login_required", "interactive_challenge", "managed_challenge_timeout", "deferred", "needs_attention"].includes(challengeState.status)) {
-          return partial({ ...challengeState, action: [...completedActions, actionText].join(" → ") }, step);
+          return partial({ ...challengeState, ...watcher.diagnostics(), action: [...completedActions, actionText].join(" → ") }, step);
         }
         confirmation = await waitForConfiguredSequentialStep(page, target, config, step, watcher);
       }
       if (confirmation.terminal) {
-        return partial({ ...confirmation.terminal, action: [...completedActions, actionText].join(" → ") }, step);
+        return partial({ ...confirmation.terminal, ...watcher.diagnostics(), action: [...completedActions, actionText].join(" → ") }, step);
       }
       if (!confirmation.done) {
         return partial({
           status: "needs_attention",
           reason: "顺序动作已执行，但页面或接口未提供权威完成证据",
           action: [...completedActions, actionText].join(" → "),
-          submissionRequestObserved: watcher.requestObserved(),
+          ...watcher.diagnostics(),
         }, step);
       }
       const observed=stepEvidence(confirmation);
@@ -1973,7 +1954,7 @@ export async function tryConfiguredSequentialActions(page, target, config) {
     } catch (error) {
       return partial({status:"needs_attention",reason:submissionStarted ? "顺序动作提交未确认，保留隔离记录" : "顺序动作点击预检未通过，未执行提交",
         failureCode:submissionStarted ? "sequential_submission_unconfirmed" : "sequential_action_not_ready",
-        submissionAttempted:submissionStarted,submissionRequestObserved:watcher.requestObserved(),
+        submissionAttempted:submissionStarted,...watcher.diagnostics(),
         detail:safeErrorMessage(error)}, step);
     } finally {
       if (submissionStarted) await stepScope?.observe({status:'unconfirmed'});
@@ -2551,6 +2532,8 @@ export async function processCandidate(page, target, candidateUrl, config, qaRul
     // A navigation failure that leaves the page on about:blank is still an
     // ordinary load error. Only an observed HTTP(S) destination proves drift.
     if (redirect?.migration?.destinationOrigin) return redirect;
+    const unavailable = classifyNavigationFailure(error);
+    if (unavailable) return withRetrySchedule(unavailable, config);
     throw error;
   }
   const migration = await inspectSiteMigrationPage(page, target);
@@ -3107,6 +3090,8 @@ async function processTargetInternal(context, target, config, qaRules, logDirect
   if (fast && !fast.fallback && fast.result) {
     return { ...fast.result, origin: target.origin, metrics: fast.metrics, attempt: 1, candidateHistory: [] };
   }
+  const withApiFallback = result => fast?.metrics?.failureKind
+    ? { ...result, metrics: { ...result.metrics, apiFirst: fast.metrics } } : result;
   let lastResult = null;
   const candidateHistory = [];
   const targetTimeoutMs = getTargetTimeoutMs(config);
@@ -3133,7 +3118,7 @@ async function processTargetInternal(context, target, config, qaRules, logDirect
           if (error instanceof TargetTimeoutError) {
             result = targetTimeoutResult(targetTimeoutMs, page.url());
             candidateHistory.push(candidateHistoryEntry(candidateUrl, result, attempt + 1));
-            return { ...result, attempt: attempt + 1, candidateHistory };
+            return withApiFallback({ ...result, attempt: attempt + 1, candidateHistory });
           }
           result = {
             status: "error",
@@ -3144,7 +3129,8 @@ async function processTargetInternal(context, target, config, qaRules, logDirect
         candidateHistory.push(candidateHistoryEntry(candidateUrl, result, attempt + 1));
         // A blocked verification must not be reopened through a second bookmark
         // candidate or a local retry. The caller still hands it to the user.
-        if (result.retryable === false || result.submissionAttempted === true) return { ...result, attempt: attempt + 1, candidateHistory };
+        if (result.retryable === false || result.retryableLoginRecovery === false
+          || result.submissionAttempted === true || pausesUntilNextDay(result)) return withApiFallback({ ...result, attempt: attempt + 1, candidateHistory });
         attemptResult = preferCandidateResult(attemptResult, result);
         lastResult = preferCandidateResult(lastResult, result);
         // A logical bookmark target can contain multiple related URLs.  One
@@ -3160,11 +3146,11 @@ async function processTargetInternal(context, target, config, qaRules, logDirect
         if (config.failureScreenshots && !COMPLETED.has(effectiveResult.status) && effectiveResult.status !== "login_required") {
           effectiveResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
         }
-        return { ...effectiveResult, attempt: attempt + 1, candidateHistory };
+        return withApiFallback({ ...effectiveResult, attempt: attempt + 1, candidateHistory });
       }
       if (effectiveResult?.status === "interactive_challenge") {
         if (config.failureScreenshots) effectiveResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
-        return { ...effectiveResult, attempt: attempt + 1, candidateHistory };
+        return withApiFallback({ ...effectiveResult, attempt: attempt + 1, candidateHistory });
       }
       if (effectiveResult && CHALLENGE.has(effectiveResult.status) && attempt === config.retryCount && config.failureScreenshots) {
         effectiveResult.screenshot = await saveFailureScreenshot(page, logDirectory, target);
@@ -3183,9 +3169,9 @@ async function processTargetInternal(context, target, config, qaRules, logDirect
 
     if (attempt < config.retryCount) await sleep(config.retryDelayMs);
   }
-  return {
+  return withApiFallback({
     ...(lastResult ?? { status: "error", reason: "未知错误" }),
     attempt: config.retryCount + 1,
     candidateHistory,
-  };
+  });
 }

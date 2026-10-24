@@ -7,7 +7,17 @@ import {
   parseLoginHelperResult,
   resolveLoginRecoveryUrl,
   shouldRecheckCheckinAfterLogin,
+  applyLoginRecoveryHandoff,
 } from "../src/login-recovery.mjs";
+
+test('explicit second-factor helper failure is preserved for manual handoff without leaking code values',()=>{
+  const result=loginHelperOutcome(JSON.stringify({status:'needs_attention',failureCode:'two_factor_required',otp:'123456'}));
+  assert.equal(result.retryableLoginRecovery,false);assert.equal(result.failureCode,'two_factor_required');
+  assert.doesNotMatch(JSON.stringify(result),/123456|otp/);
+  const outcome={attempts:[{method:'saved_password',...result}]};
+  assert.equal(applyLoginRecoveryHandoff({status:'login_required'},outcome).status,'needs_attention');
+  assert.equal(applyLoginRecoveryHandoff({status:'already_signed'},outcome).status,'already_signed');
+});
 
 test("登录助手必须明确返回 logged_in 才算成功", () => {
   assert.deepEqual(parseLoginHelperResult('startup\n{"status":"logged_in"}\n'), { status: "logged_in" });

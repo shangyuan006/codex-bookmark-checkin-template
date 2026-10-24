@@ -19,7 +19,7 @@ function boundedNumber(value, maximum) {
 
 export function sanitizeLinuxDoProbeDiagnostic(entry, now = new Date()) {
   if (!stages.has(entry?.stage)) return null;
-  return {
+  const safe = {
     recordedAt: now.toISOString(),
     stage: entry.stage,
     status: classifications.has(entry.status) ? entry.status : "unknown",
@@ -42,6 +42,16 @@ export function sanitizeLinuxDoProbeDiagnostic(entry, now = new Date()) {
       };
     }),
   };
+  // Summarize existing probes only. Never start another browser, share a
+  // session result across profiles, or cache an authenticated decision here.
+  safe.sessionPreflight = Object.fromEntries(['request','page'].map(surface => {
+    const observations = safe.observations.filter(item=>item.surface===surface && item.step==='session');
+    return [surface, { attempts:observations.length,
+      status:observations.at(-1)?.classification ?? 'unknown',
+      challengeObserved:observations.some(item=>item.challenge),
+      rateLimited:observations.some(item=>item.httpStatus===429) }];
+  }));
+  return safe;
 }
 
 export async function writeLinuxDoProbeDiagnostic(entry, {
