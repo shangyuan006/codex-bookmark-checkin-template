@@ -8,7 +8,9 @@ param(
     [switch]$ForceReauth,
     [switch]$PostOAuthVerify,
     [switch]$OverrideTodayAbandonment,
-    [switch]$DispatchManualHandoff
+    [switch]$DispatchManualHandoff,
+    [ValidatePattern('^[a-f0-9]{32}$')][string]$ResumeManualSessionId,
+    [ValidatePattern('^[a-f0-9]{32}$')][string]$ExecutionId = [guid]::NewGuid().ToString('N')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +25,7 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'CheckinCycle.ps1')
 . (Join-Path $PSScriptRoot 'TaskRetryPolicy.ps1')
 . (Join-Path $PSScriptRoot 'TaskRuntimeBudget.ps1')
+. (Join-Path $PSScriptRoot 'CheckinExecutionReport.ps1')
 $reporterScript = Join-Path $PSScriptRoot 'Submit-UnifiedCheckinReport.ps1'
 $outboxScript = Join-Path $PSScriptRoot 'Invoke-CheckinNotificationOutbox.ps1'
 $timeoutFinalizerScript = Join-Path $root 'src\finalize-timeout-report.mjs'
@@ -32,7 +35,6 @@ $manualSessionPath = Join-Path $root 'tmp\manual-session.json'
 $manualLaunchPath = Join-Path $root 'tmp\manual-handoff-launch.json'
 $manualHandoffPath = Join-Path $root 'tmp\manual-handoff.json'
 $manualAbandonPath = Join-Path $root 'tmp\manual-abandon.json'
-$startedAt = Get-Date
 $runnerStatus = 'failed'
 $runnerMessage = '签到任务尚未开始。'
 $nodeExitCode = 1
@@ -58,51 +60,9 @@ function Get-CurrentPlanFingerprint {
     return ''
 }
 
-function Get-FreshResumeReport([datetime]$NotBefore) {
-    $logsRoot = Join-Path $root 'logs'
-    if (-not (Test-Path -LiteralPath $logsRoot)) { return $null }
-    $candidates = @()
-    $latestPath = Join-Path $logsRoot 'latest.json'
-    if (Test-Path -LiteralPath $latestPath) { $candidates += Get-Item -LiteralPath $latestPath }
-    $candidates += @(Get-ChildItem -LiteralPath $logsRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        foreach ($name in @('result.json', 'progress.json')) {
-            $path = Join-Path $_.FullName $name
-            if (Test-Path -LiteralPath $path) { Get-Item -LiteralPath $path }
-        }
-    })
-    $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
-    $validCandidates = @()
-    foreach ($file in @($candidates | Where-Object { $_.LastWriteTime -ge $NotBefore.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending)) {
-        try {
-            $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $file.FullName | ConvertFrom-Json
-            if ([string]$value.runId -like "$todayPrefix*" -and $null -ne $value.results) {
-                $candidateFingerprint = [string]$value.planFingerprint
-                if (-not $candidateFingerprint -and $value.bookmarkSummary) {
-                    $candidateFingerprint = [string]$value.bookmarkSummary.planFingerprint
-                }
-                if ($currentPlanFingerprint -and $candidateFingerprint -and $candidateFingerprint -ne $currentPlanFingerprint) {
-                    continue
-                }
-                $plannedTotal = if ($null -ne $value.plannedTotal) { [int]$value.plannedTotal } else { 0 }
-                $processedTotal = if ($null -ne $value.processedTotal) { [int]$value.processedTotal } else { @($value.results).Count }
-                $completeFinal = [string]$value.runState -eq 'final' `
-                    -and $value.isComplete -eq $true `
-                    -and $plannedTotal -gt 0 `
-                    -and $processedTotal -ge $plannedTotal `
-                    -and @($value.results).Count -ge $plannedTotal
-                $validCandidates += [pscustomobject]@{
-                    Path = $file.FullName
-                    Report = $value
-                    LastWriteTime = $file.LastWriteTime
-                    CompleteFinal = $completeFinal
-                }
-            }
-        }
-        catch { }
-    }
-    return @($validCandidates | Sort-Object `
-        @{ Expression = { [int]$_.CompleteFinal }; Descending = $true }, `
-        @{ Expression = { $_.LastWriteTime }; Descending = $true } | Select-Object -First 1)[0]
+function Get-FreshResumeReport([int]$Attempt = 0) {
+    return Find-CheckinExecutionReport -LogsRoot (Join-Path $root 'logs') -ExecutionId $ExecutionId `
+        -Attempt $Attempt -PlanFingerprint $currentPlanFingerprint
 }
 
 function Get-TodayResumeReport {
@@ -221,9 +181,15 @@ function Test-RequestedOriginsAuthoritativelyComplete($Report, [string[]]$Reques
     return $true
 }
 
-function Test-NeedsSavedLoginSync($ResumeCandidate, [datetime]$Now) {
+function Test-NeedsSavedLoginSync($ResumeCandidate, [datetime]$Now, [string]$AccountKey, [bool]$VerifyOnly = $false,
+    [string[]]$ScopeOrigins = @()) {
+    # Reauth accounts use separate encrypted profiles; their read-only reward
+    # verification never needs to rewrite the ordinary site's login database.
+    if ($AccountKey -and $VerifyOnly) { return $false }
     if ($null -eq $ResumeCandidate) { return $true }
+    if (@($ScopeOrigins | Where-Object { $_ -notin @($ResumeCandidate.Report.results.origin) }).Count -gt 0) { return $true }
     foreach ($result in @($ResumeCandidate.Report.results)) {
+        if ($ScopeOrigins.Count -gt 0 -and [string]$result.origin -notin $ScopeOrigins) { continue }
         $isLoginProblem = [string]$result.status -eq 'login_required' `
             -or ([string]$result.status -eq 'deferred' -and [string]$result.retryCause -eq 'login_required')
         if (-not $isLoginProblem) { continue }
@@ -241,9 +207,25 @@ function Write-ManualHandoff($Report, [datetime]$Now = (Get-Date)) {
         return $false
     }
     $abandonedOrigins = Get-TodayAbandonedOrigins -Path $manualAbandonPath -Now $Now
+    $pending = Get-PendingManualVerification -Path $manualVerificationPath
+    $verificationOrigins = @()
+    $reopenOrigins = @()
+    if ($null -ne $pending -and (Test-ManualVerificationCurrentDayDocument $pending.Document $Now)) {
+        $verificationOrigins = @($pending.Origins)
+        # Only a fresh, consumed verification result can transfer ownership back to manual.
+        if ([string]$pending.Document.verificationRunId -ceq [string]$Report.runId `
+            -and (Test-IsCompleteFinalReport $Report) -and $Report.timeoutRecovered -ne $true) {
+            $reopenOrigins = @($Report.results | Where-Object {
+                $_.origin -in $verificationOrigins -and $_.origin -in @($Report.selectedOrigins) `
+                    -and (Test-ManualVerificationHandoffResult $_)
+            } | ForEach-Object { ConvertTo-ManualVerificationOrigin $_.origin })
+        }
+    }
     $targets = @(Get-ManualHandoffTargets $Report $Now | Where-Object {
-        $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
-        -not $origin -or -not $abandonedOrigins.ContainsKey($origin)
+        $origin = ConvertTo-ManualVerificationOrigin $_.origin
+        $abandonedOrigin = ConvertTo-ManualAbandonmentOrigin $_.origin
+        $origin -and (-not $abandonedOrigin -or -not $abandonedOrigins.ContainsKey($abandonedOrigin)) `
+            -and ($origin -notin $verificationOrigins -or $origin -in $reopenOrigins)
     })
     if ($targets.Count -eq 0) {
         Remove-Item -LiteralPath $manualHandoffPath -Force -ErrorAction SilentlyContinue
@@ -268,13 +250,17 @@ function Write-ManualHandoff($Report, [datetime]$Now = (Get-Date)) {
             [System.Text.UTF8Encoding]::new($false)
         )
         Move-Item -LiteralPath $temporaryPath -Destination $manualHandoffPath -Force
+        $transferredOrigins = @($targets | Where-Object { $_.origin -in $reopenOrigins } | ForEach-Object { $_.origin })
+        if ($transferredOrigins.Count -gt 0) {
+            Remove-ManualVerificationTransferredTargets -Pending $pending -Path $manualVerificationPath -Origins $transferredOrigins
+        }
     }
     finally {
         if (Test-Path -LiteralPath $temporaryPath) {
             Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
         }
     }
-    Write-Warning "自动签到已结束，$($targets.Count) 个站点等待人工接管；关闭手动窗口后将立即进行定向权威复核。"
+    Write-Warning "自动签到已结束，$($targets.Count) 个站点等待人工接管；关闭手动窗口后将立即进行定向签到复核。"
     return $true
 }
 
@@ -302,7 +288,11 @@ try {
     if (-not (Test-Path -LiteralPath $configPath)) { throw '尚未初始化，请先运行 scripts\Initialize-Checkin.ps1。' }
     $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
     $node = Resolve-CheckinNode $config
+    $ExecutionId = $ExecutionId.ToLowerInvariant()
     $requestedOrigins = @(Resolve-RequestedCheckinOrigins $Origins)
+    if ($ResumeManualSessionId -and ($DryRun -or $ReauthAccountKey -or $OverrideTodayAbandonment -or $requestedOrigins.Count -eq 0)) {
+        throw '保存会话后的续跑只允许定向消费待复核站点。'
+    }
     if ($ReauthAccountKey -and $requestedOrigins.Count -gt 0) {
         throw 'Origins 不能与 Agent Router 的 ReauthAccountKey 同时使用。'
     }
@@ -335,18 +325,18 @@ try {
     if (-not $wrapperMutexOwned) {
         $runnerStatus = 'busy'
         $runnerMessage = '已有一个签到 wrapper 正在运行，本次不重复启动。'
-        $nodeExitCode = 0
+        $nodeExitCode = 75
         $SuppressReport = $true
-        return
+        exit $nodeExitCode
     }
     if (-not $DryRun -and ((Test-Path -LiteralPath $manualSessionPath) `
         -or (Test-ManualHandoffLaunchActive -Path $manualLaunchPath))) {
         $runnerStatus = 'busy'
         $runnerMessage = '人工浏览器正在启动或处理，暂不启动自动签到；关闭窗口并保存状态后再定向复核。'
-        $nodeExitCode = 0
+        $nodeExitCode = 75
         $SuppressReport = $true
         Write-Warning $runnerMessage
-        return
+        exit $nodeExitCode
     }
     $currentPlanFingerprint = Get-CurrentPlanFingerprint
 
@@ -401,6 +391,18 @@ try {
             Write-Warning '手动复核记录不是今天的有效运行，未强制续跑；请重新打开待处理站点。'
         }
     }
+    if ($ResumeManualSessionId) {
+        $loginVerificationOrigins = @($manualVerification.Document.targets | Where-Object {
+            $targetSessionId = if ($_.PSObject.Properties['manualSessionId']) { [string]$_.manualSessionId }
+                else { [string]$manualVerification.Document.manualSessionId }
+            (Test-ManualLoginContinuationTarget $_) -and $targetSessionId -ceq $ResumeManualSessionId
+        } | ForEach-Object { ConvertTo-ManualVerificationOrigin $_.origin })
+        if ($null -eq $manualVerification -or [string]$manualVerification.Document.manualSessionId -cne $ResumeManualSessionId `
+            -or -not (Test-ManualVerificationCurrentDayDocument $manualVerification.Document) `
+            -or @($requestedOrigins | Where-Object { $_ -notin $loginVerificationOrigins }).Count -gt 0) {
+            throw '本次保存的人工登录复核范围已失效；未启动签到或预热。'
+        }
+    }
 
     $preflightConfigured = @($config.nativeWafPreflightUrls).Count -gt 0 -or @($config.nativeChallengePreflight).Count -gt 0
     $currentPreflightTargets = @()
@@ -415,11 +417,12 @@ try {
         if ($currentPreflightTargets.Count -eq 0) { throw '当前书签没有可用的预热目标。' }
     }
 
-    $shouldSyncSavedLogins = -not $DryRun `
-        -and (Test-NeedsSavedLoginSync $resumeCandidate (Get-Date)) `
+    $syncScope = if ($ReauthAccountKey) { @('https://agentrouter.org') } else { @($requestedOrigins) }
+    $shouldSyncSavedLogins = -not $DryRun -and -not $ResumeManualSessionId -and $null -eq $manualVerification `
+        -and (Test-NeedsSavedLoginSync $resumeCandidate (Get-Date) $ReauthAccountKey $PostOAuthVerify.IsPresent -ScopeOrigins @($syncScope)) `
         -and $config.syncBookmarkSavedLogins -eq $true
     if ($shouldSyncSavedLogins) {
-        & (Join-Path $PSScriptRoot 'Sync-ChromeSavedLogins.ps1')
+        & (Join-Path $PSScriptRoot 'Sync-ChromeSavedLogins.ps1') -Origins @($syncScope)
     }
 
     if ($DryRun) {
@@ -514,7 +517,8 @@ try {
             }
 
             Write-Output "开始签到任务级尝试 $attempt/$runAttempts。"
-            $attemptStartedAt = Get-Date
+            $attemptId = "$ExecutionId-$attempt"
+            $runArguments += @('--execution-attempt-id', $attemptId)
             $process = Start-Process -FilePath $node -ArgumentList $runArguments -NoNewWindow -PassThru
             $processStartedAt = $process.StartTime
             $finishedInTime = $process.WaitForExit($timeoutMinutes * 60 * 1000)
@@ -534,10 +538,10 @@ try {
                     break
                 }
                 [void](Remove-RunLockOwnedByProcess -LockPath $runLockPath -ProcessId $process.Id -ProcessStartedAt $processStartedAt)
-                $timeoutProgress = Get-FreshResumeReport $attemptStartedAt
+                $timeoutProgress = Get-FreshResumeReport $attempt
                 if ($null -ne $timeoutProgress -and [string]$timeoutProgress.Report.runState -eq 'in_progress') {
                     try {
-                        & $node $timeoutFinalizerScript --progress-report ([string]$timeoutProgress.Path) | Out-Null
+                        & $node $timeoutFinalizerScript --progress-report ([string]$timeoutProgress.Path) --execution-attempt-id $attemptId | Out-Null
                         if ($LASTEXITCODE -ne 0) { throw '超时进度报告补全失败。' }
                     }
                     catch {
@@ -550,7 +554,7 @@ try {
                 $runnerStatus = 'completed'
                 $runnerMessage = "任务级尝试 $attempt/$runAttempts 已结束，退出码 $nodeExitCode。"
             }
-            $freshCandidate = Get-FreshResumeReport $attemptStartedAt
+            $freshCandidate = Get-FreshResumeReport $attempt
             if ($null -ne $freshCandidate) {
                 $resumeCandidate = $freshCandidate
                 $manualHandoffCandidate = $freshCandidate
@@ -560,7 +564,8 @@ try {
                 -and (Test-RequestedOriginsAuthoritativelyComplete $freshCandidate.Report $requestedOrigins)) {
                 $nodeExitCode = 0
                 $runnerStatus = 'completed'
-                $runnerMessage = "$($requestedOrigins.Count) 个定向站点已取得权威签到结果。"
+                $completionSummary = Get-CheckinCompletionSummary @($freshCandidate.Report.results | Where-Object { $_.origin -in $requestedOrigins })
+                $runnerMessage = "$($requestedOrigins.Count) 个定向站点已确认完成。$completionSummary。"
                 $needsNativeFallbackRetry = $false
             }
             if ($ReauthAccountKey `
@@ -570,12 +575,12 @@ try {
                 if (Test-ReauthAccountAuthoritativelyComplete $freshCandidate.Report $ReauthAccountKey) {
                     $nodeExitCode = 0
                     $runnerStatus = 'completed'
-                    $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 已取得权威签到结果。"
+                    $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 已取得签到完成证据。"
                 }
                 else {
                     $nodeExitCode = 2
                     $runnerStatus = 'needs_attention'
-                    $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 未取得 signed 或 already_signed 权威结果。"
+                    $runnerMessage = "Agent Router accountKey '$ReauthAccountKey' 未取得 signed 或 already_signed 完成证据。"
                 }
             }
             if (-not $ReauthAccountKey `
@@ -597,10 +602,11 @@ try {
                     -RetryAt ((Get-Date).AddMinutes($retryDelayMinutes))
                 if ($manualAttemptUpdate.Updated) {
                     if ($manualAttemptUpdate.Complete) {
-                        Write-Output '手动操作后的定向权威复核已全部确认。'
+                        $completionSummary = Get-CheckinCompletionSummary @($freshCandidate.Report.results | Where-Object { $_.origin -in @($manualVerification.Document.targets.origin) })
+                        Write-Output "手动操作后的定向签到复核已全部确认。$completionSummary。"
                     }
                     else {
-                        Write-Output "手动操作后的定向权威复核仍有 $(@($manualAttemptUpdate.PendingOrigins).Count) 个待处理站点。"
+                        Write-Output "手动操作后的定向签到复核仍有 $(@($manualAttemptUpdate.PendingOrigins).Count) 个待处理站点。"
                     }
                 }
             }
@@ -665,7 +671,7 @@ catch {
 finally {
     if (-not $DryRun -and -not $SuppressReport) {
         try {
-            $notificationCandidate = Get-FreshResumeReport $startedAt
+            $notificationCandidate = Get-FreshResumeReport
             if ($null -ne $notificationCandidate) { & $reporterScript -RunnerStatus $runnerStatus -RunnerMessage $runnerMessage -ReportPath ([string]$notificationCandidate.Path) }
             else { & $reporterScript -RunnerStatus $runnerStatus -RunnerMessage $runnerMessage }
         }

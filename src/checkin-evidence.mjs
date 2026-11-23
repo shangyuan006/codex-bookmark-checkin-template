@@ -1,7 +1,7 @@
 import { safeLogUrl } from './security.mjs';
 import { checkinCycle } from './checkin-cycle.mjs';
 import { CHECKIN_CONTRACT } from './checkin-contract.generated.mjs';
-import { configuredSequentialActionTypes } from './sequential-action-evidence.mjs';
+import { configuredSequentialActionTypes, normalizeResultActionEntries } from './sequential-action-evidence.mjs';
 
 const success=new Set(CHECKIN_CONTRACT.successStatuses);
 const sources=new Set(['page_text','status_endpoint','reward_log','user_rule','reauth_state']);
@@ -40,7 +40,8 @@ export function isConfiguredTerminalCompletion(result, target, config = {}, now 
 }
 // Readiness is not completion. Only adapters that have freshly observed the
 // negative daily state (or an explicitly configured recurring reauth contract)
-// may construct it. Never infer it from a clickable button or a cached login.
+// may construct it. A generic clickable button or cached login is insufficient;
+// an exact locally reviewed daily state control may supply negative page text.
 export function dailyReadinessEvidence(target, config={}, {source="page_text", outcome="daily_checkin_not_signed", authoritative=true, observedOrigin=target.origin, now=new Date()}={}) {
   return {status:"not_signed",reason:"当前周期动作尚待执行",evidence:{source,outcome,authoritative,
     confirmedAt:now.toISOString(),binding:{...evidenceBinding(target,config,now),observedOrigin}}};
@@ -83,6 +84,7 @@ export function completionEvidenceKind(result,now=new Date()) {
 }
 
 export function normalizeBoundEvidenceResult(result,config,now=new Date()) {
+  result = normalizeResultActionEntries(result);
   if (result?.accountResults?.length) {
     const accountResults=result.accountResults.map(account=>normalizeBoundEvidenceResult({...account,origin:account.origin??result.origin},config,now));
     if (success.has(result.status)&&accountResults.some(account=>!success.has(account.status))) {
@@ -107,6 +109,7 @@ export function normalizeBoundEvidenceResult(result,config,now=new Date()) {
 }
 
 export function reconcileCheckinResult(result, evidence=result?.evidence, now=new Date(), context={}) {
+  result = normalizeResultActionEntries(result);
   if(!result||!success.has(result.status)) return result;
   const at=Date.parse(evidence?.confirmedAt??'');
   const valid=sources.has(evidence?.source)&&Number.isFinite(at)&&at<=now.getTime()

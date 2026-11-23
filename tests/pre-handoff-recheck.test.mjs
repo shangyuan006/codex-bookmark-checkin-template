@@ -152,6 +152,154 @@ test('cycle rollover during the delay prevents navigation', async () => {
   assert.equal(result.preHandoffReadOnlyRecheck.outcome, 'cycle_changed');
 });
 
+const historicalCalendarConfig = {
+  ...config, calendarDayCheckinOrigins: [origin],
+  preHandoffReadOnlyRecheckRules: { [origin]: { ...config.preHandoffReadOnlyRecheckRules[origin], includeHistoricalCalendarLocks: true } },
+};
+const previousDay = new Date(at.getTime() - 86_400_000);
+const historicalPending = () => ({ ...pending(origin, previousDay), submissionAttempted: false,
+  calendarDiagnostics: { reads: 4, dayButtonCount: 0, outcome: 'needs_attention' } });
+
+test('an opted-in historical calendar lock permits one read-only recheck without releasing the old lock', async t => {
+  const { runtime } = await journalFixture(t, historicalCalendarConfig, previousDay);
+  const before = await readSubmissionJournal(runtime.submissionJournalPath);
+  let reads = 0;
+  const [result] = await recheckBeforeManualHandoff([historicalPending()], [target], runtime, dependencies({
+    processTarget: (_context, identity, activeConfig) => runWithSubmissionJournal(runtime.submissionJournalPath,
+      identity, activeConfig, async active => {
+        reads++;
+        assert.equal(active.checkinReadOnly, true);
+        assert.equal(active.checkinObservationOnly, true);
+        return { ...completion(), calendarDiagnostics: { reads: 2, dayButtonCount: 1, outcome: 'already_signed' } };
+      }, { now: () => at }),
+  }));
+  assert.equal(reads, 1);
+  assert.equal(result.status, 'already_signed');
+  assert.equal(result.preHandoffReadOnlyRecheck.historicalCalendar, true);
+  assert.equal(result.preHandoffReadOnlyRecheck.outcome, 'confirmed');
+  assert.deepEqual(result.initialCalendarDiagnostics, historicalPending().calendarDiagnostics);
+  assert.equal(result.calendarDiagnostics.outcome, 'already_signed');
+  assert.equal(result.historicalSubmissionWarning.pendingCount, 1);
+  const after = await readSubmissionJournal(runtime.submissionJournalPath);
+  assert.equal(after.entries.length, 1);
+  assert.equal(after.entries[0].id, before.entries[0].id);
+  assert.equal(after.entries[0].cycleId, before.entries[0].cycleId);
+  assert.equal(after.entries[0].startedAt, before.entries[0].startedAt);
+  assert.equal(after.entries[0].state, 'uncertain');
+});
+
+test('an unconfirmed historical recheck retains the lock and cannot resubmit or recheck twice', async t => {
+  for (const status of ['ready', 'not_signed', 'interactive_challenge']) {
+    const { runtime } = await journalFixture(t, historicalCalendarConfig, previousDay);
+    let reads = 0;
+    const [result] = await recheckBeforeManualHandoff([historicalPending()], [target], runtime, dependencies({
+      processTarget: (_context, identity, activeConfig) => runWithSubmissionJournal(runtime.submissionJournalPath,
+        identity, activeConfig, async active => {
+          reads++;
+          assert.equal(active.checkinReadOnly, true);
+          return { status, calendarDiagnostics: { outcome: status } };
+        }, { now: () => at }),
+    }));
+    assert.equal(reads, 1);
+    assert.equal(result.failureCode, 'submission_quarantined');
+    assert.equal(result.submissionAttempted, false);
+    assert.deepEqual(result.calendarDiagnostics, historicalPending().calendarDiagnostics);
+    assert.equal(result.recheckCalendarDiagnostics.outcome, status);
+    const journal = await readSubmissionJournal(runtime.submissionJournalPath);
+    assert.equal(journal.entries.length, 1);
+    assert.equal(journal.entries[0].state, 'uncertain');
+    await recheckBeforeManualHandoff([result], [target], runtime, dependencies({
+      launchContext: async () => assert.fail('one recheck only'),
+    }));
+  }
+});
+
+test('historical calendar recheck requires explicit opt-in, valid age, default identity and ordinary action', async () => {
+  const cases = [
+    [historicalPending(), target, config],
+    [historicalPending(), target, { ...historicalCalendarConfig, calendarDayCheckinOrigins: [] }],
+    [{ ...historicalPending(), submissionAttempted: true }, target, historicalCalendarConfig],
+    ...['invalid', null, at.toISOString(), new Date(at.getTime() + 86_400_000).toISOString()].map(time => [
+      { ...historicalPending(), quarantine: { ...historicalPending().quarantine, firstAttemptAt: time } }, target, historicalCalendarConfig,
+    ]),
+    [{ ...historicalPending(), quarantine: { ...historicalPending().quarantine, pendingCount: 0 } }, target, historicalCalendarConfig],
+    [{ ...historicalPending(), accountKey: 'other' }, target, historicalCalendarConfig],
+    [historicalPending(), { ...target, accountKey: 'other' }, historicalCalendarConfig],
+    [historicalPending(), { ...target, actionType: 'draw' }, historicalCalendarConfig],
+    [{ ...historicalPending(), actionType: 'reauth' }, target, historicalCalendarConfig],
+    [historicalPending(), target, { ...historicalCalendarConfig, agentrouterAccounts: [{ origin }] }],
+  ];
+  for (const [result, identity, activeConfig] of cases) {
+    const actual = await recheckBeforeManualHandoff([result], [identity], activeConfig, dependencies({
+      wait: async () => assert.fail('must not wait'), launchContext: async () => assert.fail('must not launch'),
+    }));
+    assert.equal(actual[0], result);
+  }
+});
+
+test('offline Edge reads a delayed historical calendar completion with zero clicks or POSTs', {
+  skip: process.env.CHECKIN_BROWSER_FIXTURES !== '1', timeout: 40_000,
+}, async t => {
+  const { chromium } = await import('playwright-core');
+  const { processTarget } = await import('../src/browser.mjs');
+  const browser = await chromium.launch({ channel: 'msedge', headless: true });
+  t.after(() => browser.close());
+  const actual = new Date();
+  const old = new Date(actual.getTime() - 86_400_000);
+  // Keep the fixture navigation outside the mutation-route matcher so the
+  // page-level submit guard can block POSTs without bypassing context routing.
+  const { root, runtime } = await journalFixture(t, { ...historicalCalendarConfig,
+    calendarDayCheckinPaths: { [origin]: ['/calendar'] } }, old);
+  const calendarTarget = { ...target, candidates: [`${origin}/calendar`] };
+  const day = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', day: 'numeric' }).format(actual);
+  let posts = 0, clicks = 0, navigations = 0, closed = 0;
+  let observed;
+  let releaseImage;
+  const imagePending = new Promise(resolve => { releaseImage = resolve; });
+  t.after(() => releaseImage());
+  const [result] = await recheckBeforeManualHandoff([{ ...pending(origin, old), submissionAttempted: false }],
+    [calendarTarget], runtime, dependencies({
+      now: () => new Date(),
+      launchContext: async () => {
+        const context = await browser.newContext();
+        await context.exposeBinding('recordClick', () => { clicks++; });
+        await context.route(`${origin}/**`, async route => {
+          if (new URL(route.request().url()).pathname === '/slow.png') {
+            await imagePending;
+            await route.abort().catch(() => {});
+            return;
+          }
+          if (route.request().method() === 'POST') posts++;
+          if (route.request().isNavigationRequest()) navigations++;
+          await route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+            <a href="/logout">退出登录</a><img src="/slow.png"><div id="calendar">正在加载</div>
+            <script>document.addEventListener('click', () => window.recordClick());
+            fetch('/api/checkin', {method:'POST'}).catch(() => {});
+            setTimeout(() => document.querySelector('#calendar').innerHTML =
+              '<table><tr><td data-today="true"><button disabled>${day}</button>已签到</td></tr></table>', 500);
+            </script>` });
+        });
+        return context;
+      },
+      processTarget: async (context, identity, readOnlyConfig) => {
+        observed = await processTarget(context, identity, readOnlyConfig, [], root);
+        return observed;
+      },
+      closeContext: async context => { releaseImage(); await context.close(); closed++; return { closed: true }; },
+    }));
+  assert.equal(result.status, 'already_signed', JSON.stringify({ result, observed }));
+  assert.equal(result.evidence?.outcome, 'calendar_day_confirmed');
+  assert.equal(result.preHandoffReadOnlyRecheck.historicalCalendar, true);
+  assert.equal(result.calendarDiagnostics.session, 'authenticated');
+  assert.equal(result.calendarDiagnostics.loaded, false);
+  assert.equal(result.calendarDiagnostics.domReady, true);
+  assert.deepEqual([clicks, posts, navigations, closed], [0, 0, 1, 1]);
+  const journal = await readSubmissionJournal(runtime.submissionJournalPath);
+  assert.equal(journal.entries.length, 1);
+  assert.equal(journal.entries[0].startedAt, old.toISOString());
+  assert.equal(journal.entries[0].state, 'uncertain');
+});
+
 test('failed cleanup or a previously blocked browser prevents further launches', async () => {
   const secondOrigin = 'https://second.example';
   const second = { origin: secondOrigin, candidates: [`${secondOrigin}/profile`] };

@@ -1,4 +1,5 @@
 import { nativeChallengeFrameIsAllowed } from './native-checkin-action.mjs';
+import { readChallengeWidgetReadiness } from './challenge-widget-readiness.mjs';
 
 // Read the browser frame tree as well as the light DOM. A closed-shadow
 // Turnstile frame can be absent from document.querySelectorAll('iframe').
@@ -12,10 +13,8 @@ export async function readCloudflareFrameEvidence(page, expectedOrigin) {
     if (!element || !await element.isVisible().catch(()=>false)) continue;
     const box=await element.boundingBox().catch(()=>null);
     if (!box || box.width<=0 || box.height<=0) continue;
-    const resolvedState=await frame.evaluate(()=>Boolean(document.querySelector(
-      'input[type="checkbox"]:checked, [role="checkbox"][aria-checked="true"], [data-state="success"], [data-status="verified"]',
-    ))).catch(()=>false);
-    visibleFrames.push({visible:true,challengeLike:true,resolvedState,responsePresent:false});
+    const readiness = await readChallengeWidgetReadiness(frame);
+    visibleFrames.push({visible:true,challengeLike:true,...readiness,responsePresent:false});
   }
   if (visibleFrames.length===1) {
     visibleFrames[0].responsePresent=await page.evaluate(()=>[...document.querySelectorAll(

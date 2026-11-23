@@ -4,6 +4,7 @@ import { atomicWriteJson } from "./security.mjs";
 import { acquireRunLock, releaseRunLock } from "./run-lock.mjs";
 import { reconcileCheckinResult } from "./checkin-evidence.mjs";
 import { isTerminalResult } from "./result-contract.mjs";
+import { newerUnresolvedObservation, failureObservation } from './result-observation.mjs';
 
 function dayKey(at) {
   return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Shanghai",year:"numeric",month:"2-digit",day:"2-digit"}).format(at).replaceAll("-","");
@@ -36,6 +37,30 @@ function completionForTarget(target,result,now,config) {
   if((result.actionType??"checkin")!==(target.actionType??"checkin")) return null;
   return validManualCompletion(result,now,config) ? result : null;
 }
+function updatePendingObservation(target, result, document, report, now, kind, config) {
+  if (!result || result.origin !== target.origin || validManualCompletion({ ...target, status: target.verificationStatus }, now, config)) return false;
+  const keys = target.accountKeys?.length ? target.accountKeys : target.accountKey ? [target.accountKey] : null;
+  const selected = keys ? keys.map(key => (result.accountResults ?? [result]).find(item => item.accountKey === key)) : [result];
+  if (selected.some(item => !item)) return false;
+  const actionType = target.actionType ?? (keys && selected.every(item => item.actionType === 'reauth') ? 'reauth' : 'checkin');
+  if (selected.some(item => (item.actionType ?? 'checkin') !== actionType)) return false;
+  if (!keys && result.accountKey && result.accountKey !== 'default') return false;
+  // A whole-site task may carry substeps, but an isolated substep cannot clear
+  // or replace that task's observation. Store only the scoped failure summary.
+  const observation = keys ? selected.find(item => !isTerminalResult(item, now)) : result;
+  if (!observation) return false;
+  const incoming = { ...failureObservation(observation, observation.observedAt ?? report.finishedAt), origin: target.origin, actionType };
+  const current = { origin: target.origin, actionType, status: target.verificationStatus ?? target.previousStatus ?? 'needs_attention',
+    observedAt: target.lastObservation?.observedAt ?? target.observedAt ?? document.verifiedAt ?? document.createdAt };
+  const updated = newerUnresolvedObservation(current, incoming, { incomingAt: report.finishedAt, now });
+  if (!updated) return false;
+  target.lastObservation = failureObservation(updated, updated.observedAt);
+  if (kind === 'verification') Object.assign(target, { verificationStatus: observation.status, verificationReason: observation.reason });
+  else Object.assign(target, { previousStatus: observation.status, reason: observation.reason });
+  if (observation.failureCode) target.failureCode = observation.failureCode;
+  else delete target.failureCode;
+  return true;
+}
 export function reconcileManualDocument(document,report,kind,{now=new Date(),config={}}={}) {
   if(report?.runState!=="final" || report?.isComplete!==true || !Array.isArray(report.results)
     || !sameDayDocument(document,report,now)) return {document,changed:false};
@@ -47,7 +72,7 @@ export function reconcileManualDocument(document,report,kind,{now=new Date(),con
   if(kind==="verification") {
     for (const target of updated.targets??[]) {
       const result=completionForTarget(target,results.get(target.origin),now,config);
-      if(!result) continue;
+      if(!result) { changed = updatePendingObservation(target, results.get(target.origin), document, report, now, kind, config) || changed; continue; }
       if(target.verificationStatus===result.status && JSON.stringify(target.evidence)===JSON.stringify(result.evidence)) continue;
       Object.assign(target,{verificationStatus:result.status,verificationReason:result.reason,evidence:result.evidence,
         cycle:result.cycle,actionType:result.actionType,accountKey:result.accountKey,accountResults:result.accountResults,
@@ -67,7 +92,7 @@ export function reconcileManualDocument(document,report,kind,{now=new Date(),con
     const completed=[];
     updated.targets=(updated.targets??[]).filter(target=>{
       const result=completionForTarget(target,results.get(target.origin),now,config);
-      if(!result) return true;
+      if(!result) { changed = updatePendingObservation(target, results.get(target.origin), document, report, now, kind, config) || changed; return true; }
       completed.push({...target,verificationStatus:result.status,evidence:result.evidence,cycle:result.cycle,
         accountResults:result.accountResults,actionType:result.actionType,accountKey:result.accountKey,
         allowedOrigins:result.allowedOrigins,actionResults:result.actionResults,requiredActionTypes:result.requiredActionTypes});
@@ -80,6 +105,7 @@ export function reconcileManualDocument(document,report,kind,{now=new Date(),con
       updated.reconciledFromRunId=report.runId;
       updated.reconciledAt=now.toISOString();
     }
+    if (changed) { updated.reconciledFromRunId = report.runId; updated.reconciledAt = now.toISOString(); }
   }
   return {document:updated,changed};
 }

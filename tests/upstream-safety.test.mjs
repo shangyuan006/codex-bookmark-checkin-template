@@ -210,6 +210,37 @@ test('release refuses a running task and a pending manual handoff',async t=>{
   try {await assert.rejects(applyRelease(base,bundle),/正在运行/);} finally {await releaseRunLock(lease);}
   await fs.writeFile(path.join(base,'tmp/manual-verification.json'),JSON.stringify({state:'pending_verification'}));await assert.rejects(applyRelease(base,bundle),/manual handoff/);
 });
+for (const marker of ['manual-session.json', 'agentrouter-manual-state.json', 'manual-handoff-launch.json']) {
+  test(`release and rollback refuse active ${marker} without changing code`, async t => {
+    const {base,bundle} = await releaseFixture(t);
+    const applied = await applyRelease(base,bundle);
+    const before = await fs.readFile(path.join(base,'src/example.mjs'),'utf8');
+    const backups = await fs.readdir(path.join(base,'data/code-update-backups'));
+    await fs.writeFile(path.join(base,'tmp',marker),'{}');
+    await assert.rejects(applyRelease(base,bundle), /active manual session/);
+    await assert.rejects(applyRelease(base,applied.backup,{rollback:true}), /active manual session/);
+    assert.equal(await fs.readFile(path.join(base,'src/example.mjs'),'utf8'),before);
+    assert.deepEqual(await fs.readdir(path.join(base,'data/code-update-backups')),backups);
+  });
+}
+for (const state of ['awaiting_manual_handoff','awaiting_manual_verification','in_progress','starting','awaiting_user']) {
+  test(`release refuses ${state} before making backups`, async t => {
+    const {base,bundle} = await releaseFixture(t);
+    await fs.mkdir(path.join(base,'tmp'),{recursive:true});
+    await fs.writeFile(path.join(base,'tmp/manual-handoff.json'),JSON.stringify({state}));
+    await assert.rejects(applyRelease(base,bundle), /manual handoff/);
+    assert.equal(await fs.readFile(path.join(base,'src/example.mjs'),'utf8'),'old code\n');
+    await assert.rejects(fs.access(path.join(base,'data/code-update-backups')));
+  });
+}
+test('release fails closed on unreadable handoff state', async t => {
+  const {base,bundle} = await releaseFixture(t);
+  await fs.mkdir(path.join(base,'tmp'),{recursive:true});
+  await fs.writeFile(path.join(base,'tmp/manual-verification.json'),'{invalid');
+  await assert.rejects(applyRelease(base,bundle));
+  assert.equal(await fs.readFile(path.join(base,'src/example.mjs'),'utf8'),'old code\n');
+  await assert.rejects(fs.access(path.join(base,'data/code-update-backups')));
+});
 test('generated JavaScript and PowerShell status contracts have no drift',async()=>{
   await promisify(execFile)(process.execPath,['scripts/generate-checkin-contract.mjs','--check'],{cwd:path.resolve('.'),windowsHide:true});
 });

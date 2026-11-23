@@ -6,13 +6,18 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "health": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Test-CheckinHealth.ps1",
+    "health": "node src/health-cli.mjs",
     "preflight": "node src/preflight.mjs",
     "dry-run": "node src/index.mjs --dry-run",
     "status": "node src/status-dashboard.mjs",
+    "unknown:summary": "node src/unknown-summary.mjs",
     "contract:generate": "node scripts/generate-checkin-contract.mjs",
     "contract:check": "node scripts/generate-checkin-contract.mjs --check",
     "release": "node src/code-release.mjs",
+    "modules:check": "node src/module-reachability.mjs",
+    "modules:report": "node src/module-reachability.mjs --json",
+    "integrity:check": "node src/runtime-integrity.mjs",
+    "integrity:record": "node src/runtime-integrity.mjs --record",
     "start": "node src/index.mjs"
   },
   "dependencies": {

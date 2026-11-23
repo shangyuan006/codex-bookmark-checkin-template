@@ -5,7 +5,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { linuxDoAuthorizationRequiresLogin } from '../src/oauth-linuxdo-login.mjs';
 import { reauthLoginFailureResult, shouldRetryOAuthFailureStage } from '../src/reauth-checkin.mjs';
-import { isConfiguredProviderAuthorizationPage, authorizeConfiguredOAuthProvider } from '../src/oauth-provider-authorization.mjs';
+import { authorizeConfiguredOAuthProvider } from '../src/oauth-provider-authorization.mjs';
+import { continueOAuthProviderReturn } from '../src/oauth-provider-return.mjs';
+import { createOAuthTimeBudget } from '../src/oauth-time-budget.mjs';
 const exec = promisify(execFile);
 const fakePage = (url, password = false) => ({ url: () => url, locator: () => ({ count: async () => password ? 1 : 0 }) });
 
@@ -21,30 +23,23 @@ test('only an official LinuxDO login surface routes back to provider recovery', 
 });
 
 test('production authorization stage reports a provider login redirect rather than completed authorization', async () => {
-  const source = await fs.readFile(new URL('../src/oauth-login.mjs', import.meta.url), 'utf8');
-  const start = source.indexOf('  if (isConfiguredProviderAuthorizationPage(page.url(), provider)) {');
-  const end = source.indexOf('\n  setOAuthStage("target_callback");', start);
-  assert.ok(start >= 0 && end > start);
-  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  const execute = new AsyncFunction('page', 'isConfiguredProviderAuthorizationPage', 'linuxDoAuthorizationRequiresLogin', `
-    const provider='LinuxDO', providerWaitMs=1000, privateResult=false, config={};
-    const timeBudget={deadline:(_,ms)=>Date.now()+ms};
-    let oauthStage=null, authorizationOutcome=null, providerAuthorizationChallengeOutcome=null, providerAuthorizationChallengeClicks=0;
-    const setOAuthStage=value=>{oauthStage=value;};
-    const authorizeConfiguredOAuthProvider=async()=>({clicked:true,outcome:'authorization_clicked'});
-    const describeConfiguredAuthorizationSurface=async()=>({challengeFrameCount:0});
-    const clickConfiguredLoginChallengeControl=async()=>false;
-    try { ${source.slice(start, end)} } catch {}
-    return {oauthStage,authorizationOutcome};
-  `);
   for (const destination of ['https://linux.do/login', 'https://target.example/callback']) {
-    let current = 'https://connect.linux.do/oauth2/authorize';
-    const page = { ...fakePage(current, destination.includes('linux.do')), url: () => current,
-      waitForTimeout: async () => { current = destination; }, waitForLoadState: async () => {} };
-    const result = await execute(page, isConfiguredProviderAuthorizationPage, linuxDoAuthorizationRequiresLogin);
+    let current = 'https://connect.linux.do/oauth2/authorize', clock = 0, stage = null;
+    const page = { url: () => current, locator: () => ({ count: async () => current.includes('linux.do/login') ? 1 : 0 }),
+      waitForTimeout: async ms => { clock += ms; current = destination; }, waitForLoadState: async () => {} };
+    const result = await continueOAuthProviderReturn(page, 'https://target.example', 'LinuxDO', {}, {
+      now: () => clock, waitMs: 1000, timeBudget: createOAuthTimeBudget({ now: () => clock }),
+      onStage: value => { stage = value; }, authorize: async () => ({ clicked: true, outcome: 'authorization_clicked' }),
+      recoverLogin: async () => ({ recovered: false }),
+    });
     if (destination.includes('linux.do')) {
-      assert.deepEqual(result, { oauthStage: 'linuxdo_provider_login_required', authorizationOutcome: 'provider_login_required' });
-    } else assert.equal(result.authorizationOutcome, 'authorization_departed');
+      assert.equal(stage, 'linuxdo_provider_login_required');
+      assert.equal(result.authorizationOutcome, 'provider_login_required');
+      assert.equal(result.readyForCallback, false);
+    } else {
+      assert.equal(result.authorizationOutcome, 'authorization_departed');
+      assert.equal(result.readyForCallback, true);
+    }
   }
 });
 
@@ -57,25 +52,9 @@ test('provider-login expiry is a non-retryable handoff with a precise reason', (
 });
 
 test('production OAuth handles consent and approval challenges before entering target callback', async () => {
-  const source = await fs.readFile(new URL('../src/oauth-login.mjs', import.meta.url), 'utf8');
-  const start = source.indexOf('  if (isConfiguredProviderAuthorizationPage(page.url(), provider)) {');
-  const end = source.indexOf('\n  setOAuthStage("target_callback");', start);
-  assert.ok(start >= 0 && end > start);
-  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  const execute = new AsyncFunction('page', 'isConfiguredProviderAuthorizationPage', 'authorizeConfiguredOAuthProvider',
-    'clickConfiguredLoginChallengeControl', 'describeConfiguredAuthorizationSurface', 'clock', `
-    const Date={now:()=>clock.value}, provider='LinuxDO', providerWaitMs=5000, privateResult=false, config={};
-    const timeBudget={deadline:(_,ms)=>Date.now()+ms};
-    const linuxDoAuthorizationRequiresLogin=async()=>false;
-    let oauthStage=null, authorizationOutcome=null, providerAuthorizationChallengeOutcome=null, providerAuthorizationChallengeClicks=0;
-    const setOAuthStage=value=>{oauthStage=value;};
-    let failed=false;
-    try { ${source.slice(start, end)} } catch {failed=true;}
-    return {failed,oauthStage,authorizationOutcome,providerAuthorizationChallengeClicks,providerAuthorizationChallengeOutcome};
-  `);
   for (const blockedApproval of [false, true]) {
     const clock = { value: 0 };
-    let phase = 'initial_challenge', consentClicks = 0, approvalClicked = false, approvalWaits = 0;
+    let phase = 'initial_challenge', consentClicks = 0, approvalClicked = false, approvalWaits = 0, stage = null;
     const page = {
       url: () => phase === 'callback' ? 'https://target.example/callback'
         : phase === 'approval' ? 'https://connect.linux.do/oauth2/approve/fixture-request'
@@ -96,13 +75,17 @@ test('production OAuth handles consent and approval challenges before entering t
       return false;
     };
     const describe = async () => ({ challengeFrameCount: ['initial_challenge','approval'].includes(phase) ? 1 : 0 });
-    const result = await execute(page, isConfiguredProviderAuthorizationPage, authorizeConfiguredOAuthProvider, clickChallenge, describe, clock);
+    const result = await continueOAuthProviderReturn(page, 'https://target.example', 'LinuxDO', {}, {
+      now: () => clock.value, waitMs: 5000, timeBudget: createOAuthTimeBudget({ now: () => clock.value }),
+      authorize: authorizeConfiguredOAuthProvider, clickChallenge, describe, requiresLogin: async () => false,
+      onStage: value => { stage = value; },
+    });
     assert.equal(consentClicks, 1, 'Never resubmit consent on the approval page');
     assert.equal(result.providerAuthorizationChallengeClicks, 2);
-    assert.equal(result.failed, blockedApproval);
+    assert.equal(result.readyForCallback, !blockedApproval);
     assert.equal(result.authorizationOutcome, blockedApproval ? 'provider_challenge_unresolved' : 'authorization_departed');
     assert.equal(result.providerAuthorizationChallengeOutcome, blockedApproval ? 'unresolved_after_click' : 'departed_unconfirmed');
-    assert.equal(result.oauthStage, 'provider_authorization');
+    assert.equal(stage, 'provider_authorization');
     assert.ok(clock.value <= 5500, 'Unresolved approval must have a finite wait');
   }
 });
@@ -117,7 +100,7 @@ test('production native fallback opens only LinuxDO and records sequential conti
     $ProviderOnly=$false; $ContinueToAgentRouter=$false; $providerChallengeHandoff=$true
     $browser=[pscustomobject]@{ProcessName='fixture.exe'}; $profile='fixture'
     $automaticResult=[pscustomobject]@{oauthStage='linuxdo_provider_login_required';authorizationOutcome='provider_login_required'}
-    function Get-CimInstance { @() }; function Get-AgentRouterTargetCompletionProbe { 'unconfirmed' }
+    function Get-CheckinProfileBrowserProcesses { @() }; function Get-AgentRouterTargetCompletionProbe { 'unconfirmed' }
     if ($true) {
     ${source.slice(start, end)}
     [pscustomobject]@{providerOnly=[bool]$ProviderOnly;agentRouterOnly=[bool]$AgentRouterOnly;

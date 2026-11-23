@@ -30,6 +30,7 @@ function Resolve-NativeProfilePath([string]$ConfiguredPath) {
 . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
 . (Join-Path $PSScriptRoot 'ManualAbandonment.ps1')
 . (Join-Path $PSScriptRoot 'NativePreflightCheckpoint.ps1')
+. (Join-Path $PSScriptRoot 'NativePreflightBrowserClose.ps1')
 $preflightPath = Join-Path $root 'tmp\native-waf-preflight.json'
 $node = Resolve-CheckinNode $config
 $browser = Resolve-CheckinBrowser $config
@@ -50,6 +51,9 @@ $items = @($config.nativeWafPreflightUrls | ForEach-Object {
         passiveOnly = $passiveOnly
         action = $null
         newApiCheckin = $false
+        calendarDayCheckin = $false
+        dailyFormCheckin = $false
+        samePageCheckin = $false
         nativeMinimal = $false
         maxAttempts = 2
         profilePath = Resolve-NativeProfilePath $(if ($profileConfigured) { [string]$_.automationUserDataDir } else { '' })
@@ -62,12 +66,42 @@ $items += @($config.nativeChallengePreflight | ForEach-Object {
     $passiveOnly = [bool]$_.passiveOnly
     $action = if ($null -ne $_.action) { $_.action } else { $null }
     $newApiCheckin = [bool]$_.newApiCheckin
+    $calendarDayCheckin = [bool]$_.calendarDayCheckin
+    $dailyFormCheckin = [bool]$_.dailyFormCheckin
+    $samePageCheckin = [bool]$_.samePageCheckin
     $entryOrigin = $uri.GetLeftPart([System.UriPartial]::Authority)
+    if ($samePageCheckin) {
+        if ($passiveOnly -or $newApiCheckin -or $calendarDayCheckin -or $dailyFormCheckin -or $null -ne $action) {
+            throw '原生同页签到不能与其他原生动作同时配置。'
+        }
+        $samePageRule = $config.samePageManualCheckinRules.$entryOrigin
+        $samePageSteps = @($config.sequentialActionRules.$entryOrigin.steps)
+        if ($samePageRule.browserMode -ne 'native' -or $samePageRule.enabled -eq $false `
+            -or [string]$samePageRule.expectedPath -ne [string]$uri.AbsolutePath `
+            -or $samePageSteps.Count -ne 1 -or -not $samePageRule.sequentialActionType `
+            -or [string]$samePageSteps[0].actionType -ne [string]$samePageRule.sequentialActionType `
+            -or [uri][string]$samePageSteps[0].url -ne $uri) {
+            throw '原生同页签到必须使用匹配的精确路径和单步顺序规则。'
+        }
+    }
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "原生验证预热地址无效：$($_.url)" }
     if ($waitSeconds -lt 5 -or $waitSeconds -gt 120) { throw "原生验证等待时间必须为 5 到 120 秒：$($_.url)" }
     if ($passiveOnly -and $null -ne $action) { throw "被动原生验证不能同时配置签到动作：$($_.url)" }
     if ($passiveOnly -and $newApiCheckin) { throw "被动原生验证不能同时配置 New API 签到：$($_.url)" }
     if ($null -ne $action -and $newApiCheckin) { throw "原生按钮签到和 New API 签到不能同时配置：$($_.url)" }
+    if ($calendarDayCheckin -and ($passiveOnly -or $newApiCheckin -or $null -ne $action)) {
+        throw '原生日历签到不能与其他原生动作同时配置。'
+    }
+    if ($calendarDayCheckin -and @($config.calendarDayCheckinOrigins) -notcontains $entryOrigin) {
+        throw '原生日历签到必须使用已配置的日历站点和路径。'
+    }
+    if ($dailyFormCheckin -and ($passiveOnly -or $newApiCheckin -or $calendarDayCheckin -or $null -ne $action)) {
+        throw '原生每日表单签到不能与其他原生动作同时配置。'
+    }
+    if ($dailyFormCheckin -and ($null -eq $config.preCheckinNavigationRules.$entryOrigin.dailyUnsignedForm `
+        -or [string]$uri.AbsolutePath -notin @('/','/index.php'))) {
+        throw '原生每日表单签到必须配置每日表单规则并从首页可见入口开始。'
+    }
     if ($newApiCheckin -and @($config.newApiCheckinOrigins) -notcontains $entryOrigin) {
         throw "原生 New API 签到来源未加入 newApiCheckinOrigins：$($_.url)"
     }
@@ -89,6 +123,9 @@ $items += @($config.nativeChallengePreflight | ForEach-Object {
         passiveOnly = $passiveOnly
         action = $action
         newApiCheckin = $newApiCheckin
+        calendarDayCheckin = $calendarDayCheckin
+        dailyFormCheckin = $dailyFormCheckin
+        samePageCheckin = $samePageCheckin
         nativeMinimal = [bool]$_.nativeMinimal
         maxAttempts = if ($null -ne $_.maxAttempts) { [Math]::Max(1, [Math]::Min(2, [int]$_.maxAttempts)) } else { 2 }
         profilePath = Resolve-NativeProfilePath ([string]$_.automationUserDataDir)
@@ -144,23 +181,18 @@ foreach ($configuredProfile in @($items.profilePath | Select-Object -Unique)) {
     }
 }
 
-$preflightResults = @(Read-NativePreflightConfirmations -Path $preflightPath -Config $config)
+$preflightResults = @(Read-NativePreflightConfirmations -Path $preflightPath -Config $config -IncludePrepared)
 
 function Close-AutomationBrowser([string]$ProfilePath) {
-    $targets = @(Get-AutomationBrowserProcesses $ProfilePath)
-    $targetIds = @($targets.ProcessId)
-    $roots = @($targets | Where-Object { $targetIds -notcontains $_.ParentProcessId })
-    foreach ($processInfo in $roots) {
-        $process = Get-Process -Id $processInfo.ProcessId -ErrorAction SilentlyContinue
-        if ($process) { [void]$process.CloseMainWindow() }
+    Close-NativePreflightBrowser -GetProcesses { Get-AutomationBrowserProcesses $ProfilePath } -RequestClose {
+        param($targets)
+        $targetIds = @($targets.ProcessId)
+        $roots = @($targets | Where-Object { $targetIds -notcontains $_.ParentProcessId })
+        foreach ($processInfo in $roots) {
+            $process = Get-Process -Id $processInfo.ProcessId -ErrorAction SilentlyContinue
+            if ($process) { [void]$process.CloseMainWindow() }
+        }
     }
-
-    $closeDeadline = (Get-Date).AddSeconds(20)
-    do {
-        Start-Sleep -Milliseconds 500
-        $remaining = @(Get-AutomationBrowserProcesses $ProfilePath)
-    } while ($remaining.Count -gt 0 -and (Get-Date) -lt $closeDeadline)
-    if ($remaining.Count -gt 0) { throw '原生 WAF 预热窗口未能正常退出。' }
 }
 
 # Chromium 浏览器会节流离屏的非活动标签页，因此逐站打开并正常关闭，确保每个
@@ -170,8 +202,14 @@ foreach ($item in $items) {
     $url = [string]$item.url
     $origin = ([uri]$url).GetLeftPart([System.UriPartial]::Authority)
     $hostName = ([uri]$url).Host
+    $preparationBytes = [Text.Encoding]::UTF8.GetBytes("$url`n$($profilePath.ToLowerInvariant())`n$($item.waitSeconds)")
+    $preparationHasher = [Security.Cryptography.SHA256]::Create()
+    try { $preparationKey = [BitConverter]::ToString($preparationHasher.ComputeHash($preparationBytes)) }
+    finally { $preparationHasher.Dispose() }
 
-    if (@($preflightResults | Where-Object { $_.origin -eq $origin -and $_.status -in @('signed', 'already_signed') }).Count -gt 0) {
+    if (@($preflightResults | Where-Object { $_.origin -eq $origin -and ($_.status -in @('signed', 'already_signed') `
+        -or ([bool]$item.passiveOnly -and $_.status -eq 'prepared' -and $_.passiveOnly -eq $true `
+            -and $_.preparationKey -eq $preparationKey -and (([datetimeoffset]::Now - [datetimeoffset]$_.observedAt).TotalMinutes -le 10))) }).Count -gt 0) {
         continue
     }
 
@@ -191,24 +229,26 @@ foreach ($item in $items) {
             $passivePrepared = $false
         }
         finally {
-            if ((Get-AutomationBrowserProcesses $profilePath).Count -gt 0) { Close-AutomationBrowser $profilePath }
-        }
-
-        if (-not $passivePrepared) {
-            Write-Warning "被动原生预热未完成：$hostName"
-        }
-        $preflightResults += [pscustomobject]@{
-            origin = $origin
-            url = $url
-            status = if ($passivePrepared) { 'prepared' } else { 'unconfirmed' }
-            reason = if ($passivePrepared) {
-                "原生 $($browser.DisplayName) 已完成被动等待，等待自动化复查"
-            } else {
-                "原生 $($browser.DisplayName) 被动等待未完成"
+            # Save passive progress even if graceful shutdown needs another run.
+            $preflightResults += [pscustomobject]@{
+                origin = $origin
+                url = $url
+                status = if ($passivePrepared) { 'prepared' } else { 'unconfirmed' }
+                passiveOnly = $true
+                preparationKey = $preparationKey
+                reason = if ($passivePrepared) {
+                    "原生 $($browser.DisplayName) 已完成被动等待，等待自动化复查"
+                } else {
+                    "原生 $($browser.DisplayName) 被动等待未完成"
+                }
+                inspectionStatus = if ($passivePrepared) { 'passive_wait' } else { 'unavailable' }
             }
-            inspectionStatus = if ($passivePrepared) { 'passive_wait' } else { 'unavailable' }
+            $checkpointFailure = $null
+            try { Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults -Config $config }
+            catch { $checkpointFailure = $_; throw }
+            finally { Complete-NativePreflightAttempt -Cleanup { Close-AutomationBrowser $profilePath } -Failure $checkpointFailure }
         }
-        Write-NativePreflightCheckpoint -Path $preflightPath -Results $preflightResults -Config $config
+        if (-not $passivePrepared) { Write-Warning "被动原生预热未完成：$hostName" }
         continue
     }
 
@@ -216,7 +256,10 @@ foreach ($item in $items) {
     $lastInspection = $null
     $hasAction = $null -ne $item.action
     $hasNewApiCheckin = [bool]$item.newApiCheckin
-    $inspectionMode = if ($hasAction) { 'execute-checkin' } elseif ($hasNewApiCheckin) { 'execute-new-api' } elseif ([bool]$item.trustAsSigned) { 'allow-endpoint' } else { 'require-confirmed' }
+    $hasCalendarCheckin = [bool]$item.calendarDayCheckin
+    $hasDailyFormCheckin = [bool]$item.dailyFormCheckin
+    $hasSamePageCheckin = [bool]$item.samePageCheckin
+    $inspectionMode = if ($hasSamePageCheckin) { 'execute-same-page' } elseif ($hasDailyFormCheckin) { 'execute-daily-form' } elseif ($hasCalendarCheckin) { 'execute-calendar' } elseif ($hasAction) { 'execute-checkin' } elseif ($hasNewApiCheckin) { 'execute-new-api' } elseif ([bool]$item.trustAsSigned) { 'allow-endpoint' } else { 'require-confirmed' }
     $actionConfigBase64 = if ($hasAction) {
         $actionJson = $item.action | ConvertTo-Json -Depth 5 -Compress
         [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($actionJson))
@@ -253,32 +296,41 @@ foreach ($item in $items) {
                     $lastInspection = $inspection
                     $attemptExplicit = [string]$inspection.status -in @('signed', 'already_signed') `
                         -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
+                    $attemptDisabled = Test-ConfirmedNotAvailable $inspection
                     $attemptEndpoint = [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
                         -and [bool]$inspection.attendanceEndpoint -and [string]$inspection.status -eq 'ready'
-                    $attemptPrepared = -not $hasAction -and -not $hasNewApiCheckin -and -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
+                    $attemptPrepared = -not $hasSamePageCheckin -and -not $hasDailyFormCheckin -and -not $hasCalendarCheckin -and -not $hasAction -and -not $hasNewApiCheckin -and -not [bool]$item.trustAsSigned -and [bool]$inspection.siteBodyLoaded `
                         -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
-                    if (-not $attemptExplicit -and -not $attemptEndpoint -and -not $attemptPrepared) { $inspection = $null }
+                    if (-not $attemptExplicit -and -not $attemptDisabled -and -not $attemptEndpoint -and -not $attemptPrepared) { $inspection = $null }
                 }
             }
             catch { $inspection = $null }
-            if ($null -ne $inspection -and ($attemptExplicit -or $attemptEndpoint)) {
+            if ($null -ne $inspection -and ($attemptExplicit -or $attemptDisabled -or $attemptEndpoint)) {
                 # Persist confirmation before browser cleanup, which can itself fail.
                 $confirmedResult = [pscustomobject]@{
                     origin = $origin
                     url = $url
                     status = Get-NativePreflightConfirmationStatus $inspection $attemptExplicit $attemptEndpoint
-                    reason = if ($attemptExplicit) { '原生页面或接口明确确认今天已签到' } else { '原生验证已确认配置的签到端点完整加载' }
+                    reason = if ($attemptDisabled) { [string]$inspection.reason } elseif ([string]$inspection.evidence.source -eq 'user_rule') { '按本地配置的完成条件确认今天已签到' } elseif ($attemptExplicit) { '原生页面或接口明确确认今天已签到' } else { '原生验证已确认配置的签到端点完整加载' }
                     inspectionStatus = [string]$inspection.status
                     actionAttempted = [bool]$inspection.actionAttempted
                     actionOutcome = [string]$inspection.actionOutcome
                     challengeOutcome = [string]$inspection.challengeOutcome
+                    cloudflareDiagnostics = $inspection.cloudflareDiagnostics
+                    verificationRecoveryDiagnostics = $inspection.verificationRecoveryDiagnostics
                     safeLineDiagnostics = $inspection.safeLineDiagnostics
                     readOnlyDiagnostics = $inspection.readOnlyDiagnostics
                     readOnlyRecheck = $inspection.readOnlyRecheck -eq $true
+                    calendarDiagnostics = $inspection.calendarDiagnostics
+                    formDiagnostics = $inspection.formDiagnostics
                     newApiConfirmed = [bool]$inspection.newApiConfirmed
                     evidence = $inspection.evidence
                     cycle = $inspection.cycle
-                    actionResults = @($inspection.actionResults)
+                    availabilityKind = $inspection.availabilityKind
+                    disabledByConfig = $inspection.disabledByConfig
+                    temporarilyUnavailable = $inspection.temporarilyUnavailable
+                    browserErrorRecovery = $inspection.browserErrorRecovery
+                    actionResults = @($inspection.actionResults | Where-Object { $null -ne $_ })
                     requiredActionTypes = $inspection.requiredActionTypes
                     submissionTrackedPerAction = $inspection.submissionTrackedPerAction -eq $true
                 }
@@ -299,40 +351,55 @@ foreach ($item in $items) {
             $inspectionLimit = $inspectionAttempt + 1
             continue
         }
-        if ([string]$lastInspection.failureCode -in @('safeline_client_challenge','submission_quarantined')) { break }
+        if ($lastInspection.retryable -eq $false -or [string]$lastInspection.failureCode -in @('safeline_client_challenge','submission_quarantined','cloudflare_verification_unresolved')) { break }
         if ($null -eq $inspection -and $inspectionAttempt -lt $inspectionLimit) { Start-Sleep -Seconds 1 }
     }
     $explicitlyConfirmed = $null -ne $inspection -and [string]$inspection.status -in @('signed', 'already_signed') `
         -and (-not $hasNewApiCheckin -or [bool]$inspection.newApiConfirmed)
+    $featureDisabled = $null -ne $inspection -and (Test-ConfirmedNotAvailable $inspection)
     $endpointConfirmed = [bool]$item.trustAsSigned -and $null -ne $inspection `
         -and [bool]$inspection.siteBodyLoaded -and [bool]$inspection.attendanceEndpoint `
         -and [string]$inspection.status -eq 'ready'
-    $prepared = -not $hasAction -and -not $hasNewApiCheckin -and $null -ne $inspection -and [bool]$inspection.siteBodyLoaded `
+    $prepared = -not $hasSamePageCheckin -and -not $hasDailyFormCheckin -and -not $hasCalendarCheckin -and -not $hasAction -and -not $hasNewApiCheckin -and $null -ne $inspection -and [bool]$inspection.siteBodyLoaded `
         -and [string]$inspection.status -notin @('login_required', 'interactive_challenge', 'managed_challenge')
     $reportedInspection = if ($null -ne $inspection) { $inspection } else { $lastInspection }
-    $requiresHandoff = -not $explicitlyConfirmed -and -not $endpointConfirmed `
-        -and [string]$reportedInspection.failureCode -in @('safeline_client_challenge','submission_quarantined')
-    if (-not $explicitlyConfirmed -and -not $endpointConfirmed -and -not $prepared) {
+    $calendarNeedsAttentionCodes = @('calendar_loading_timeout','calendar_today_not_found','calendar_completion_unconfirmed')
+    $dailyFormNeedsAttentionCodes = @('daily_form_page_changed','daily_form_readiness_unconfirmed','daily_form_completion_unconfirmed','native_browser_error_unresolved','daily_form_document_unbound','daily_form_browser_request_blocked')
+    $requiresHandoff = -not $explicitlyConfirmed -and -not $featureDisabled -and -not $endpointConfirmed `
+        -and ([string]$reportedInspection.failureCode -in @('safeline_client_challenge','submission_quarantined','cloudflare_verification_unresolved','native_submission_unconfirmed') `
+            -or (($hasSamePageCheckin -or $hasDailyFormCheckin -or $hasCalendarCheckin) -and $reportedInspection.retryable -eq $false))
+    if (-not $explicitlyConfirmed -and -not $featureDisabled -and -not $endpointConfirmed -and -not $prepared) {
         Write-Warning "原生验证未能确认站点正文：$hostName"
     }
     $preflightResults += [pscustomobject]@{
         origin = $origin
         url = $url
-        status = if ($explicitlyConfirmed -or $endpointConfirmed) { Get-NativePreflightConfirmationStatus $inspection $explicitlyConfirmed $endpointConfirmed } elseif ($requiresHandoff -and [string]$reportedInspection.failureCode -eq 'submission_quarantined') { 'needs_attention' } elseif ($requiresHandoff) { 'interactive_challenge' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
+        status = if ($explicitlyConfirmed -or $featureDisabled -or $endpointConfirmed) { Get-NativePreflightConfirmationStatus $inspection $explicitlyConfirmed $endpointConfirmed } elseif ($requiresHandoff -and ($hasSamePageCheckin -or [string]$reportedInspection.failureCode -in @('submission_quarantined','native_submission_unconfirmed') -or ($hasCalendarCheckin -and [string]$reportedInspection.failureCode -in $calendarNeedsAttentionCodes) -or ($hasDailyFormCheckin -and [string]$reportedInspection.failureCode -in $dailyFormNeedsAttentionCodes))) { 'needs_attention' } elseif ($requiresHandoff) { 'interactive_challenge' } elseif ($prepared) { 'prepared' } else { 'unconfirmed' }
         failureCode = if ($requiresHandoff) { [string]$reportedInspection.failureCode } else { $null }
         retryable = if ($requiresHandoff) { $false } else { $null }
+        manualBrowserMode = if ($hasSamePageCheckin -or [string]$reportedInspection.manualBrowserMode -eq 'native') { 'native' } else { $null }
         preflightAttemptId = $AttemptId
         evidence = $reportedInspection.evidence
         cycle = $reportedInspection.cycle
-        actionResults = @($reportedInspection.actionResults)
+        actionResults = @($reportedInspection.actionResults | Where-Object { $null -ne $_ })
         requiredActionTypes = $reportedInspection.requiredActionTypes
         submissionTrackedPerAction = $reportedInspection.submissionTrackedPerAction -eq $true
         submissionAttempted = $reportedInspection.submissionAttempted -eq $true
         quarantine = $reportedInspection.quarantine
         historicalSubmissionWarning = $reportedInspection.historicalSubmissionWarning
         submissionObservation = $reportedInspection.submissionObservation
-        reason = if ($requiresHandoff -and [string]$reportedInspection.failureCode -eq 'submission_quarantined') {
-            '原生提交尚未取得完成证据，保持持久隔离，仅允许只读核验'
+        calendarDiagnostics = $reportedInspection.calendarDiagnostics
+        formDiagnostics = $reportedInspection.formDiagnostics
+        browserErrorRecovery = $reportedInspection.browserErrorRecovery
+        availabilityKind = $reportedInspection.availabilityKind
+        disabledByConfig = $reportedInspection.disabledByConfig
+        temporarilyUnavailable = $reportedInspection.temporarilyUnavailable
+        reason = if ($featureDisabled) {
+            [string]$inspection.reason
+        } elseif ($requiresHandoff -and [string]$reportedInspection.failureCode -eq 'submission_quarantined') {
+            [string]$reportedInspection.reason
+        } elseif ($explicitlyConfirmed -and [string]$inspection.evidence.source -eq 'user_rule') {
+            '按本地配置的完成条件确认今天已签到'
         } elseif ($explicitlyConfirmed -and $hasAction -and [bool]$inspection.actionAttempted) {
             "原生 $($browser.DisplayName) 已执行签到动作，并由页面明确确认今天已签到"
         } elseif ($explicitlyConfirmed -and $hasNewApiCheckin -and [bool]$inspection.newApiConfirmed) {
@@ -345,6 +412,12 @@ foreach ($item in $items) {
             "原生 $($browser.DisplayName) 已通过 WAF，并确认签到端点完整加载"
         } elseif ($prepared) {
             "原生 $($browser.DisplayName) 已完成验证预热，等待自动化复查"
+        } elseif ($requiresHandoff -and [string]$reportedInspection.failureCode -eq 'cloudflare_verification_unresolved') {
+            'Cloudflare 验证在有限点击和等待后仍未通过，转原生可见浏览器人工处理'
+        } elseif ($requiresHandoff -and [string]$reportedInspection.failureCode -eq 'native_submission_unconfirmed') {
+            '原生签到已尝试但未获得完成证据，保留提交保护并接续同站页面复核'
+        } elseif ($requiresHandoff -and ($hasSamePageCheckin -or $hasDailyFormCheckin -or $hasCalendarCheckin)) {
+            [string]$reportedInspection.reason
         } elseif ($requiresHandoff) {
             '雷池 WAF 要求合法用户确认，停止本轮自动重试并转人工处理'
         } elseif ($hasAction -and [string]$reportedInspection.actionOutcome -eq 'action_not_found') {
@@ -367,6 +440,8 @@ foreach ($item in $items) {
             '原生 New API 签到接口显示登录状态无效'
         } elseif ($hasNewApiCheckin) {
             '原生 New API 签到未取得权威完成状态'
+        } elseif ($hasSamePageCheckin -or $hasDailyFormCheckin -or $hasCalendarCheckin) {
+            [string]$reportedInspection.reason
         } else {
             '原生验证页面未能确认签到结果'
         }
@@ -375,6 +450,8 @@ foreach ($item in $items) {
         actionOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.actionOutcome } else { 'unavailable' }
         challengeOutcome = if ($null -ne $reportedInspection) { [string]$reportedInspection.challengeOutcome } else { 'unavailable' }
         challengeDetails = if ($null -ne $reportedInspection) { $reportedInspection.challengeDetails } else { $null }
+        cloudflareDiagnostics = if ($null -ne $reportedInspection) { $reportedInspection.cloudflareDiagnostics } else { $null }
+        verificationRecoveryDiagnostics = if ($null -ne $reportedInspection) { $reportedInspection.verificationRecoveryDiagnostics } else { $null }
         safeLineDiagnostics = if ($null -ne $reportedInspection) { $reportedInspection.safeLineDiagnostics } else { $null }
         readOnlyDiagnostics = if ($null -ne $reportedInspection) { $reportedInspection.readOnlyDiagnostics } else { $null }
         readOnlyRecheck = $readOnlyRecheckAttempted

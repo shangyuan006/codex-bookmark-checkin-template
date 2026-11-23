@@ -35,6 +35,8 @@ test("CI retains dependency, test, public-safety, and bounded audit gates", asyn
   for (const command of [
     "npm ci",
     "npm test",
+    "npm run modules:check",
+    "npm run integrity:check",
     "./scripts/Scan-PublicSafety.ps1",
     "./scripts/Invoke-NpmAuditWithRetry.ps1",
   ]) {

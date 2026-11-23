@@ -6,6 +6,7 @@ import { readEffectiveBookmarkPlan } from "./effective-bookmark-plan.mjs";
 import { buildCurrentPlan } from "./current-plan.mjs";
 import { summarizeResults, writeRunResult } from "./logger.mjs";
 import { isCurrentLocalRunId, nextDeferredRetryAt } from "./retry-policy.mjs";
+import { sanitizeRuntimeCode } from './runtime-integrity.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
@@ -58,6 +59,8 @@ export function buildTimeoutReport(plan, progress, now = new Date()) {
   const isComplete = plannedTotal > 0 && processedTotal === plannedTotal;
   return {
     runId: progress.runId,
+    ...(progress.executionAttemptId ? { executionAttemptId: progress.executionAttemptId } : {}),
+    ...(sanitizeRuntimeCode(progress.runtimeCode) ? { runtimeCode: sanitizeRuntimeCode(progress.runtimeCode) } : {}),
     runState: "final",
     plannedTotal,
     processedTotal,
@@ -80,6 +83,8 @@ export function buildTimeoutReport(plan, progress, now = new Date()) {
 
 async function main() {
   const progressIndex = process.argv.indexOf("--progress-report");
+  const attemptIndex = process.argv.indexOf("--execution-attempt-id");
+  const attemptId = attemptIndex >= 0 ? process.argv[attemptIndex + 1] : null;
   const requestedProgressPath = progressIndex >= 0 ? String(process.argv[progressIndex + 1] ?? "").trim() : "";
   if (!requestedProgressPath) throw new Error("用法: node src/finalize-timeout-report.mjs --progress-report <logs/progress.json>");
 
@@ -90,7 +95,10 @@ async function main() {
     throw new Error("超时进度报告必须位于本项目 logs 目录且名称为 progress.json");
   }
   const progress = JSON.parse(await fs.readFile(progressPath, "utf8"));
-  if (!Array.isArray(progress.results) || !isCurrentLocalRunId(progress.runId)) {
+  if (!attemptId || !/^[a-f0-9]{32}-[1-9]\d?$/.test(attemptId)
+    || progress.executionAttemptId !== attemptId || progress.runState !== "in_progress"
+    || !Array.isArray(progress.results) || !isCurrentLocalRunId(progress.runId)
+    || progress.runId !== path.basename(path.dirname(progressPath)) || !progress.runId.endsWith(`-${attemptId}`)) {
     throw new Error("超时进度报告不是今天的有效运行");
   }
 

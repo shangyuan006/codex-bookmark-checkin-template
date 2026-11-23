@@ -142,9 +142,8 @@ test("原生签到从实际点击后重新计算完整确认等待窗口", async
   const source = await fs.readFile(new URL("../src/native-browser-inspect.mjs", import.meta.url), "utf8");
   assert.match(source, /if \(actionAttempted\) confirmationDeadline = Date\.now\(\) \+ maxWaitSeconds \* 1000/);
   assert.match(source, /actionOutcome = "confirmation_timeout"/);
-  assert.match(source, /clickVisibleNativeChallengeControl/);
-  assert.match(source, /retryableChallengeOutcomes\.has\(challengeOutcome\)/);
-  assert.match(source, /challenge_frame_not_stable/);
+  assert.match(source, /createNativeCloudflareReader/);
+  assert.match(source, /cloudflareDiagnostics/);
   assert.match(source, /createNativeSafeLineReader/);
   assert.match(source, /safeLineDiagnostics: safeLine\.diagnostics\(\)/);
   assert.doesNotMatch(source, /Date\.now\(\) >= deadline/);
@@ -173,5 +172,7 @@ test("Cloudflare 隐藏 checkbox 时只回退到与其关联的可见 label", as
   assert.match(source, /rule\.challengeFrameStableMs/);
   assert.match(source, /nativeChallengeFrameGeometryMatches/);
   assert.match(source, /challenge_frame_not_stable/);
-  assert.match(source, /challenge_frame_clicked/);
+  assert.match(source, /clickClosedShadowChallengeControl/);
+  assert.match(source, /challenge_control_unreadable/);
+  assert.doesNotMatch(source, /page\.mouse\.click\(box\.x/);
 });

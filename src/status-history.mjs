@@ -47,7 +47,7 @@ export async function loadStatusHistory(root,{maxReports=200,maxDays=31,now=new 
   const logs = path.join(root,'logs');
   const entries = (await fs.readdir(logs,{withFileTypes:true}).catch(error => {
     if (error.code==='ENOENT') return []; throw error;
-  })).filter(entry=>entry.isDirectory()&&!entry.isSymbolicLink()&&/^\d{8}-\d{6}$/.test(entry.name))
+  })).filter(entry=>entry.isDirectory()&&!entry.isSymbolicLink()&&/^\d{8}-\d{6}(?:-[a-f0-9]{32}-[1-9]\d?)?$/.test(entry.name))
     .sort((a,b)=>b.name.localeCompare(a.name)).slice(0,maxReports);
   const reports = [];
   let unreadableReports = 0;

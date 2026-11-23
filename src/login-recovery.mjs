@@ -1,4 +1,5 @@
 import { sanitizeOAuthPageObservation, sanitizeOAuthCallbackDiagnostics, sanitizeOAuthTimingDiagnostics } from './oauth-target-state.mjs';
+import { LOGIN_DIAGNOSTIC_STAGES, sanitizeLoginDiagnostics } from './login-diagnostics.mjs';
 
 const LOGIN_HELPER_STATUSES = new Set([
   "logged_in",
@@ -23,6 +24,7 @@ export const OAUTH_DIAGNOSTIC_STAGES = new Set([
   "linuxdo_session_rate_limited",
   "linuxdo_login_challenge",
   "linuxdo_provider_login_required",
+  "linuxdo_sso_stalled",
   "provider_session",
   "github_autofill_missing",
   "github_account_selection",
@@ -38,19 +40,6 @@ export const OAUTH_DIAGNOSTIC_STAGES = new Set([
   "completed",
   "timeout",
   "helper_failed",
-]);
-
-const LOGIN_DIAGNOSTIC_STAGES = new Set([
-  "navigation",
-  "form_expand",
-  "form_fields",
-  "submit_control",
-  "challenge_ready",
-  "challenge_blocked",
-  "post_submit",
-  "session_present",
-  "session_verification",
-  "completed",
 ]);
 
 const PROVIDER_AUTHORIZATION_CHALLENGE_OUTCOMES = new Set([
@@ -127,6 +116,7 @@ export function applyLoginRecoveryHandoff(result, loginOutcome) {
     ...preserved,
     status: "needs_attention",
     failureCode: "login_recovery_requires_manual",
+    loginRecoveryRequired: true,
     retryable: false,
     reason: "页面仍要求登录，现有自动恢复方法无可用登录路径；需人工登录，不再重复自动恢复",
   };
@@ -191,6 +181,7 @@ export function loginHelperOutcome(text, fallback = "failed") {
     ...sanitizeOAuthPageObservation(value),
     ...sanitizeOAuthCallbackDiagnostics(value?.callbackDiagnostics),
     ...sanitizeOAuthTimingDiagnostics(value),
+    ...sanitizeLoginDiagnostics(value?.loginDiagnostics),
     ...(["signed", "already_signed"].includes(String(value?.checkinStatus))
       ? { checkinStatus: String(value.checkinStatus) }
       : {}),
@@ -228,6 +219,8 @@ export function loginHelperOutcomeFromStreams(stdout, stderr = "", fallback = "f
         .filter(([key]) => primary[key] == null)),
       ...(!primary.oauthStage && diagnostic.oauthStage ? { oauthStage: diagnostic.oauthStage } : {}),
       ...(!primary.loginStage && diagnostic.loginStage ? { loginStage: diagnostic.loginStage } : {}),
+      ...(!primary.loginDiagnostics && diagnostic.loginDiagnostics
+        ? { loginDiagnostics: diagnostic.loginDiagnostics } : {}),
       ...(!primary.authorizationOutcome && diagnostic.authorizationOutcome
         ? {authorizationOutcome:diagnostic.authorizationOutcome} : {}),
       ...(!primary.providerAuthorizationChallengeOutcome && diagnostic.providerAuthorizationChallengeOutcome

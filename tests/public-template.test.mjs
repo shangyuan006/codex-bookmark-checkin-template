@@ -87,8 +87,8 @@ test("保存密码同步必须经过显式总开关授权", async () => {
   const syncer = await fs.readFile(new URL("../scripts/Sync-ChromeSavedLogins.ps1", import.meta.url), "utf8");
   assert.match(runner, /syncBookmarkSavedLogins -eq \$true/);
   assert.doesNotMatch(runner, /syncSavedLoginOrigins\)\.Count -gt 0 -or/);
-  assert.match(syncer, /\$parsedOrigins = \$discoveredText \| ConvertFrom-Json/);
-  assert.match(syncer, /\$origins = @\(\$parsedOrigins\)/);
+  assert.match(syncer, /\$authorizedOrigins = @\(\$discoveredText \| ConvertFrom-Json\)/);
+  assert.match(syncer, /'--origins', \(\$Origins -join ','\)/);
   assert.match(syncer, /populated_origins/);
   assert.match(syncer, /没有保存记录/);
   assert.doesNotMatch(syncer, /\$origins = @\(\$discoveredText \| ConvertFrom-Json\)/);
@@ -125,7 +125,7 @@ test("人工定向复核时原生预热与指定 origin 取交集", async () => 
   assert.match(runner, /\$preflightTargets = @\(\$preflightTargets \| Where-Object \{\s*\$manualOriginSet\.ContainsKey\(\[string\]\$_\.origin\)/);
 });
 
-test("手动登录使用无 Playwright 和无远程调试的最小原生浏览器", async () => {
+test("纯手动登录禁用远程调试，受控签到仅对明确规则启用本机调试", async () => {
   const opener = await fs.readFile(new URL("../scripts/Open-ManualLogin.ps1", import.meta.url), "utf8");
   const nativeLauncher = await fs.readFile(new URL("../scripts/Open-PlainLoginChrome.ps1", import.meta.url), "utf8");
   const closer = await fs.readFile(new URL("../scripts/Close-ManualLogin.ps1", import.meta.url), "utf8");
@@ -136,7 +136,9 @@ test("手动登录使用无 Playwright 和无远程调试的最小原生浏览�
   assert.match(opener, /\[string\[\]\]\$Origins/);
   assert.match(opener, /\[int\[\]\]\$Selection/);
   assert.match(opener, /Open-PlainLoginChrome\.ps1'\) @launchOptions/);
-  assert.match(nativeLauncher, /\$TrackManualSession -and \(-not \$NativeMinimal -or \$Offscreen -or \$RemoteDebuggingPort -gt 0\)/);
+  assert.match(nativeLauncher, /\$RemoteDebuggingPort -gt 0 -and -not \$ControlledCheckin/);
+  assert.match(nativeLauncher, /--remote-debugging-address=127\.0\.0\.1/);
+  assert.match(nativeLauncher, /无法校验受控签到规则/);
   assert.match(nativeLauncher, /\$TrackManualSession -and \$Urls\.Count -gt 0/);
   assert.match(nativeLauncher, /--origin/);
   assert.match(nativeLauncher, /--selection/);
@@ -200,6 +202,7 @@ test("原生登录及共享中文状态合同保留 Windows PowerShell 5.1 可�
     "Close-ManualLogin.ps1",
     "Recover-NativeOAuthCheckin.ps1",
     "CheckinContract.generated.ps1",
+    "Resolve-Runtime.ps1",
   ]) {
     const contents = await fs.readFile(new URL(`../scripts/${script}`, import.meta.url));
     assert.deepEqual([...contents.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
@@ -322,6 +325,7 @@ test("原生预热检查器不向父进程返回页面标题或正文片段", as
   assert.match(outputBlock, /siteBodyLoaded/);
   assert.match(outputBlock, /attendanceEndpoint/);
   assert.doesNotMatch(outputBlock, /origin|url|title|reason|bodyText|leichiText/);
+  assert.doesNotMatch(outputBlock, /\.\.\.current\.state/);
 });
 
 test("公开模板不预设任何用户的书签文件夹名称", async () => {

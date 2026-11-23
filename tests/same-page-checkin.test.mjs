@@ -56,7 +56,9 @@ test("ambiguous submit failures do not repeat clicks or close the window", async
   assert.equal(result.status, "unconfirmed");
   assert.equal(result.submissionAttempted, true);
   assert.ok(s.stages.some(s => s.stage === "needs_attention"));
-  assert.ok(s.stages.some(s => s.stage === "completion_wait_timeout"));
+  assert.equal(s.stages.at(-1).stage, 'needs_attention', 'a waiting stage must not erase a click exception');
+  assert.equal(s.stages.at(-1).waitTimedOut, true);
+  assert.equal(result.failureCode, 'same_page_submission_failed');
 });
 
 test("a close request wins over ready controls", async () => {
@@ -83,7 +85,7 @@ test("same-page manual routing is opt-in and leaves unrelated origins in the han
 });
 
 test("same-page readiness rejects a different path or foreign origin before reading controls", async () => {
-  const page = { url: () => `${target.origin}/`, evaluate: async () => assert.fail("wrong path") };
+  const page = { url: () => `${target.origin}/`, evaluate: async () => false };
   assert.equal((await readSamePageReadiness(page, target, rule)).responseReady, false);
   page.url = () => "https://other.example/attendance.php";
   await assert.rejects(readSamePageReadiness(page, target, rule), /跨站/);

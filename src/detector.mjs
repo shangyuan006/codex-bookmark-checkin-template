@@ -42,6 +42,7 @@ export function classifyPageText({
   unsignedTextObserved = false,
   hasTwoFactorControl = false,
   loginRequiredTextObserved = false,
+  exactCheckinUrl,
 }) {
   const normalizedBodyText = normalizeText(bodyText).slice(0, 30000);
   const text = normalizeText(`${title}\n${normalizedBodyText}`).slice(0, 30000);
@@ -74,7 +75,7 @@ export function classifyPageText({
   // A login form can legitimately contain an image CAPTCHA.  Treating every
   // CAPTCHA marker as a standalone browser challenge hides the real action
   // required (refreshing the site's login session).
-  if (hasPassword || /\/(log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)/i.test(lowerUrl)) {
+  if (hasPassword || (url !== exactCheckinUrl && /\/(log[-_]?in|sign[-_]?in|auth)(?:[/?#]|$)/i.test(lowerUrl))) {
     const suffix = challengeSelectors ? "，登录页包含验证码" : "";
     return { status: "login_required", reason: `登录状态失效${suffix}` };
   }

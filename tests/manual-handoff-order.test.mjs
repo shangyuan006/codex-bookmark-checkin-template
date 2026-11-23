@@ -11,7 +11,7 @@ import { powershellExecutable } from "./helpers/powershell.mjs";
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const execFileAsync = promisify(execFile);
 const dependencies = ["CheckinContract.generated", "Run-Checkin", "Resolve-Runtime", "RunLock", "ManualVerification", "ResultContract",
-  "ManualAbandonment", "NativeFallbackPolicy", "PreflightScope", "CheckinCycle", "TaskRetryPolicy", "TaskRuntimeBudget"];
+  "ManualAbandonment", "NativeFallbackPolicy", "PreflightScope", "CheckinCycle", "TaskRetryPolicy", "TaskRuntimeBudget", "CheckinExecutionReport"];
 
 const workerSource = String.raw`
 import fs from 'node:fs/promises';
@@ -28,11 +28,13 @@ const status = config.fixtureManualLoginRequired ? 'needs_attention'
   : observations.length === 1 ? 'login_required' : config.fixtureFinalStatus;
 const now = new Date();
 const date = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((value, index) => index ? String(value).padStart(2, '0') : value).join('');
-const report = { runId: date + '-10000' + observations.length, planFingerprint: 'a'.repeat(64),
+const executionAttemptId = process.argv[process.argv.indexOf('--execution-attempt-id') + 1];
+const report = { runId: date + '-10000' + observations.length + '-' + executionAttemptId, executionAttemptId, planFingerprint: 'a'.repeat(64),
   runState: 'final', isComplete: true, plannedTotal: 1, processedTotal: 1, finishedAt: now.toISOString(),
   results: [{ origin: 'https://fixture.test', status, retryable: !config.fixtureManualLoginRequired,
     ...(config.fixtureManualLoginRequired ? { failureCode: 'login_recovery_requires_manual' } : {}) }] };
-await fs.mkdir(path.join(root, 'logs'), { recursive: true });
+await fs.mkdir(path.join(root, 'logs', report.runId), { recursive: true });
+await fs.writeFile(path.join(root, 'logs', report.runId, 'result.json'), JSON.stringify(report));
 await fs.writeFile(path.join(root, 'logs', 'latest.json'), JSON.stringify(report));
 process.exitCode = status === 'signed' ? 0 : 2;
 `;
@@ -78,8 +80,8 @@ async function runFixture(finalStatus, manualOpen = false, manualLoginRequired =
     const execution = await execFileAsync(powershellExecutable, ["-NoProfile", "-NonInteractive", "-File",
       path.join(fixture, "scripts", "Run-Checkin.ps1"), "-Attempts", "2", "-SuppressReport", "-DispatchManualHandoff"],
     { cwd: fixture, encoding: "utf8", timeout: 20_000 }).catch((error) => {
-      if (error.code !== 2) throw error;
-      return { stdout: error.stdout };
+      if (error.code !== 2 && !(manualOpen && error.code === 75)) throw error;
+      return { stdout: error.stdout, exitCode: error.code };
     });
     const read = (name) => fs.readFile(path.join(fixture, "tmp", name), "utf8").then(JSON.parse).catch(() => null);
     let dispatch = null;
@@ -92,7 +94,7 @@ async function runFixture(finalStatus, manualOpen = false, manualLoginRequired =
       } while (Date.now() < deadline);
     }
     return { observations: await read("observations.json"), handoff: await read("manual-handoff.json"),
-      planInvoked: await read("plan-invoked.json"), dispatch, stdout: execution.stdout };
+      planInvoked: await read("plan-invoked.json"), dispatch, stdout: execution.stdout, exitCode: execution.exitCode ?? 0 };
   } finally {
     await fs.rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
@@ -102,14 +104,14 @@ test("automatic retries finish before creating or dispatching manual handoff", a
   const result = await runFixture("login_required");
   assert.equal(result.planInvoked, true);
   assert.deepEqual(result.observations, [{ attempt: 1, handoffVisible: false }, { attempt: 2, handoffVisible: false }]);
-  assert.equal(result.handoff.sourceRunId.endsWith("100002"), true);
+  assert.match(result.handoff.sourceRunId, /-100002-[a-f0-9]{32}-2$/);
   assert.deepEqual(result.dispatch, { attempts: 2, wrapperLockReleased: true });
 });
 
 test("unavailable automatic login hands off after one attempt and after releasing the wrapper lock", async () => {
   const result = await runFixture("needs_attention", false, true);
   assert.deepEqual(result.observations, [{ attempt: 1, handoffVisible: false }]);
-  assert.equal(result.handoff.sourceRunId.endsWith("100001"), true);
+  assert.match(result.handoff.sourceRunId, /-100001-[a-f0-9]{32}-1$/);
   assert.equal(result.handoff.targets[0].previousStatus, "needs_attention");
   assert.deepEqual(result.dispatch, { attempts: 1, wrapperLockReleased: true });
 });
@@ -124,6 +126,7 @@ test("successful automatic retry does not dispatch the first attempt's stale han
 
 test("an active manual browser session blocks automatic attempts without replacing reports", async () => {
   const result = await runFixture("signed", true);
+  assert.equal(result.exitCode, 75);
   assert.equal(result.planInvoked, null);
   assert.equal(result.observations, null);
   assert.equal(result.handoff, null);
@@ -236,7 +239,7 @@ $root = Split-Path -Parent $PSScriptRoot
 while (-not (Test-Path -LiteralPath (Join-Path $root 'tmp/helper-release.signal'))) { Start-Sleep -Milliseconds 25 }
 $config = Get-Content -Raw -LiteralPath (Join-Path $root 'config/config.json') | ConvertFrom-Json
 if ($config.fixtureFail) { throw 'expected simulated launch failure' }
-[System.IO.File]::WriteAllText((Join-Path $root 'tmp/manual-session.json'), '{}')
+[System.IO.File]::WriteAllText((Join-Path $root 'tmp/manual-session.json'), '{"mode":"native","windowReady":true}')
 `);
     await fs.writeFile(path.join(fixture, "src", "current-plan.mjs"),
       "import fs from 'node:fs'; fs.writeFileSync('tmp/plan-invoked.json', 'true'); console.log('{}');");

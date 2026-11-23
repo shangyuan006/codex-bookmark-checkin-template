@@ -65,7 +65,7 @@ test("recovery reads only the selected account checkpoint and rejects corrupt st
 
 function quote(value) { return `'${String(value).replaceAll("'", "''")}'`; }
 
-for (const scenario of ["restart", "complete", "fallback-write-failure", "restart-manual"]) {
+for (const scenario of ["restart", "verify_logout", "complete", "fallback-write-failure", "restart-manual"]) {
   test(`manual recovery dispatch: ${scenario}`, async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reauth-dispatch-"));
     const scripts = path.join(directory, "scripts");
@@ -82,7 +82,7 @@ for (const scenario of ["restart", "complete", "fallback-write-failure", "restar
       await fs.writeFile(path.join(scripts, "Resolve-Runtime.ps1"), [
         `function Resolve-CheckinNode { return ${quote(process.execPath)} }`,
         "function Resolve-CheckinBrowser { return [pscustomobject]@{ Executable='mock-edge.exe'; ProcessName='never-a-browser.exe' } }",
-        "function Get-CimInstance { return @() }",
+        "function Get-CimInstance { return @() }; function Get-CheckinProfileBrowserProcesses { param($Config,$ProfilePath) return @() }",
         `function Start-Process { [System.IO.File]::AppendAllText(${quote(calls)}, "manual\n"); return [pscustomobject]@{ Id=4242 } }`,
         "function Wait-CheckinVisibleBrowserWindow { return [pscustomobject]@{ ProcessId=4242; ProcessStartedAt=[datetime]::UtcNow.ToString('o') } }",
       ].join("\n"));

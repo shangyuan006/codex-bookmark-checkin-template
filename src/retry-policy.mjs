@@ -4,17 +4,36 @@ export const RECOVERABLE_STATUSES = new Set(CHECKIN_CONTRACT.recoverableStatuses
 import { isTerminalResult } from "./result-contract.mjs";
 import { compatiblePriorResult, resultIdentity } from "./result-identity.mjs";
 import { pausesUntilNextDay } from './site-availability.mjs';
+import { normalizeResultActionEntries } from './sequential-action-evidence.mjs';
 
 export const TERMINAL_STATUSES = new Set(CHECKIN_CONTRACT.successStatuses);
 
 export function recoveryEntriesForResults(results, targets, now = new Date()) {
   const byOrigin = new Map(targets.map(target => [target.origin, target]));
   return results.flatMap((result, resultIndex) => {
-    if (!isRetryEligible(result, now)) return [];
+    if (result?.recoveryProgress?.stopped === true || !isRetryEligible(result, now)) return [];
     const target = byOrigin.get(result.origin);
     if (!target) throw new Error("Recovery result has no matching selected target");
     return [{ resultIndex, target }];
   });
+}
+
+// Compare diagnostic state, never private page text, timestamps or raw URLs.
+export function recoveryProgressSignature(result = {}) {
+  result = normalizeResultActionEntries(result);
+  const fields = ['status','failureCode','retryCause','oauthStage','actionOutcome','challengeOutcome',
+    'documentStatus','submissionAttempted','submissionRequestObserved','submissionResponseStatus'];
+  return JSON.stringify([fields.map(key => result[key] ?? null),
+    (result.actionResults ?? []).map(action => [action.actionType, action.status, action.failureCode ?? null]),
+    result.formDiagnostics?.readinessObserved ?? null, result.formDiagnostics?.verificationReady ?? null,
+    result.cloudflareDiagnostics?.outcome ?? null]);
+}
+
+export function withRecoveryProgress(result, previous, { loginRecovered = false } = {}) {
+  if (!isRetryEligible(result)) return result;
+  const unchanged = !loginRecovered && recoveryProgressSignature(result) === recoveryProgressSignature(previous);
+  return { ...result, recoveryProgress: { unchangedRounds: unchanged ? (previous?.recoveryProgress?.unchangedRounds ?? 0) + 1 : 0,
+    stopped: unchanged, outcome: unchanged ? 'no_new_evidence' : 'state_changed' } };
 }
 
 function shanghaiParts(date) {
@@ -355,6 +374,8 @@ export function isResumeRetryEligible(result, reauthOrigins, now = new Date()) {
 
 export function filterAutomaticRetryOrigins(origins, results) {
   const blocked = new Set(results.filter(result => result.retryable === false || result.submissionAttempted === true
+    || result.recoveryProgress?.stopped === true
+    || result.recoveryProgress?.stopped === true
     || (['login_required','needs_attention'].includes(result.status) && result.retryableLoginRecovery === false))
     .map(result => result.origin));
   return new Set([...origins].filter(origin => !blocked.has(origin)));

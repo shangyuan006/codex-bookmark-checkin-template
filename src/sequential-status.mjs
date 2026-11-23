@@ -10,25 +10,29 @@ export function normalizeSequentialStatusCheck(raw, stepUrl) {
     || typeof raw.signedField !== 'string' || !/^[A-Za-z0-9_.-]{1,120}$/.test(raw.signedField)) {
     throw new Error('顺序动作状态接口必须为已审查的同源只读接口和布尔完成字段');
   }
-  return { url: url.href, signedField: raw.signedField, readOnly: true };
+  return { url: url.href, signedField: raw.signedField, readOnly: true,
+    ...(raw.pageFallback === true ? { pageFallback: true } : {}) };
 }
 
 export async function readSequentialStatus(request, rule) {
   let response;
-  const unknown = { status: 'unconfirmed', failureCode: 'sequential_status_unconfirmed' };
+  const unknown = code => ({ status: 'unconfirmed', failureCode: 'sequential_status_unconfirmed',
+    statusDiagnostics: { outcome: code, ...(response ? { httpStatus: response.status() } : {}) } });
   try {
     response = await request.get(rule.url, { maxRedirects: 0, timeout: 5000,
       failOnStatusCode: false, headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' } });
-    if (response.url() !== rule.url) return unknown;
-    if (response.status() === 401) return { status: 'login_required', failureCode: 'sequential_status_login_required' };
-    if (response.status() !== 200) return unknown;
+    if (response.url() !== rule.url) return unknown('unexpected_response_url');
+    if (response.status() === 401) return { status: 'login_required', failureCode: 'sequential_status_login_required',
+      statusDiagnostics: { outcome: 'login_required', httpStatus: 401 } };
+    if (response.status() !== 200) return unknown('http_error');
     const text = await response.text();
-    if (text.length > 65536) return unknown;
-    const json = JSON.parse(text);
+    if (text.length > 65536) return unknown('response_too_large');
+    let json;
+    try { json = JSON.parse(text); } catch { return unknown('invalid_json'); }
     const value = rule.signedField.split('.').reduce((current, key) => (
       current && typeof current === 'object' && Object.hasOwn(current, key) ? current[key] : undefined
     ), json);
-    return value === true ? { status: 'already_signed' } : value === false ? { status: 'not_signed' } : unknown;
-  } catch { return unknown; }
+    return value === true ? { status: 'already_signed' } : value === false ? { status: 'not_signed' } : unknown('boolean_field_missing');
+  } catch { return unknown('request_failed'); }
   finally { await response?.dispose().catch(() => {}); }
 }

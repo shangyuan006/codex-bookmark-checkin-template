@@ -71,7 +71,7 @@ export async function waitForOAuthTargetSession(context, origin, config = {}, {
         onObservation({ targetSurface: surface.kind, noticeObserved: surface.noticeVisible === true });
         if (!surface.ready || surface.passwordVisible || surface.challengeVisible
           || ['target_login', 'loading', 'unavailable', 'other_origin'].includes(surface.kind)
-          || await hasProviderControl(page)) {
+          || (!surface.authenticatedControl && await hasProviderControl(page))) {
           outcome = surface.kind === 'target_login' ? 'target_login' : 'target_not_ready';
           continue;
         }

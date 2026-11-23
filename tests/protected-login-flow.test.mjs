@@ -150,11 +150,15 @@ function emptyChallengeLocator() {
   };
 }
 
-function challengeFrame(url, box) {
+function challengeFrame(url, box, click = async () => {}) {
   return {
     url: () => url,
     frameElement: async () => ({ boundingBox: async () => box }),
-    locator: () => emptyChallengeLocator(),
+    locator: selector => selector.startsWith('input') ? {
+      count: async () => 1,
+      nth: () => ({ isVisible: async () => true, isEnabled: async () => true, click }),
+    } : emptyChallengeLocator(),
+    evaluate: async () => ({ resolvedState: false, checkboxReady: true, failed: false, loading: false }),
   };
 }
 
@@ -174,11 +178,13 @@ test("OAuth login challenge uses one configured same-origin Cloudflare frame and
   const box = { x: 100, y: 50, width: 300, height: 70 };
   const frameUrl = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2";
   const frames = [{ url: frameUrl, box }];
+  const readyFrame = challengeFrame(frameUrl, box, async () => { clicked += 1; });
   const page = {
     url: () => "https://protected.example/sign-in",
     getByRole: () => emptyChallengeLocator(),
     locator: (selector) => selector === "iframe[src]" ? parentFrameLocator(frames) : emptyChallengeLocator(),
-    frames: () => [challengeFrame(frameUrl, box)],
+    frames: () => [readyFrame],
+    evaluate: async () => true,
     mouse: { click: async () => { clicked += 1; } },
   };
   const config = { autoClickTurnstileOrigins: ["https://protected.example"] };

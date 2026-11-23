@@ -379,7 +379,8 @@ test("Run-Checkin persists explicit origin-scoped authoritative verification", a
   assert.match(runner, /'signed', 'already_signed'/);
   assert.match(runner, /Get-TodayAbandonedOrigins -Path \$manualAbandonPath/);
   assert.match(runner, /-OverrideTodayAbandonment/);
-  assert.match(runner, /个定向站点已取得权威签到结果/);
+  assert.match(runner, /个定向站点已确认完成/);
+  assert.match(runner, /Get-CheckinCompletionSummary/);
 });
 
 test("manual verification blocks handoff only when all source evidence belongs to today in Shanghai", async () => {

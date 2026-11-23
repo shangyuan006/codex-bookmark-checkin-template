@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import { normalizeText } from "./detector.mjs";
 
+// PowerShell's @($null) was persisted as [null] by older native checkpoints.
+// Removing those placeholders supplies no step evidence; declared steps must
+// still pass the normal identity and completion checks.
+export function normalizeResultActionEntries(result) {
+  if (!Array.isArray(result?.actionResults) || !result.actionResults.some(item => item == null)) return result;
+  return { ...result, actionResults: result.actionResults.filter(item => item != null) };
+}
+
 export function sequentialActionType(step) {
   const actionTexts = [...new Set((step.actionTexts ?? []).map(normalizeText).filter(Boolean))];
   return step.actionType ?? `sequence_${createHash("sha256").update(JSON.stringify({url:new URL(step.url).href,actionTexts})).digest("hex").slice(0,16)}`;
@@ -21,15 +29,22 @@ export function normalizeSequentialCompletedControl(raw) {
   }
   try { new RegExp(textPattern, 'u'); }
   catch { throw new Error('Invalid sequential completed control text pattern'); }
-  return { selector, textPattern };
+  if (raw.allowNonInteractive != null && typeof raw.allowNonInteractive !== 'boolean') {
+    throw new Error('Sequential completed text opt-in must be boolean');
+  }
+  return { selector, textPattern, ...(raw.allowNonInteractive === true ? { allowNonInteractive: true } : {}),
+    ...(raw.matchByText === true ? { matchByText: true } : {}) };
 }
 
 export function sequentialCompletedControlMatches(observations, rule) {
   if (!rule || !Array.isArray(observations)) return false;
-  const visible = observations.filter(control => control?.visible === true);
-  if (visible.length !== 1 || visible[0].interactive !== true) return false;
-  const text = normalizeText(visible[0].text);
-  return text.length <= 120 && new RegExp(rule.textPattern, 'u').test(text);
+  const matchesText = control => {
+    const text = normalizeText(control.text);
+    return text.length <= 120 && new RegExp(rule.textPattern, 'u').test(text);
+  };
+  const visible = observations.filter(control => control?.visible === true && (!rule.matchByText || matchesText(control)));
+  if (visible.length !== 1 || visible[0].interactive !== true && rule.allowNonInteractive !== true) return false;
+  return matchesText(visible[0]);
 }
 
 export function readSequentialDailyQuota(text, step) {

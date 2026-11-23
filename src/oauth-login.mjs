@@ -6,6 +6,7 @@ import { findBookmarkTarget } from "./bookmarks.mjs";
 import { launchAutomationContext, processCandidate, dismissConfiguredPreCheckinOverlay } from "./browser.mjs";
 import { prepareOAuthTargetPage, readOAuthTargetSurface, describeOAuthFlowPages } from './oauth-target-state.mjs';
 import { waitForOAuthTargetSession, waitForOAuthTargetReturn } from './oauth-target-completion.mjs';
+import { continueOAuthProviderReturn } from './oauth-provider-return.mjs';
 import { connectOverCdpWithRetry } from "./native-cdp.mjs";
 import { selectPreferredOAuthTargetPage } from "./oauth-page-selection.mjs";
 import { linuxDoProbeFailureStage, probeProviderSessionInContext } from "./oauth-provider-session.mjs";
@@ -13,8 +14,6 @@ import { writeLinuxDoProbeDiagnostic } from "./linuxdo-probe-diagnostics.mjs";
 import {writeOAuthFlowDiagnostic} from './oauth-flow-diagnostics.mjs';
 import { rewriteConfiguredOAuthCallbackUrl } from "./oauth-callback-rewrite.mjs";
 import {
-  authorizeConfiguredOAuthProvider,
-  describeConfiguredAuthorizationSurface,
   isConfiguredProviderAuthorizationPage,
 } from "./oauth-provider-authorization.mjs";
 import { findUniqueOAuthProviderControl } from "./oauth-provider-control.mjs";
@@ -45,6 +44,7 @@ import {
 import { assertBookmarkNavigation } from "./security.mjs";
 import { getConfiguredReauthAccounts, inspectConfiguredReauthRecovery } from './reauth-checkin.mjs';
 import { oauthRetryBudgetBinding, updateOAuthRetryBudget } from './oauth-retry-budget.mjs';
+import { assertOAuthHandoffIdentity, recordOAuthHandoffCompletion } from './oauth-handoff-identity.mjs';
 import { createOAuthTimeBudget, OAuthTimeBudgetError } from './oauth-time-budget.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -89,6 +89,7 @@ const nativeCdpPort = Number.parseInt(
   10,
 );
 const useNativeCdp = Number.isInteger(nativeCdpPort) && nativeCdpPort > 0 && nativeCdpPort <= 65535;
+const nativeHandoff = process.argv.includes('--native-visible-handoff');
 if (nativeCdpPortIndex >= 0 && !useNativeCdp) throw new Error("Invalid native CDP port");
 if (checkinAfterLogin && (!useNativeCdp
   || !(config.nativeOAuthCheckinOrigins ?? []).includes(origin)
@@ -107,6 +108,15 @@ const runtimeConfig = {
   automationUserDataDir: path.resolve(rootDirectory, accountProfile),
   ...(interactiveAttention ? { backgroundWindowMode: "visible", headless: false } : {}),
 };
+const handoffStateFile = path.join(rootDirectory, 'tmp/agentrouter-manual-state.json');
+const handoffScope = { accountKey: accountId, profile: accountProfile, port: nativeCdpPort, provider, native: useNativeCdp,
+  stage: diagnosticStageIndex >= 0 ? process.argv[diagnosticStageIndex + 1] : '', root: rootDirectory };
+if (nativeHandoff) {
+  const state = JSON.parse(await fs.readFile(handoffStateFile, 'utf8'));
+  assertOAuthHandoffIdentity(state, handoffScope);
+  handoffScope.launchMarker = state.launchMarker;
+}
+const retryBudgetMode = nativeHandoff ? 'handoff' : useNativeCdp ? 'native' : 'automatic';
 let connectedNativeBrowser = null;
 
 async function openOAuthContext() {
@@ -206,6 +216,7 @@ let noticeDismissed = false;
 let noticeDismissDiagnostics = null;
 let callbackDiagnostics = null;
 let callbackWaitDiagnostics = null;
+let providerReturnDiagnostics = null;
 let terminationReason = null;
 let timeoutPhase = null;
 let lastProgressAt = -Infinity;
@@ -239,6 +250,7 @@ function oauthProgress() {
     ...(noticeDismissDiagnostics ? { noticeDismissDiagnostics } : {}),
     ...(callbackDiagnostics ? { callbackDiagnostics } : {}),
     ...(callbackWaitDiagnostics ? { callbackWaitDiagnostics } : {}),
+    ...(providerReturnDiagnostics ? { providerReturnDiagnostics } : {}),
     ...readFlowPageObservation(),
     ...(terminationReason ? { terminationReason, ...(timeoutPhase ? { timeoutPhase } : {}) } : {}),
     ...(authorizationOutcome ? { authorizationOutcome } : {}),
@@ -272,8 +284,9 @@ function observeSessionProgress(value, budgetMs) {
 setOAuthStage("target_login");
 
 async function printResult(status, details = {}) {
+  if (nativeHandoff) await recordOAuthHandoffCompletion(handoffStateFile, handoffScope, { status, oauthStage });
   if (retryBudgetReserved) {
-    await updateOAuthRetryBudget(retryBudgetBinding, useNativeCdp ? 'native' : 'automatic', {
+    await updateOAuthRetryBudget(retryBudgetBinding, retryBudgetMode, {
       status, oauthStage, callbackWaitDiagnostics, authorizationOutcome, providerAuthorizationChallengeOutcome,
     });
     retryBudgetReserved = false;
@@ -388,7 +401,9 @@ async function runProviderOnlyFlow() {
     });
     await providerPage.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
     if (isLinuxDoLoginPage(providerPage)) {
-      const recovery = await recoverSavedLinuxDoLogin(providerPage, timeBudget.timeoutMs('provider', providerWaitMs));
+      const recovery = await recoverSavedLinuxDoLogin(providerPage, timeBudget.timeoutMs('provider', providerWaitMs), {
+        socialProvider: config.linuxDoLoginRecovery?.socialProvider,
+      });
       if (recovery.challengeObserved && !recovery.recovered) {
         setOAuthStage("linuxdo_login_challenge");
       }
@@ -422,12 +437,14 @@ if (providerOnly) {
   if (/linux\s*do/i.test(provider)) {
     const budgetAccount = getConfiguredReauthAccounts({ origin, candidates: [origin], allowedOrigins: [origin] }, config)
       .find(account => account.accountKey === accountId);
+    if (nativeHandoff && !budgetAccount) throw new Error('Visible OAuth handoff account is not configured');
     if (budgetAccount) {
       if (path.resolve(budgetAccount.automationUserDataDir).toLowerCase()
         !== path.resolve(runtimeConfig.automationUserDataDir).toLowerCase()) throw new Error('OAuth budget profile mismatch');
       const recovery = await inspectConfiguredReauthRecovery(budgetAccount);
       retryBudgetBinding = oauthRetryBudgetBinding(budgetAccount, recovery.previous);
-      const reservation = await updateOAuthRetryBudget(retryBudgetBinding, useNativeCdp ? 'native' : 'automatic');
+      if (nativeHandoff && !retryBudgetBinding) throw new Error('Visible OAuth handoff requires a verified logout checkpoint');
+      const reservation = await updateOAuthRetryBudget(retryBudgetBinding, retryBudgetMode);
       if (!reservation.allowed) {
         setOAuthStage('oauth_retry_budget_exhausted');
         await printResult('needs_attention');
@@ -612,7 +629,9 @@ if (providerOnly) {
     }
     for (let attempt = 0; attempt < 2 && isLinuxDoLoginPage(page); attempt += 1) {
       setOAuthStage("linuxdo_session");
-      const recovery = await recoverSavedLinuxDoLogin(page, timeBudget.timeoutMs('provider', providerWaitMs));
+      const recovery = await recoverSavedLinuxDoLogin(page, timeBudget.timeoutMs('provider', providerWaitMs), {
+        socialProvider: config.linuxDoLoginRecovery?.socialProvider,
+      });
       if (recovery.challengeObserved && !recovery.recovered) {
         setOAuthStage("linuxdo_login_challenge");
       }
@@ -645,82 +664,32 @@ if (providerOnly) {
     await page.goto(authorizeUrl.href, { waitUntil: "domcontentloaded", timeout: timeBudget.timeoutMs('provider', config.navigationTimeoutMs) });
   }
 
-  if (isConfiguredProviderAuthorizationPage(page.url(), provider)) {
-    setOAuthStage("provider_authorization");
-    providerAuthorizationChallengeOutcome = "not_observed";
-    providerAuthorizationChallengeClicks = 0;
-    const authorizationDeadline = timeBudget.deadline('provider', providerWaitMs);
-    let authorization = null;
-    let authorizationSubmitted = false;
-    let providerChallengeObserved = false;
-    let providerChallengeClicked = false;
-    let authorizationSurfaceReported = false;
-    while (Date.now() < authorizationDeadline
-      && isConfiguredProviderAuthorizationPage(page.url(), provider)) {
-      if (!authorizationSubmitted) {
-        authorization = await authorizeConfiguredOAuthProvider(page, provider);
-        authorizationOutcome = authorization.outcome;
-        if (authorization.clicked) {
-          authorizationSubmitted = true;
-          await page.waitForTimeout(500);
-          continue;
-        }
-      }
-      const authorizationSurface = await describeConfiguredAuthorizationSurface(page, provider);
-      if ((authorizationSurface?.challengeFrameCount ?? 0) > 0) {
-        providerChallengeObserved = true;
-        if (providerAuthorizationChallengeClicks === 0) {
-          providerAuthorizationChallengeOutcome = "observed_not_clickable";
-        }
-      }
-      if (privateResult && !authorizationSurfaceReported && authorizationSurface
-        && (authorization.outcome === "authorization_not_found"
-          || (authorizationSurface.challengeFrameCount ?? 0) > 0)) {
-        process.stderr.write(`${JSON.stringify({ oauthStage, authorizationSurface })}\n`);
-        authorizationSurfaceReported = true;
-      }
-      const providerOrigin = new URL(page.url()).origin;
-      const remaining = Math.max(1, authorizationDeadline - Date.now());
-      const providerChallengeClick = await clickConfiguredLoginChallengeControl(
-        page,
-        providerOrigin,
-        config,
-        remaining,
-      );
-      if (providerChallengeClick) {
-        providerChallengeClicked = true;
-        providerChallengeObserved = true;
-        providerAuthorizationChallengeClicks += 1;
-        providerAuthorizationChallengeOutcome = providerAuthorizationChallengeClicks === 1
-          ? "clicked_once"
-          : "clicked_twice";
-        authorizationSubmitted = false;
-      }
-      await page.waitForTimeout(500);
-    }
-    if (isConfiguredProviderAuthorizationPage(page.url(), provider)) {
-      if (providerChallengeObserved) {
-        authorizationOutcome = providerChallengeClicked
-          ? "provider_challenge_unresolved"
-          : "provider_challenge_not_clickable";
-        providerAuthorizationChallengeOutcome = providerChallengeClicked
-          ? "unresolved_after_click"
-          : "observed_not_clickable";
-      }
-      throw new Error("configured OAuth provider authorization did not complete");
-    }
-    if (providerChallengeObserved) {
-      providerAuthorizationChallengeOutcome = "departed_unconfirmed";
-    }
-    await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
-    if (await linuxDoAuthorizationRequiresLogin(page, provider)) {
-      authorizationOutcome = "provider_login_required";
-      setOAuthStage("linuxdo_provider_login_required");
-      throw new Error("LinuxDO authorization returned to the provider login form");
-    }
-    // Leaving the authorize URL is a transition, not a completed callback.
-    authorizationOutcome = "authorization_departed";
-  }
+  const ssoReturnRule = configuredLinuxDoSsoChallengeRule(config, provider);
+  const providerReturn = await continueOAuthProviderReturn(page, origin, provider, config, {
+    timeBudget, waitMs: providerWaitMs,
+    ssoOptions: { allowFrameCoordinateFallback: allowLinuxDoSsoFrameClick,
+      frameStableMs: ssoReturnRule.frameStableMs, maxChallengeClicks: ssoReturnRule.loginMaxClicks,
+      challengeRetryDelayMs: ssoReturnRule.loginRetryDelayMs },
+    onStage: setOAuthStage,
+    onProgress: observation => {
+      authorizationOutcome = observation.authorizationOutcome;
+      providerAuthorizationChallengeOutcome = observation.providerAuthorizationChallengeOutcome;
+      providerAuthorizationChallengeClicks = observation.providerAuthorizationChallengeClicks;
+      providerReturnDiagnostics = observation.providerReturnDiagnostics ?? null;
+      emitOAuthProgress();
+    },
+    onAuthorizationSurface: authorizationSurface => {
+      if (privateResult) process.stderr.write(`${JSON.stringify({ oauthStage, authorizationSurface })}\n`);
+    },
+    resumeTargetOAuth: async currentPage => {
+      await currentPage.goto(loginUrl.href, { waitUntil: 'commit', timeout: timeBudget.timeoutMs('provider', config.navigationTimeoutMs) });
+      await currentPage.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => {});
+      page = await startProviderOAuth(currentPage);
+      return page;
+    },
+  });
+  page = providerReturn.page;
+  if (!providerReturn.readyForCallback) throw new Error('OAuth provider continuation did not complete');
 
   setOAuthStage("target_callback");
   const rewrittenCallback = rewriteConfiguredOAuthCallbackUrl(

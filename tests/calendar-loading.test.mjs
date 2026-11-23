@@ -66,3 +66,51 @@ test('calendar navigation outside the configured origin or path fails closed', a
     assert.deepEqual(f.waits, []);
   }
 });
+
+test('calendar diagnostics distinguish the initial shell from the final dated completion', async () => {
+  const f = fixture();
+  let reads = 0;
+  const samples = [
+    { ...empty, loaded: false, pageState: 'unconfirmed' },
+    { ...signed, loaded: true, authenticated: true, pageState: 'already_signed', currentDateCellSignedCount: 1,
+      bodyText: 'private-account-and-reward', accountId: 'private-id' },
+  ];
+  const result = await waitForCalendarDayCheckinEvidence(f.page, target, config, {
+    now: f.now, readEvidence: async () => samples[reads++],
+  });
+  assert.deepEqual(result.calendarDiagnostics, {
+    reads: 2, elapsedMs: 250, expectedDay: 9, loaded: true, domReady: null, session: 'authenticated', pageState: 'already_signed',
+    dayButtonCount: 1, currentDateCount: 1, signedCellCount: 1, explicitSuccess: true, unsignedObserved: false,
+    firstLoaded: false, firstDayButtonCount: 0, outcome: 'already_signed', budgetMs: 2000, timedOut: false,
+  });
+  const classified = classifyCalendarDayCheckinEvidence(result);
+  assert.equal(classified.status, 'already_signed');
+  assert.doesNotMatch(JSON.stringify(classified), /private-account|private-id|bodyText|accountId/);
+});
+
+test('a rendered dated completion can confirm while unrelated resources still load', async () => {
+  const f = fixture();
+  const result = await waitForCalendarDayCheckinEvidence(f.page, target, config, { now: f.now,
+    readEvidence: async () => ({ ...signed, loaded: false, domReady: true, pageState: 'already_signed' }) });
+  assert.equal(classifyCalendarDayCheckinEvidence(result).status, 'already_signed');
+  assert.equal(result.calendarDiagnostics.loaded, false);
+  assert.equal(result.calendarDiagnostics.domReady, true);
+  assert.deepEqual(f.waits, []);
+});
+
+test('loading, login and challenge blockers override calendar success until resolved', async () => {
+  for (const [blocker, status] of [
+    [{ loaded: false }, 'unconfirmed'],
+    [{ loaded: true, pageState: 'login_required' }, 'login_required'],
+    [{ loaded: true, pageState: 'interactive_challenge' }, 'interactive_challenge'],
+    [{ loaded: true, pageState: 'managed_challenge' }, 'managed_challenge'],
+    [{ loaded: true, pageState: 'deferred' }, 'needs_attention'],
+  ]) {
+    const f = fixture();
+    const result = await waitForCalendarDayCheckinEvidence(f.page, target, { ...config, calendarDayCheckinWaitMs: 0 },
+      { now: f.now, readEvidence: async () => ({ ...signed, ...blocker }) });
+    assert.equal(classifyCalendarDayCheckinEvidence(result).status, status);
+    assert.equal(result.calendarDiagnostics.outcome, status);
+    assert.deepEqual(f.waits, []);
+  }
+});

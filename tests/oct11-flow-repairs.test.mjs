@@ -12,6 +12,9 @@ import {reauthLoginFailureResult} from '../src/reauth-checkin.mjs';
 import {sanitizeOAuthFlowDiagnostic, writeOAuthFlowDiagnostic} from '../src/oauth-flow-diagnostics.mjs';
 import {nativePreflightProgress} from '../src/native-preflight-state.mjs';
 import {createNativeSafeLineReader} from '../src/native-safeline-recovery.mjs';
+import {createNativeCloudflareReader} from '../src/native-cloudflare-recovery.mjs';
+import {nativeSubmissionHandoff} from '../src/native-checkin-recovery.mjs';
+import {readCheckinFeatureStatus} from '../src/checkin-feature-status.mjs';
 
 const origin='https://daily.example';
 const target={origin};
@@ -111,10 +114,11 @@ test('native inspector executes the recovered daily action with its durable inte
   const deps={
     connectOverCdpWithRetry:async()=>({contexts:()=>[{pages:()=>[page]}],close:async()=>{closed++;}}),
     chromium:{},port:12345,maxWaitSeconds:30,expectedOrigin:origin,scope,
-    attachSubmissionScope:()=>{},guardPageSubmissions,executeCheckin:true,forceReadOnly:false,mayExecuteCheckin:false,
+    inspectionMode:'execute-checkin',
+    attachSubmissionScope:()=>{},guardPageSubmissions,executeCheckin:true,executeCalendar:false,executeDailyForm:false,executeSamePage:false,continuationOnly:false,forceReadOnly:false,mayExecuteCheckin:false,
     selectNewestOriginPage:()=>page,pagesForOrigin:()=>[page],readPageState:readState,config:{},
     actionRule:{clickChallenge:false},retryableChallengeOutcomes:new Set(),allowEndpointReady:false,
-    waitForNativeReadOnlyCompletion,resumeNativeDailyCycle,createNativeSafeLineReader,
+    waitForNativeReadOnlyCompletion,resumeNativeDailyCycle,createNativeSafeLineReader,createNativeCloudflareReader,
     waitForNativeCheckinAction:async()=>{
       await scope.begin();
       const entries=(await readSubmissionJournal(file)).entries;
@@ -123,7 +127,7 @@ test('native inspector executes the recovered daily action with its durable inte
     },
     clickVisibleNativeSafeLineControl:noChallenge,clickVisibleNativeChallengeControl:noChallenge,
     nativeEvidence:async value=>bindSuccessEvidence({...value,evidence:successEvidence('page_text','page_completion_text')},target,{}),
-    reconcileSubmissionResult,console:{log:value=>outputs.push(JSON.parse(value))},
+    reconcileSubmissionResult,nativeSubmissionHandoff,readCheckinFeatureStatus,console:{log:value=>outputs.push(JSON.parse(value))},
   };
   const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor;
   await new AsyncFunction(...Object.keys(deps),source.slice(start,end)+'\nawait inspectWithPlaywright();')(...Object.values(deps));

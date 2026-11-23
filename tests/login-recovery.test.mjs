@@ -207,7 +207,6 @@ test("OAuth helper exposes only fixed diagnostic stages", async () => {
   assert.match(source, /providerAuthorizationChallengeOutcome/);
   assert.match(source, /providerAuthorizationChallengeClicks/);
   assert.match(source, /resolved_after_click/);
-  assert.match(source, /unresolved_after_click/);
   assert.match(source, /setOAuthStage\("login_challenge"\)/);
   assert.match(source, /setOAuthStage\("linuxdo_session"\)/);
   assert.match(source, /setOAuthStage\("linuxdo_login_challenge"\)/);
@@ -218,14 +217,7 @@ test("OAuth helper exposes only fixed diagnostic stages", async () => {
   assert.match(source, /agentRouterOnly && !providerSessionConfirmed/);
   assert.match(source, /if \(agentRouterOnly\) \{[\s\S]*?probeLinuxDoSession\(context, 3\)/);
   assert.match(source, /probeLinuxDoSession\(context, 3\)[\s\S]*?acquireTargetPage\(context\)/);
-  assert.match(source, /setOAuthStage\("provider_authorization"\)/);
-  assert.match(source, /describeConfiguredAuthorizationSurface\(page, provider\)/);
-  assert.match(source, /authorizationSurfaceReported = true/);
-  assert.match(source, /clickConfiguredLoginChallengeControl\([\s\S]*?providerOrigin/);
-  assert.match(source, /isConfiguredProviderAuthorizationPage\(page\.url\(\), provider\)[\s\S]*?authorizationDeadline/);
-  assert.match(source, /authorizationSubmitted = true[\s\S]*?providerChallengeClick[\s\S]*?authorizationSubmitted = false/);
-  assert.doesNotMatch(source, /if \(!providerChallengeClicked\)/);
-  assert.match(source, /if \(isConfiguredProviderAuthorizationPage\(page\.url\(\), provider\)\) \{[\s\S]*?authorization did not complete/);
+  assert.match(source, /continueOAuthProviderReturn\(page, origin, provider, config/);
   assert.match(source, /setOAuthStage\("target_callback"\)/);
   assert.match(source, /setOAuthStage\("checkin_verification"\)/);
   assert.match(source, /nativeOAuthCheckinOrigins/);

@@ -36,9 +36,11 @@ async function readBudget(binding) {
   const entry = saved?.cycle === binding.cycle ? saved
     : { cycle: binding.cycle, automatic: 0, native: 0, challengeBlocked: false };
   if (!Object.hasOwn(entry, 'callbackBlocked')) entry.callbackBlocked = false;
+  if (!Object.hasOwn(entry, 'providerBlocked')) entry.providerBlocked = false;
+  if (!Object.hasOwn(entry, 'handoff')) entry.handoff = 0;
   if (!Number.isInteger(entry.automatic) || !Number.isInteger(entry.native)
-    || entry.automatic < 0 || entry.native < 0 || typeof entry.challengeBlocked !== 'boolean'
-    || typeof entry.callbackBlocked !== 'boolean') {
+    || entry.automatic < 0 || entry.native < 0 || !Number.isInteger(entry.handoff) || entry.handoff < 0 || entry.handoff > 1 || typeof entry.challengeBlocked !== 'boolean'
+    || typeof entry.callbackBlocked !== 'boolean' || typeof entry.providerBlocked !== 'boolean') {
     throw new Error('Invalid OAuth retry budget');
   }
   return { data: { version: 1, entries: data?.entries ?? {} }, entry };
@@ -47,24 +49,27 @@ async function readBudget(binding) {
 export async function inspectOAuthRetryBudget(binding) {
   if (!binding) return { automaticAllowed: true, nativeAllowed: true };
   const { entry } = await readBudget(binding);
-  return { automaticAllowed: !entry.challengeBlocked && !entry.callbackBlocked && entry.automatic < binding.limit,
+  return { automaticAllowed: !entry.challengeBlocked && !entry.callbackBlocked && !entry.providerBlocked && entry.automatic < binding.limit,
     nativeAllowed: entry.native < 1 };
 }
 
 export async function updateOAuthRetryBudget(binding, mode, result = null) {
   if (!binding) return { allowed: true };
-  if (!['automatic', 'native'].includes(mode)) throw new Error('Invalid OAuth retry mode');
+  if (!['automatic', 'native', 'handoff'].includes(mode)) throw new Error('Invalid OAuth retry mode');
   const lease = await acquireRunLock(`${binding.file}.lock`);
   try {
     const { data, entry } = await readBudget(binding);
     if (result === null) {
-      const allowed = mode === 'native' ? entry.native < 1
-        : !entry.challengeBlocked && !entry.callbackBlocked && entry.automatic < binding.limit;
+      const allowed = mode === 'handoff' ? entry.handoff < 1 : mode === 'native' ? entry.native < 1
+        : !entry.challengeBlocked && !entry.callbackBlocked && !entry.providerBlocked && entry.automatic < binding.limit;
       if (!allowed) return { allowed: false };
       entry[mode]++;
     } else {
       if (isUnresolvedOAuthChallenge(result)) entry.challengeBlocked = true;
       if (isStalledOAuthCallback(result)) entry.callbackBlocked = true;
+      if (result.oauthStage === 'linuxdo_sso_stalled' && result.status !== 'logged_in' && result.succeeded !== true) {
+        entry.providerBlocked = true;
+      }
     }
     data.entries[binding.key] = entry;
     await atomicWriteJson(binding.file, data);

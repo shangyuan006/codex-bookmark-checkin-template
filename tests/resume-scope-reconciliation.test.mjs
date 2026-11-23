@@ -110,7 +110,7 @@ test('production wrapper reconciles a deleted target before preflight and consum
     for (const folder of ['src', 'scripts', 'config', 'logs', 'tmp']) await fs.mkdir(path.join(dir, folder));
     await fs.cp(path.join(root, 'src'), path.join(dir, 'src'), { recursive: true });
     const deps = ['CheckinContract.generated', 'Run-Checkin', 'Resolve-Runtime', 'RunLock', 'ManualVerification',
-      'ResultContract', 'ManualAbandonment', 'NativeFallbackPolicy', 'PreflightScope', 'CheckinCycle', 'TaskRetryPolicy', 'TaskRuntimeBudget'];
+      'ResultContract', 'ManualAbandonment', 'NativeFallbackPolicy', 'PreflightScope', 'CheckinCycle', 'TaskRetryPolicy', 'TaskRuntimeBudget', 'CheckinExecutionReport'];
     for (const name of deps) await fs.copyFile(path.join(root, 'scripts', `${name}.ps1`), path.join(dir, 'scripts', `${name}.ps1`));
     const [removed, kept] = ['removed', 'kept'].map(target);
     const bookmarksPath = path.join(dir, 'bookmarks.json');
@@ -146,7 +146,11 @@ test('production wrapper reconciles a deleted target before preflight and consum
         assertManualVerificationExecution(doc,{runDate:before.runId.slice(0,8),consume:process.argv.includes('--consume-manual-verification'),
           resumeRequested:!!resume,allowSubset:true,selectedOrigins:new Set(['https://kept.example'])});
         await fs.writeFile(path.join(root,'tmp/verified.json'),JSON.stringify({remaining:doc.targets.length,resumeCount:before.results.length}));
-        const final={...before,selectedOrigins:['https://kept.example'],results:[{origin:'https://kept.example',status:'signed'}]};
+        const executionAttemptId=process.argv[process.argv.indexOf('--execution-attempt-id')+1];
+        const final={...before,runId:before.runId.slice(0,8)+'-100001-'+executionAttemptId,executionAttemptId,
+          selectedOrigins:['https://kept.example'],results:[{origin:'https://kept.example',status:'signed'}]};
+        await fs.mkdir(path.join(root,'logs',final.runId),{recursive:true});
+        await fs.writeFile(path.join(root,'logs',final.runId,'result.json'),JSON.stringify(final));
         await fs.writeFile(path.join(root,'logs/latest.json'),JSON.stringify(final));
       }
     `);

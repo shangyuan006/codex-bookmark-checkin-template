@@ -18,6 +18,24 @@ test('successful login continues native check-in and requires confirmation for t
   assert.equal(result.nativePreflight,true);
 });
 
+test('native same-page login recovery preserves its action proof and unresolved verification handoff', async () => {
+  const active = { nativeChallengePreflight: [{ url: target.origin + '/attendance.php', samePageCheckin: true }] };
+  for (const complete of [true, false]) {
+    const confirmation = { status: complete ? 'signed' : 'needs_attention',
+      actionResults: [{ actionType: 'daily_checkin', status: complete ? 'signed' : 'unconfirmed' }],
+      requiredActionTypes: ['daily_checkin'], submissionTrackedPerAction: true,
+      ...(!complete ? { failureCode: 'same_page_verification_unresolved', retryable: false, manualBrowserMode: 'native' } : {}) };
+    let calls = 0;
+    const result = await continueNativeCheckinAfterLogin(target, active, { succeeded: true }, {
+      runPreflight: async () => { calls++; }, readConfirmations: async () => new Map([[target.origin, confirmation]]),
+    });
+    assert.equal(calls, 1); assert.equal(result.status, confirmation.status);
+    assert.deepEqual(result.actionResults, confirmation.actionResults);
+    assert.deepEqual(result.requiredActionTypes, ['daily_checkin']); assert.equal(result.submissionTrackedPerAction, true);
+    if (!complete) { assert.equal(result.retryable, false); assert.equal(result.manualBrowserMode, 'native'); }
+  }
+});
+
 test('native login continuation retains the original bound completion proof through report verification',async()=>{
   const now=new Date();
   const proof=bindSuccessEvidence({origin:target.origin,status:'signed',

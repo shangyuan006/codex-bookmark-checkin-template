@@ -81,6 +81,13 @@ export function sanitizeOAuthTimingDiagnostics(value) {
 }
 
 export function sanitizeOAuthPageObservation(value) {
+  const providerReturn = value?.providerReturnDiagnostics;
+  const providerReturnDiagnostics = ['not_applicable', 'target_reached', 'callback_alias', 'provider_stalled', 'recovering_login',
+    'login_required', 'resuming_sso', 'resuming_target', 'authorizing', 'authorization_departed',
+    'authorization_pending', 'flow_closed'].includes(providerReturn?.outcome)
+    ? { outcome: providerReturn.outcome,
+      ...Object.fromEntries([['ssoVisits', 3], ['loginRecoveries', 1], ['restarts', 1]].map(([key, limit]) =>
+        [key, Math.max(0, Math.min(limit, Math.round(Number(providerReturn[key]) || 0)))])) } : null;
   const raw = value?.noticeDismissDiagnostics;
   const noticeDismissDiagnostics = ['dismissed', 'not_observed', 'control_disabled', 'observation_failed',
     'click_failed', 'no_progress', 'transition_confirmed', 'dismissal_limit'].includes(raw?.outcome)
@@ -89,6 +96,7 @@ export function sanitizeOAuthPageObservation(value) {
       transitions: Math.max(0, Math.min(5, Math.round(Number(raw.transitions) || 0))),
       elapsedMs: Math.max(0, Math.min(120_000, Math.round(Number(raw.elapsedMs) || 0))) } : null;
   return {
+    ...(providerReturnDiagnostics ? { providerReturnDiagnostics } : {}),
     ...(Array.isArray(value?.flowPageKinds) ? { flowPageKinds: [...new Set(value.flowPageKinds
       .filter(kind => flowPageKinds.has(kind)))].slice(0, flowPageKinds.size) } : {}),
     ...(flowPageKinds.has(value?.currentPageKind) ? { currentPageKind: value.currentPageKind } : {}),

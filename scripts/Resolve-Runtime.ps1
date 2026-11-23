@@ -1,4 +1,4 @@
-function Resolve-CheckinExecutable {
+﻿function Resolve-CheckinExecutable {
     param(
         [string]$Configured,
         [string[]]$CommandNames,
@@ -38,7 +38,7 @@ function Resolve-CheckinBrowser {
         [string]$Config.chromeExecutable
     }
     $browserId = if ($Config.browser) { [string]$Config.browser } else { 'chrome' }
-    $commandNames = if ($browserId -eq 'edge') { @('msedge.exe') } else { @('chrome.exe') }
+    $commandNames = @(if ($browserId -eq 'edge') { 'msedge.exe' } else { 'chrome.exe' })
     $executable = Resolve-CheckinExecutable -Configured $configured -CommandNames $commandNames -Optional:$OptionalExecutable
     $processName = if ($Config.browserProcessName) {
         [string]$Config.browserProcessName
@@ -63,6 +63,127 @@ function Resolve-CheckinBrowser {
     }
 }
 
+function Get-CheckinWmiProcesses {
+    param([Parameter(Mandatory = $true)][string]$Filter)
+
+    # Use the same local Win32 provider and permissions. Never substitute an
+    # empty inventory when either query fails.
+    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+        return @(Get-WmiObject -Class Win32_Process -Filter $Filter -ErrorAction Stop)
+    }
+    Add-Type -AssemblyName System.Management -ErrorAction Stop
+    $searcher = [System.Management.ManagementObjectSearcher]::new("SELECT Name,ProcessId,CommandLine FROM Win32_Process WHERE $Filter")
+    $searcher.Options.Timeout = [TimeSpan]::FromSeconds(5)
+    $collection = $null
+    try {
+        $collection = $searcher.Get()
+        return @($collection | ForEach-Object {
+            [pscustomobject]@{ Name = [string]$_.Name; ProcessId = [int]$_.ProcessId; CommandLine = [string]$_.CommandLine }
+        })
+    }
+    finally {
+        if ($collection) { $collection.Dispose() }
+        $searcher.Dispose()
+    }
+}
+
+function Get-CheckinCimProcesses {
+    param([Parameter(Mandatory = $true)][string]$Filter)
+
+    # A cancelled inventory is unknown, not an empty list of running browsers.
+    $retryDelays = @(250, 750, 1500)
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try { return @(Get-CimInstance -ClassName Win32_Process -Filter $Filter -OperationTimeoutSec 5 -ErrorAction Stop) }
+        catch {
+            if ($attempt -eq 4) {
+                try { return @(Get-CheckinWmiProcesses -Filter $Filter) } catch { }
+                try { return @(Get-CheckinDirectProcesses -Filter $Filter) } catch { }
+                throw [System.Management.Automation.ErrorRecord]::new(
+                    [System.InvalidOperationException]::new('无法确认项目浏览器进程，保留会话状态。'),
+                    'CheckinProcessQueryFailed', [System.Management.Automation.ErrorCategory]::ResourceUnavailable, $null)
+            }
+            Start-Sleep -Milliseconds $retryDelays[$attempt - 1]
+        }
+    }
+}
+
+function Get-CheckinLocalProcessSnapshot {
+    param([string]$ProcessName, [int]$ProcessId = 0)
+    # Enumerate locally without WMI list queries. Reading any matching start
+    # time must succeed: an inaccessible process is not an absent process.
+    return @(Get-Process -ErrorAction Stop | Where-Object {
+        if ($ProcessId -gt 0) { $_.Id -eq $ProcessId }
+        else { $_.ProcessName -ieq [IO.Path]::GetFileNameWithoutExtension($ProcessName) }
+    } | ForEach-Object {
+        [pscustomobject]@{ ProcessId = [int]$_.Id; Name = "$($_.ProcessName).exe"
+            StartedAt = $_.StartTime.ToUniversalTime() }
+    })
+}
+
+function Get-CheckinDirectProcessObject {
+    param([int]$ProcessId, [int]$TimeoutSeconds = 5)
+    Add-Type -AssemblyName System.Management -ErrorAction Stop
+    $options = [System.Management.ObjectGetOptions]::new()
+    $options.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+    $item = [System.Management.ManagementObject]::new([System.Management.ManagementScope]::new(),
+        [System.Management.ManagementPath]::new("Win32_Process.Handle='$ProcessId'"), $options)
+    try {
+        $item.psbase.Get()
+        return [pscustomobject]@{ Name = [string]$item['Name']; ProcessId = [int]$item['ProcessId']
+            CommandLine = [string]$item['CommandLine']
+            StartedAt = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$item['CreationDate']).ToUniversalTime() }
+    }
+    finally { $item.psbase.Dispose() }
+}
+
+function Get-CheckinDirectProcesses {
+    param([Parameter(Mandatory = $true)][string]$Filter)
+    $processName = ''; $processId = 0
+    if ($Filter -match "^Name='([a-zA-Z0-9_.-]+\.exe)'$") { $processName = $Matches[1] }
+    elseif ($Filter -match '^ProcessId=([1-9][0-9]*)$' -and [int]::TryParse($Matches[1], [ref]$processId)) { }
+    else { throw 'Unsupported direct process query' }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        try {
+            $before = @(Get-CheckinLocalProcessSnapshot -ProcessName $processName -ProcessId $processId)
+            if ($before.Count -gt 256) { throw 'Direct process inventory limit exceeded' }
+            $rows = @()
+            foreach ($candidate in $before) {
+                if ($clock.Elapsed.TotalSeconds -ge 45) { throw 'Direct process inventory timeout' }
+                $row = Get-CheckinDirectProcessObject -ProcessId $candidate.ProcessId
+                if ($row.ProcessId -ne $candidate.ProcessId -or $row.Name -ine $candidate.Name `
+                    -or -not $row.CommandLine -or $null -eq $row.StartedAt `
+                    -or [Math]::Abs(($row.StartedAt - $candidate.StartedAt).TotalSeconds) -gt 1) {
+                    throw 'Direct process identity changed'
+                }
+                $rows += $row
+            }
+            $after = @(Get-CheckinLocalProcessSnapshot -ProcessName $processName -ProcessId $processId)
+            if ($clock.Elapsed.TotalSeconds -ge 45 -or $before.Count -ne $after.Count) { throw 'Incomplete direct inventory' }
+            foreach ($candidate in $before) {
+                $matching = @($after | Where-Object {
+                    $_.ProcessId -eq $candidate.ProcessId -and $_.Name -ieq $candidate.Name `
+                        -and $_.StartedAt.Ticks -eq $candidate.StartedAt.Ticks
+                })
+                if ($matching.Count -ne 1) { throw 'Direct inventory changed during lookup' }
+            }
+            return $rows
+        }
+        catch {
+            if ($attempt -eq 1 -or $clock.Elapsed.TotalSeconds -ge 45) { throw }
+        }
+    }
+}
+
+function Test-CheckinBrowserProfileArgument {
+    param([string]$CommandLine, [string]$ProfilePath)
+    $matchesFound = [regex]::Matches($CommandLine, '(?:^|\s)(?:"--user-data-dir=([^"]+)"|--user-data-dir="([^"]+)"|--user-data-dir=([^\s"]+))(?=\s|$)')
+    if ($matchesFound.Count -ne 1) { return $false }
+    $value = @($matchesFound[0].Groups | Select-Object -Skip 1 | Where-Object { $_.Success })[0].Value
+    try { return [string]::Equals([IO.Path]::GetFullPath($value), [IO.Path]::GetFullPath($ProfilePath), [StringComparison]::OrdinalIgnoreCase) }
+    catch { return $false }
+}
+
 function Get-CheckinProfileBrowserProcesses {
     param(
         $Config,
@@ -72,8 +193,9 @@ function Get-CheckinProfileBrowserProcesses {
 
     $browser = Resolve-CheckinBrowser $Config -OptionalExecutable
     $resolvedProfilePath = [System.IO.Path]::GetFullPath($ProfilePath)
-    return @(Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$resolvedProfilePath*"
+    if ($browser.ProcessName -notmatch '^[a-zA-Z0-9_.-]+\.exe$') { throw 'Invalid browser process name' }
+    return @(Get-CheckinCimProcesses -Filter "Name='$($browser.ProcessName)'" | Where-Object {
+        $_.Name -ieq $browser.ProcessName -and (Test-CheckinBrowserProfileArgument $_.CommandLine $resolvedProfilePath)
     })
 }
 
@@ -96,7 +218,7 @@ function Wait-CheckinVisibleBrowserWindow {
     $stableSince = $null
     do {
         $marked = @(Get-CheckinProfileBrowserProcesses -Config $Config -ProfilePath $ProfilePath | Where-Object {
-            $_.CommandLine -like "*--checkin-launch=$LaunchMarker*"
+            $_.CommandLine -match "(?:^|\s)--checkin-launch=$LaunchMarker(?:\s|$)"
         })
         $visible = @($marked | ForEach-Object {
             Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue
@@ -187,15 +309,29 @@ function Get-CheckinManualSessionBrowserProcesses {
         [string]$ProfilePath
     )
 
-    $profileProcesses = @(Get-CheckinProfileBrowserProcesses -Config $Config -ProfilePath $ProfilePath)
+    try { $profileProcesses = @(Get-CheckinProfileBrowserProcesses -Config $Config -ProfilePath $ProfilePath) }
+    catch {
+        # A tracked PID permits a narrower query; it still needs the profile,
+        # launch marker and start time below before any process can be used.
+        if (-not $State.pid -or -not $State.processStartedAt -or [string]$State.launchMarker -notmatch '^[a-f0-9]{32}$') { throw }
+        $trackedPid = 0
+        if (-not [int]::TryParse([string]$State.pid, [ref]$trackedPid) -or $trackedPid -le 0) { throw }
+        $browser = Resolve-CheckinBrowser $Config -OptionalExecutable
+        $profileProcesses = @(Get-CheckinCimProcesses -Filter "ProcessId=$trackedPid" | Where-Object {
+            $_.Name -ieq $browser.ProcessName -and (Test-CheckinBrowserProfileArgument $_.CommandLine $ProfilePath)
+        })
+    }
     if ($profileProcesses.Count -eq 0) { return @() }
 
     $launchMarker = [string]$State.launchMarker
     if ($launchMarker -and $launchMarker -match '^[a-f0-9]{32}$') {
         $marked = @($profileProcesses | Where-Object {
-            $_.CommandLine -like "*--checkin-launch=$launchMarker*"
+            $_.CommandLine -match "(?:^|\s)--checkin-launch=$launchMarker(?:\s|$)" -and `
+                (-not $State.pid -or [int]$_.ProcessId -eq [int]$State.pid) -and `
+                (-not $State.processStartedAt -or (Test-CheckinProcessStartIdentity `
+                    (Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue) $State.processStartedAt))
         })
-        if ($marked.Count -gt 0) { return $marked }
+        return $marked
     }
 
     $recordedStartValue = if ($State.processStartedAt) {

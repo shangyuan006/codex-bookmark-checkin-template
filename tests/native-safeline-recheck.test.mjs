@@ -38,6 +38,7 @@ function Close-AutomationBrowser {param($ProfilePath)}
 function Complete-NativePreflightAttempt {param($Cleanup,$Failure) & $Cleanup}
 function Write-NativePreflightCheckpoint {param($Path,$Results,$Config)}
 function Get-NativePreflightConfirmationStatus {param($Inspection,$Explicit,$Endpoint) $Inspection.status}
+function Test-ConfirmedNotAvailable {param($Result) $false}
 ${source.slice(start, end)}
 [pscustomobject]@{attempted=$readOnlyRecheckAttempted;status=$lastInspection.status;safeLine=$lastInspection.safeLineDiagnostics;readOnly=$lastInspection.readOnlyDiagnostics}|ConvertTo-Json -Compress
 `], { windowsHide: true, timeout: 20000 });

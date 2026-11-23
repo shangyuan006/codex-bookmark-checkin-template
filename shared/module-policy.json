@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "production": [
+    "src/index.mjs",
+    "scripts/Run-Checkin.ps1",
+    "scripts/Start-UserScheduler.ps1",
+    "scripts/Ensure-UserScheduler.ps1"
+  ],
+  "manual": [
+    "src/health-cli.mjs",
+    "src/code-release.mjs",
+    "src/status-dashboard.mjs",
+    "src/unknown-summary.mjs",
+    "src/preflight.mjs",
+    "src/inspect-target.mjs",
+    "src/checkin-api.mjs",
+    "src/search-site-checkin.mjs",
+    "src/repair-local-results.mjs",
+    "src/module-reachability.mjs",
+    "src/private-value-scan.mjs",
+    "src/runtime-integrity.mjs",
+    "scripts/Initialize-Checkin.ps1",
+    "scripts/Initialize-BrowserProfile.ps1",
+    "scripts/Invoke-NpmAuditWithRetry.ps1",
+    "scripts/Install-ScheduledTask.ps1",
+    "scripts/Install-UserScheduler.ps1",
+    "scripts/Remove-ScheduledTask.ps1",
+    "scripts/Remove-UserScheduler.ps1",
+    "scripts/Test-Environment.ps1",
+    "scripts/Get-ManualHandoffStatus.ps1",
+    "scripts/Invoke-PendingAccountVerification.ps1",
+    "scripts/Test-CheckinHealth.ps1",
+    "scripts/Scan-PublicSafety.ps1",
+    "scripts/Export-PublicBundle.ps1",
+    "scripts/Clear-AutomationChromeCache.ps1",
+    "scripts/Set-TodayAbandonment.ps1",
+    "scripts/Set-ProtectedSiteCredential.ps1",
+    "scripts/Test-AgentRouterLinuxDoTurnstile.ps1",
+    "scripts/generate-checkin-contract.mjs"
+  ],
+  "historical": []
+}

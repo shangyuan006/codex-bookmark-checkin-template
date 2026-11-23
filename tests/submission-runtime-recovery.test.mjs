@@ -65,7 +65,7 @@ test("automatic wrapper resumes only after a fresh negative observation, once",a
   const result=await runWithSubmissionJournal(file,target,{},async config=>{
     phases.push(config.checkinReadOnly);
     if(config.checkinReadOnly) return dailyReadinessEvidence(target,{}, {source:"status_endpoint",now});
-    assert.equal((await readSubmissionJournal(file)).entries[1].state,"intent");
+    assert.equal((await readSubmissionJournal(file)).entries.length,1,'navigation has not submitted anything');
     await config[SUBMISSION_SCOPE].begin();
     return completion();
   },{now:()=>now});
@@ -101,7 +101,11 @@ test("reauth continuation requires an explicit recurring rule and matching isola
   const identity={...target,accountKey:"github",actionType:"reauth"};const {file}=await fixture(t,identity);
   const config={reauthCheckinRules:{[origin]:{allowCycleContinuation:true}},agentrouterAccounts:[{origin,accountKey:"github"}]};
   const proof=dailyReadinessEvidence(identity,config,{source:"reauth_state",outcome:"configured_daily_reauth_due",authoritative:false,now});
-  const result=await runWithSubmissionJournal(file,identity,config,async c=>c.checkinReadOnly?proof:completion(identity,"reauth_state"),{now:()=>now});
+  const result=await runWithSubmissionJournal(file,identity,config,async c=>{
+    if(c.checkinReadOnly)return proof;
+    await c[SUBMISSION_SCOPE].begin();
+    return completion(identity,"reauth_state");
+  },{now:()=>now});
   assert.equal(result.status,"signed");assert.equal((await readSubmissionJournal(file)).entries.length,2);
   const denied=await fixture(t,identity);
   await assert.rejects(createSubmissionScope(denied.file,identity,{...config,agentrouterAccounts:[{origin,accountKey:"linuxdo"}]},{now:()=>now}).beginNewCycleAfterVerifiedReadiness(proof));

@@ -71,10 +71,13 @@ if (Test-Path -LiteralPath $statePath) {
     if (-not $trackedStateMatches) {
         throw 'The tracked Agent Router manual login state belongs to a different account or profile.'
     }
-    $trackedProcesses = @(Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profile*"
-    })
+    $trackedProcesses = @(Get-CheckinProfileBrowserProcesses -Config $config -ProfilePath $profile)
     if ($trackedProcesses.Count -gt 0) {
+        if ($provider -eq 'LinuxDO' -and $trackedState.nativeDebugPort `
+            -and (Test-Path -LiteralPath (Join-Path $root 'tmp\agentrouter-native-state.json'))) {
+            & (Join-Path $PSScriptRoot 'Resume-AgentRouterNativeWindow.ps1') -AccountKey $requestedAccountKey
+            return
+        }
         throw 'An Agent Router manual login state is already tracked. Close or complete it first.'
     }
     # A crashed or externally closed dedicated window can leave only this
@@ -82,9 +85,12 @@ if (Test-Path -LiteralPath $statePath) {
     # stage; the encrypted browser profile remains untouched.
     Remove-Item -LiteralPath $statePath -Force -ErrorAction Stop
 }
-$existingProfileProcesses = @(Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profile*"
-})
+$existingProfileProcesses = @(Get-CheckinProfileBrowserProcesses -Config $config -ProfilePath $profile)
+if ($provider -eq 'LinuxDO' -and (Test-Path -LiteralPath (Join-Path $root 'tmp\agentrouter-native-state.json'))) {
+    & (Join-Path $PSScriptRoot 'Resume-AgentRouterNativeWindow.ps1') -AccountKey $requestedAccountKey
+    if (Test-Path -LiteralPath $statePath) { return }
+    $existingProfileProcesses = @(Get-CheckinProfileBrowserProcesses -Config $config -ProfilePath $profile)
+}
 if ($existingProfileProcesses.Count -gt 0) { throw 'The selected Agent Router profile is already in use.' }
 
 if ($provider -eq 'LinuxDO' -and -not $targetFirstOAuth -and (Test-Path -LiteralPath $providerStagePath)) {
@@ -183,7 +189,7 @@ function Get-AgentRouterRecoveryAction {
     for ($index = $probeOutput.Count - 1; $index -ge 0; $index--) {
         try {
             $probe = [string]$probeOutput[$index] | ConvertFrom-Json
-            if ([string]$probe.action -in @('restart', 'resume', 'complete')) {
+            if ([string]$probe.action -in @('restart', 'resume', 'complete', 'verify_logout')) {
                 $script:oauthAutomaticAllowed = $probe.automaticAllowed -ne $false
                 return [string]$probe.action
             }
@@ -202,6 +208,15 @@ function Invoke-AgentRouterAccountCheckin([switch]$VerifyOnly) {
     )
     if ($VerifyOnly) { $runArguments += '-PostOAuthVerify' }
     & $powershell @runArguments | Out-Host
+    if ($LASTEXITCODE -eq 75) {
+        if ($VerifyOnly) {
+            . (Join-Path $PSScriptRoot 'AgentRouterVerificationQueue.ps1')
+            $null = Add-AgentRouterVerificationRequest -Root $root -AccountKey $requestedAccountKey
+            Write-Warning "Account '$requestedAccountKey' is queued for verification after the active manual session ends."
+            return 75
+        }
+        throw '签到流程正在被其他任务或人工窗口占用，本次未执行，也未确认账号签到完成；关闭并保存窗口后再续跑。'
+    }
     return $LASTEXITCODE
 }
 
@@ -291,7 +306,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
 
     }
 
-    if ($recoveryAction -eq 'restart') {
+    if ($recoveryAction -in @('restart', 'verify_logout')) {
         # The automatic run may have stopped BEFORE target logout. Let the
         # daily state machine establish that boundary before any login-only helper.
         $checkinExitCode = Invoke-AgentRouterAccountCheckin
@@ -385,9 +400,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
         Write-Output "LinuxDO authorization Turnstile outcome: $providerAuthorizationChallengeOutcome (clicks=$providerAuthorizationChallengeClicks)."
     }
     if ([string]$automaticResult.status -eq 'logged_in') {
-        if (@(Get-CimInstance Win32_Process | Where-Object {
-            $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profile*"
-        }).Count -gt 0) {
+        if (@(Get-CheckinProfileBrowserProcesses -Config $config -ProfilePath $profile).Count -gt 0) {
             throw 'Automatic Agent Router OAuth completed but its isolated browser did not close.'
         }
         $checkinExitCode = Invoke-AgentRouterAccountCheckin -VerifyOnly
@@ -399,7 +412,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     $safeOAuthStages = @(
         'oauth_retry_budget_exhausted',
         'target_login', 'logout_verification', 'provider_button', 'login_challenge', 'provider_transition',
-        'linuxdo_session', 'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'provider_session',
+        'linuxdo_session', 'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'linuxdo_sso_stalled', 'provider_session',
         'provider_authorization', 'target_callback',
         'session_verification', 'checkin_verification', 'completed'
     )
@@ -418,9 +431,7 @@ if ($provider -eq 'LinuxDO' -and $AgentRouterOnly) {
     }
     else { 'not_observed' }
     Write-Warning "Automatic Agent Router OAuth did not complete (stage=$failedStage, authorization=$failedAuthorization)."
-    if (@(Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -ieq $browser.ProcessName -and $_.CommandLine -like "*$profile*"
-    }).Count -gt 0) {
+    if (@(Get-CheckinProfileBrowserProcesses -Config $config -ProfilePath $profile).Count -gt 0) {
         throw 'Automatic Agent Router OAuth failed while its isolated browser remained open; refusing to open a second window.'
     }
     $targetCompletionProbe = Get-AgentRouterTargetCompletionProbe
@@ -502,17 +513,25 @@ $state = [ordered]@{
     stage = if ($ProviderOnly) { 'provider' } else { 'agentrouter' }
     continueToAgentRouter = $ContinueToAgentRouter.IsPresent
 }
+if ($nativeOAuthHandoff) { $state.nativeDebugPort = $nativeDebugPort }
 [System.IO.File]::WriteAllText(
     $statePath,
     ($state | ConvertTo-Json -Depth 4),
     [System.Text.UTF8Encoding]::new($false)
 )
 if ($nativeOAuthHandoff) {
+    $watchScript = Join-Path $PSScriptRoot 'Watch-AgentRouterLogin.ps1'
+    if (Test-Path -LiteralPath $watchScript) {
+        $watchShell = Resolve-AgentRouterPowerShellExecutable
+        Start-Process -FilePath $watchShell -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', ('"' + $watchScript + '"'), '-AccountKey', $requestedAccountKey, '-SessionMarker', $launchMarker) -WindowStyle Hidden | Out-Null
+    }
     $nativeArguments = @(
         (Join-Path $root 'src\oauth-login.mjs'), 'https://agentrouter.org', $provider,
         '--login-url', 'https://agentrouter.org/login',
         '--automation-user-data-dir', $profile, '--account-id', $requestedAccountKey,
         '--native-cdp-port', [string]$nativeDebugPort,
+        '--native-visible-handoff',
         '--diagnostic-stage', 'manual_target_oauth', '--private-result'
     )
     if ($null -ne $account.oauthWaitMs) { $nativeArguments += @('--wait-ms', [string]$account.oauthWaitMs) }
@@ -530,9 +549,38 @@ if ($nativeOAuthHandoff) {
         }
         catch { }
     }
+    if ([string]$nativeResult.status -ne 'logged_in' -and [string]$nativeResult.oauthStage -eq 'provider_authorization') {
+        # The retained authorization page can finish rendering after the first
+        # helper returns. Re-read it once without starting another OAuth flow.
+        $continuationHelper = Join-Path $root 'src\native-oauth-continuation.mjs'
+        $continuationOutput = @(& $node $continuationHelper ([string]$nativeDebugPort) $requestedAccountKey 2>$null)
+        for ($index = $continuationOutput.Count - 1; $index -ge 0; $index--) {
+            try {
+                $continuation = [string]$continuationOutput[$index] | ConvertFrom-Json
+                if ([string]$continuation.status -in @('logged_in', 'needs_attention')) {
+                    $nativeResult = $continuation
+                    break
+                }
+            }
+            catch { }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $statePath)) {
+        # The identity-bound observer may already have saved this window and
+        # queued its reward check while the native helper was shutting down.
+        Write-Output 'Native OAuth window has already been handed to the completion queue.'
+        return
+    }
+    $latestNativeState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+    if ([string]$latestNativeState.accountKey -cne $requestedAccountKey -or [string]$latestNativeState.launchMarker -cne $launchMarker) {
+        throw 'The native OAuth session changed before completion.'
+    }
+    $state = $latestNativeState
+    if ([string]$state.oauthCompletion.status -eq 'logged_in' -and [string]$state.oauthCompletion.oauthStage -eq 'completed' `
+        -and [string]$state.oauthCompletion.launchMarker -ceq $launchMarker) { $nativeResult = [pscustomobject]@{ status = 'logged_in' } }
     if ([string]$nativeResult.status -eq 'logged_in') {
-        & (Join-Path $PSScriptRoot 'Close-AgentRouterLogin.ps1') -AccountKey $requestedAccountKey
-        $checkinExitCode = Invoke-AgentRouterAccountCheckin -VerifyOnly
+        & (Join-Path $PSScriptRoot 'Complete-AgentRouterLogin.ps1') -AccountKey $requestedAccountKey -ExpectedLaunchMarker $launchMarker
+        $checkinExitCode = $LASTEXITCODE
         if ($checkinExitCode -ne 0) { exit $checkinExitCode }
         Remove-Item -LiteralPath $providerStagePath -Force -ErrorAction SilentlyContinue
         Write-Output "Native Agent Router OAuth completed and today's account reward was authoritatively verified."
@@ -540,10 +588,11 @@ if ($nativeOAuthHandoff) {
     }
     $handoffStages = @('target_login', 'provider_button', 'provider_transition', 'login_challenge',
         'oauth_retry_budget_exhausted',
-        'linuxdo_session', 'linuxdo_login_challenge', 'linuxdo_provider_login_required',
+        'linuxdo_session', 'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'linuxdo_sso_stalled',
         'provider_authorization', 'target_callback', 'session_verification')
     $handoffStage = if ([string]$nativeResult.oauthStage -in $handoffStages) { [string]$nativeResult.oauthStage } else { 'unknown' }
-    $state.handoffStage = $handoffStage
+    $state | Add-Member -NotePropertyName handoffStage -NotePropertyValue $handoffStage -Force
+    $state | Add-Member -NotePropertyName nativeContinuationReady -NotePropertyValue $true -Force
     [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
     if ($handoffStage -eq 'oauth_retry_budget_exhausted') {
         Write-Output 'The automatic OAuth budget for this logout is exhausted. This dedicated window is for manual login only; no further automatic OAuth was attempted.'

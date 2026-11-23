@@ -856,6 +856,9 @@ test("missing-entry completion requires a stable authenticated loaded home page"
   }
   const wrongPage = await verifyMissingNavigationControl({ ...page, url: () => `${target.origin}/unrelated.php` }, target, target.origin, config);
   assert.equal(wrongPage.terminalUnconfirmed.failureCode, "terminal_home_unconfirmed");
+  const renamed = await verifyMissingNavigationControl({ ...page,
+    evaluate: async () => ({ ...snapshot, expectedNavigationPresent: true }) }, target, target.origin, config);
+  assert.equal(renamed.terminalUnconfirmed.failureCode, 'terminal_navigation_changed');
   const reappeared = await verifyMissingNavigationControl({ ...page,
     locator: () => ({ count: async () => 1, nth: () => ({ isVisible: async () => true }) }) }, target, target.origin, config);
   assert.equal(reappeared.terminalUnconfirmed.failureCode, "terminal_control_reappeared");

@@ -75,3 +75,20 @@ function Get-NormalizedCheckinResultStatus($Result, [datetime]$Now = (Get-Date))
     }
     return 'unconfirmed'
 }
+
+function Get-CheckinCompletionSummary($Results) {
+    $authoritative = 0
+    $localRule = 0
+    $unbound = 0
+    foreach ($result in @($Results)) {
+        $items = if ($null -ne $result.accountResults -and @($result.accountResults).Count -gt 0) { @($result.accountResults) } else { @($result) }
+        foreach ($item in $items) {
+            if ([string]$item.status -notin $script:CheckinSuccessStatuses) { continue }
+            if (-not (Test-CheckinBoundSuccessEvidence $item)) { $unbound++; continue }
+            if ([string]$item.evidence.source -eq 'user_rule') { $localRule++ }
+            elseif ($item.evidence.authoritative -eq $true -and [string]$item.evidence.source -in @('page_text','status_endpoint','reward_log','reauth_state')) { $authoritative++ }
+            else { $unbound++ }
+        }
+    }
+    return "页面/接口确认 $authoritative；本地规则确认 $localRule；证据不完整 $unbound"
+}

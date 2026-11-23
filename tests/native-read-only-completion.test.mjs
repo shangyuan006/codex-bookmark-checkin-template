@@ -4,6 +4,9 @@ import fs from 'node:fs/promises';
 import { waitForNativeReadOnlyCompletion, resumeNativeDailyCycle } from '../src/native-checkin-state.mjs';
 import { guardPageSubmissions } from '../src/submission-guard.mjs';
 import { createNativeSafeLineReader } from '../src/native-safeline-recovery.mjs';
+import { createNativeCloudflareReader } from '../src/native-cloudflare-recovery.mjs';
+import { nativeSubmissionHandoff } from '../src/native-checkin-recovery.mjs';
+import { readCheckinFeatureStatus } from '../src/checkin-feature-status.mjs';
 
 const origin = 'https://completion.example';
 
@@ -59,9 +62,11 @@ for (const [withSafeLine, forceReadOnly] of [[false, false], [true, false], [fal
     chromium: {}, port: 12345, maxWaitSeconds: 30, expectedOrigin: origin,
     scope: { observe: async value => { observed = value; }, allPending: async () => [] },
     attachSubmissionScope: () => {}, guardPageSubmissions,
-    executeCheckin: true, forceReadOnly, mayExecuteCheckin: false, selectNewestOriginPage: () => page, pagesForOrigin: () => [page],
+    inspectionMode: forceReadOnly ? 'verify-checkin' : 'execute-checkin',
+    executeCheckin: true, executeCalendar: false, executeDailyForm: false, executeSamePage: false, continuationOnly: false, forceReadOnly, mayExecuteCheckin: false, selectNewestOriginPage: () => page, pagesForOrigin: () => [page],
     readPageState: state, config: {}, actionRule: {}, retryableChallengeOutcomes: new Set(), allowEndpointReady: false,
     resumeNativeDailyCycle,
+    createNativeCloudflareReader,
     createNativeSafeLineReader: (expected, options) => createNativeSafeLineReader(expected, {
       ...options, recover: async () => {
         confirmations++; recovered = true;
@@ -71,7 +76,7 @@ for (const [withSafeLine, forceReadOnly] of [[false, false], [true, false], [fal
     waitForNativeReadOnlyCompletion: (activePage, expected, config, options) => waitForNativeReadOnlyCompletion(activePage, expected, config,
       { ...options, now: () => time }),
     waitForNativeCheckinAction: noAction, clickVisibleNativeChallengeControl: noAction,
-    nativeEvidence: async value => value, reconcileSubmissionResult: value => value,
+    nativeEvidence: async value => value, reconcileSubmissionResult: value => value, nativeSubmissionHandoff, readCheckinFeatureStatus,
     Date: { now: () => time }, console: { log: value => outputs.push(JSON.parse(value)) },
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;

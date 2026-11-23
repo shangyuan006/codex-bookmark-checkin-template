@@ -12,6 +12,12 @@ function ConvertTo-ManualVerificationOrigin($Value) {
     return "$($uri.Scheme)://$($uri.Authority)"
 }
 
+function Test-ManualLoginContinuationTarget($Target) {
+    return [string]$Target.previousStatus -ceq 'login_required' -or (
+        [string]$Target.previousStatus -ceq 'needs_attention' -and (
+            $Target.loginRecoveryRequired -eq $true -or [string]$Target.failureCode -ceq 'login_recovery_requires_manual'))
+}
+
 function Test-ManualVerificationTerminalStatus($Status, $Evidence = $null) {
     if ([string]$Status -in $script:ManualVerificationTerminalStatuses) { return $true }
     if ([string]$Status -ne 'not_available') { return $false }
@@ -24,8 +30,8 @@ function Test-ManualVerificationTerminalStatus($Status, $Evidence = $null) {
     })
 }
 
-function Test-ManualVerificationResultTerminal($Result) {
-    return Test-CheckinResultTerminal $Result
+function Test-ManualVerificationResultTerminal($Result, [datetime]$Now = (Get-Date)) {
+    return Test-CheckinResultTerminal $Result $Now
 }
 
 function Test-ManualVerificationTargetTerminal($Target) {
@@ -90,6 +96,29 @@ function Remove-ManualHandoffLaunch([string]$Path, [string]$LaunchId) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     $value = Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json
     if ([string]$value.launchId -eq $LaunchId) { Remove-Item -LiteralPath $Path -Force }
+}
+
+function Write-ManualHandoffLaunchOutcome {
+    param([string]$Root, [string]$LaunchId, [int]$Attempt,
+        [ValidateSet('window_ready', 'retrying', 'failed')][string]$State,
+        [ValidateSet('none', 'process_query_failed', 'startup_failed')][string]$FailureCode = 'none')
+    if ($LaunchId -notmatch '^[a-f0-9]{32}$') { throw 'Invalid manual handoff launch identity.' }
+    $value = [ordered]@{ schemaVersion = 1; launchId = $LaunchId; attempt = $Attempt
+        state = $State; failureCode = $FailureCode; observedAt = [datetime]::UtcNow.ToString('o') }
+    $path = Join-Path $Root 'tmp\manual-handoff-launch-outcome.json'
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+    $temporary = "$path.$PID.tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $path -Force
+    } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    $message = switch ($State) {
+        'window_ready' { '人工项目窗口已确认就绪。' }
+        'retrying' { "人工窗口启动失败（$FailureCode），已确认无活动项目会话，将有限重试。" }
+        'failed' { "人工窗口未确认就绪（$FailureCode）；保留待处理队列及已有会话。" }
+    }
+    [void][IO.Directory]::CreateDirectory((Join-Path $Root 'logs'))
+    Add-Content -LiteralPath (Join-Path $Root 'logs\scheduler.log') -Encoding UTF8 -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $message"
 }
 
 function Get-ManualVerificationShanghaiDate([datetime]$Value) {
@@ -170,6 +199,9 @@ function Get-ManualHandoffTargets($Report, [datetime]$Now = (Get-Date)) {
                 origin = $origin
                 previousStatus = [string]$result.status
             }
+            if ($result.loginRecoveryRequired -eq $true -or [string]$result.failureCode -ceq 'login_recovery_requires_manual') {
+                $target.loginRecoveryRequired = $true
+            }
             # Agent Router accountKey values are local anonymous selectors,
             # not site identities. Preserve only unresolved nested account
             # keys so the scheduler can select the dedicated two-stage flow.
@@ -226,6 +258,32 @@ function Get-ManualVerificationRetryOrigins($Pending, $Report, [datetime]$RetryA
     return @($retryOrigins | Sort-Object -Unique)
 }
 
+function Write-ManualVerificationDocument($Document, [string]$Path) {
+    $temporaryPath = "$Path.$PID.tmp"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryPath,
+            ($Document | ConvertTo-Json -Depth 16),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-ManualVerificationTransferredTargets($Pending, [string]$Path, [string[]]$Origins) {
+    $Pending.Document.targets = @($Pending.Document.targets | Where-Object {
+        (ConvertTo-ManualVerificationOrigin $_.origin) -notin $Origins
+    })
+    if (@($Pending.Document.targets | Where-Object { -not (Test-ManualVerificationTargetTerminal $_) }).Count -eq 0) {
+        $Pending.Document.state = 'verification_handed_off'
+        $Pending.Document.authoritativeEvidenceRequired = $false
+    }
+    Write-ManualVerificationDocument $Pending.Document $Path
+}
+
 function Update-ManualVerificationState($Pending, $Report, [string]$Path, [datetime]$RetryAt) {
     $notUpdated = [pscustomobject]@{
         Updated = $false
@@ -263,6 +321,8 @@ function Update-ManualVerificationState($Pending, $Report, [string]$Path, [datet
             $target | Add-Member -NotePropertyName disabledByConfig -NotePropertyValue ($result.disabledByConfig -eq $true) -Force
             $target | Add-Member -NotePropertyName temporarilyUnavailable -NotePropertyValue ($result.temporarilyUnavailable -eq $true) -Force
             $target | Add-Member -NotePropertyName evidence -NotePropertyValue $result.evidence -Force
+            $evidenceKind = if ([string]$result.evidence.source -eq 'user_rule') { 'user_rule' } elseif ($result.evidence.authoritative -eq $true) { 'authoritative' } else { 'unbound' }
+            $target | Add-Member -NotePropertyName verificationEvidenceKind -NotePropertyValue $evidenceKind -Force
             foreach ($field in @('cycle', 'actionType', 'accountKey', 'accountResults', 'allowedOrigins',
                 'actionResults', 'requiredActionTypes', 'submissionTrackedPerAction')) {
                 $target | Add-Member -NotePropertyName $field -NotePropertyValue $result.$field -Force
@@ -281,20 +341,7 @@ function Update-ManualVerificationState($Pending, $Report, [string]$Path, [datet
     $Pending.Document.authoritativeEvidenceRequired = -not $allConfirmed
     $Pending.Document | Add-Member -NotePropertyName verificationRunId -NotePropertyValue ([string]$Report.runId) -Force
     $Pending.Document | Add-Member -NotePropertyName verifiedAt -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o')) -Force
-    $temporaryPath = "$Path.$PID.tmp"
-    try {
-        [System.IO.File]::WriteAllText(
-            $temporaryPath,
-            ($Pending.Document | ConvertTo-Json -Depth 16),
-            [System.Text.UTF8Encoding]::new($false)
-        )
-        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
-    }
-    finally {
-        if (Test-Path -LiteralPath $temporaryPath) {
-            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Write-ManualVerificationDocument $Pending.Document $Path
 
     return [pscustomobject]@{
         Updated = $true

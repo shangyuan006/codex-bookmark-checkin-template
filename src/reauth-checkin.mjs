@@ -427,6 +427,7 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
     linuxdo_session_rate_limited: "LinuxDO 会话探测受到请求频率限制，登录状态尚未确认",
     linuxdo_login_challenge: "LinuxDO 登录页 CF 真人验证未完成",
     linuxdo_provider_login_required: "LinuxDO 授权跳回提供方登录表单，需恢复提供方登录后再继续目标站",
+    linuxdo_sso_stalled: "LinuxDO 授权后的 SSO 中转未完成，已停止无进展的自动接续",
     provider_session: "登录提供方保存会话恢复未完成",
     github_autofill_missing: "GitHub 登录态失效，浏览器未自动填充账号密码",
     github_account_selection: "GitHub 要求选择账号",
@@ -450,14 +451,14 @@ export function reauthLoginFailureReason(provider, oauthStage = null) {
 
 export function shouldRetryOAuthFailureStage(oauthStage, diagnostics = {}) {
   return !isUnresolvedOAuthChallenge(diagnostics) && !['oauth_retry_budget_exhausted', 'logout_verification', 'linuxdo_session_challenge', 'linuxdo_session_rate_limited',
-    'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'github_autofill_missing', 'github_account_selection',
+    'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'linuxdo_sso_stalled', 'github_autofill_missing', 'github_account_selection',
     'github_interactive_verification', 'github_form_not_unique', 'github_submit_not_unique',
     'github_login_not_completed'].includes(oauthStage);
 }
 
 export function reauthLoginFailureResult(provider, oauthStage, { beforeLogout = false, diagnostics = null } = {}) {
   const providerBlocked = ['linuxdo_session_challenge', 'linuxdo_session_rate_limited',
-    'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'oauth_retry_budget_exhausted'].includes(oauthStage)
+    'linuxdo_login_challenge', 'linuxdo_provider_login_required', 'linuxdo_sso_stalled', 'oauth_retry_budget_exhausted'].includes(oauthStage)
     || isUnresolvedOAuthChallenge(diagnostics)
     || (normalizeProviderLabel(provider) === 'linuxdo' && isStalledOAuthCallback(diagnostics));
   return {
@@ -518,7 +519,7 @@ export function parseQuotaDisplayText(value) {
 }
 
 export function buildReauthStateEntry(date, status, now = new Date()) {
-  if (!/^\d{8}$/.test(String(date)) || !["started", "logged_out", "completed"].includes(status)) {
+  if (!/^\d{8}$/.test(String(date)) || !["started", "evidence_reset", "logged_out", "completed"].includes(status)) {
     throw new Error("重认证状态无效");
   }
   return { date: String(date), status, updatedAt: now.toISOString() };
@@ -780,6 +781,28 @@ async function waitForUniqueVisibleLocator(locator, waitMs) {
   return null;
 }
 
+export async function openReauthAccountMenu(page, target, rule, config, {
+  dismissOverlay = dismissConfiguredPreCheckinOverlay,
+} = {}) {
+  let noticeDismissed = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // Quota/provider checks can outlast the initial announcement check. Resolve
+    // any newly arrived overlay before testing the actual menu's hit target.
+    noticeDismissed = await dismissOverlay(page, target, new URL(page.url()).origin, config) || noticeDismissed;
+    const menu = await waitForUniqueVisibleLocator(page.locator(rule.accountMenuSelector), rule.evidenceWaitMs);
+    if (!menu) throw new Error('没有找到唯一可见的账号菜单');
+    try { await menu.click({ trial: true, timeout: 1500 }); }
+    catch (error) {
+      if (attempt === 2) throw error;
+      await page.waitForTimeout(250);
+      continue;
+    }
+    // Do not repeat an actual click whose delivery is uncertain.
+    await menu.click({ timeout: 5000 });
+    return noticeDismissed;
+  }
+}
+
 export async function runOAuthHelper(rule, config, account, phaseArgs = [], {
   execute = execFileAsync, writeDiagnostic = writeOAuthFlowDiagnostic, now = Date.now,
 } = {}) {
@@ -955,10 +978,35 @@ async function runAgentRouterOnlyWithRetry(rule, config, account) {
 // The caller still establishes a durable target logout and resets reward
 // evidence first; only a fresh callback/reward can finish today's reauth.
 export async function runTargetFirstLinuxDoOAuthWithRetry(rule, config, account, {
-  runHelper = runOAuthHelper,
+  runHelper = runOAuthHelper, runNative = runNativeTargetOAuthRecovery,
 } = {}) {
   if (!usesTargetFirstLinuxDoOAuth(rule)) throw new Error("Target-first OAuth is not enabled for this account");
-  return retryOAuthOperation(rule, config, account, () => runHelper(rule, config, account, []));
+  const result = await retryOAuthOperation(rule, config, account, () => runHelper(rule, config, account, []));
+  if (result.succeeded || !(isUnresolvedOAuthChallenge(result) || isStalledOAuthCallback(result)
+    || result.oauthStage === 'oauth_retry_budget_exhausted')) return result;
+  // The same verified logout has one native reservation. This is still part
+  // of the automatic account flow; it never logs out again or opens LinuxDO home.
+  const native = await runNative(rule, config, account);
+  return native.succeeded ? { ...native, nativeRecoveryAttempted: true }
+    : { ...native, ...result, succeeded: false, nativeRecoveryAttempted: true,
+      oauthStage: preferOAuthFailureStage(result.oauthStage, native.oauthStage) };
+}
+
+export async function runNativeTargetOAuthRecovery(rule, config, account, { execute = execFileAsync } = {}) {
+  if (!usesTargetFirstLinuxDoOAuth(rule) || rule.provider !== 'LinuxDO') return { succeeded: false, oauthStage: 'helper_failed' };
+  const executable = String(config.powershellExecutable ?? '').trim()
+    || path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe');
+  if (!path.isAbsolute(executable) || !['powershell.exe','pwsh.exe'].includes(path.basename(executable).toLowerCase())) {
+    return { succeeded: false, oauthStage: 'helper_failed' };
+  }
+  try {
+    const result = await execute(executable, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', path.join(rootDirectory, 'scripts/Invoke-AgentRouterNativeRecovery.ps1'), '-AccountKey', account.accountKey],
+    { cwd: rootDirectory, windowsHide: true, timeout: OAUTH_HELPER_TIMEOUT_MS + 35000, maxBuffer: 1024 * 1024, env: process.env });
+    return loginHelperOutcomeFromStreams(result.stdout, result.stderr);
+  } catch (error) {
+    return loginHelperOutcomeFromStreams(error?.stdout, error?.stderr, 'failed');
+  }
 }
 
 export function parseProviderSessionProbe(text) {
@@ -1021,6 +1069,31 @@ export async function inspectConfiguredReauthRecovery(rule, now = new Date()) {
   return { previous, action: reauthRecoveryAction(previous, now) };
 }
 
+// Never recover from a provider home page or a stale authenticated screen.
+export async function recoverVerifiedReauthLogout(config, rule, statePath, stateKey, previous, now = null, {
+  openPage = openRulePage, readLogout = waitForReauthLogout, readReward = readLoginSuccessEvidence,
+} = {}) {
+  const clock = typeof now === 'function' ? now : () => now ?? new Date();
+  if (!['resume', 'verify_logout'].includes(reauthRecoveryAction(previous, clock()))) return null;
+  let session;
+  try {
+    session = await openPage(config, rule);
+    const logout = await readLogout(session.page, rule);
+    if (!logout.confirmed || await readReward(session.page, rule)) return null;
+    const refreshed = await readState(statePath);
+    const current = refreshed.entries?.[stateKey];
+    const verifiedAt = clock();
+    if (current?.updatedAt !== previous.updatedAt || current?.status !== previous.status
+      || !['resume', 'verify_logout'].includes(reauthRecoveryAction(current, verifiedAt))) return null;
+    const checkpoint = { ...buildReauthStateEntry(localRunDate(verifiedAt), 'logged_out', verifiedAt),
+      loginEvidenceReset: true, logoutConfirmed: true };
+    await writeState(statePath, refreshed, stateKey, checkpoint);
+    return { ...checkpoint, origin: rule.origin, accountKey: rule.accountKey };
+  } finally {
+    await session?.context.close().catch(() => {});
+  }
+}
+
 async function confirmReauthSessionAfterOAuthFailure(config, rule, statePath, stateKey, date) {
   let currentLogin;
   try {
@@ -1073,7 +1146,7 @@ async function runReauthCheckinForAccountInternal(target, config, account, optio
   const stateKey = `${rule.origin}::${rule.accountKey}`;
   const accountConfig = { ...config, automationUserDataDir: rule.automationUserDataDir };
   const state = await readState(statePath);
-  const previous = state.entries?.[stateKey];
+  let previous = state.entries?.[stateKey];
   if (shouldReuseCompletedReauthState(previous, date, options.forceReauth, now)) {
     return { status: "already_signed", reason: "今日已通过重新登录确认额度到账", observedAt:previous.updatedAt };
   }
@@ -1082,11 +1155,22 @@ async function runReauthCheckinForAccountInternal(target, config, account, optio
     if (await persistVerifiedReauthCompletion(statePath, stateKey, previous, currentLogin, options.now ?? new Date())) {
       return {status:'signed',reason:'只读核验确认本次重新认证的额度证据'};
     }
+    if (config[SUBMISSION_SCOPE] && currentLogin.valid !== true) {
+      const recovered = await recoverVerifiedReauthLogout(accountConfig, rule, statePath, stateKey, previous, options.now);
+      if (recovered) {
+        await config[SUBMISSION_SCOPE].prepareReauthenticationRecovery(recovered);
+        return { status: 'needs_attention', reason: '已核验当前退出页，可接续本次重新认证' };
+      }
+    }
     if(rule.allowCycleContinuation && previous?.date!==date && currentLogin.valid===true) {
       return dailyReadinessEvidence({...target,accountKey:rule.accountKey,actionType:"reauth"},config,{
         source:"reauth_state",outcome:"configured_daily_reauth_due",authoritative:false,now});
     }
     return {status:'needs_attention',reason:'不确定重新认证仅允许只读核验，不再次退出或登录'};
+  }
+  if (reauthRecoveryAction(previous, now) === 'verify_logout') {
+    previous = await recoverVerifiedReauthLogout(accountConfig, rule, statePath, stateKey, previous, options.now);
+    if (!previous) return { status: 'needs_attention', reason: '重认证中断后未确认当前退出状态，未重复退出或登录' };
   }
   if (options.postOAuthVerify) {
     if (reauthRecoveryAction(previous, now) !== "resume") {
@@ -1156,7 +1240,7 @@ async function runReauthCheckinForAccountInternal(target, config, account, optio
     }
     beforeSession = await openRulePage(accountConfig, rule);
     const beforeSurface = await readOAuthTargetSurface(beforeSession.page, rule.origin, accountConfig);
-    const noticeDismissed = await dismissConfiguredPreCheckinOverlay(
+    let noticeDismissed = await dismissConfiguredPreCheckinOverlay(
       beforeSession.page,
       target,
       new URL(beforeSession.page.url()).origin,
@@ -1167,13 +1251,11 @@ async function runReauthCheckinForAccountInternal(target, config, account, optio
     if (await verifyConfiguredProviderBeforeLogout(beforeSession, rule, accountConfig)) {
       throw new Error(`${rule.provider} 登录入口未出现在当前站点登录页，已取消退出`);
     }
-    const accountMenu = await waitForUniqueVisibleLocator(
-      beforeSession.page.locator(rule.accountMenuSelector),
-      rule.evidenceWaitMs,
-    );
-    if (!accountMenu) throw new Error("没有找到唯一可见的账号菜单");
-    await accountMenu.click();
+    noticeDismissed = await openReauthAccountMenu(beforeSession.page, target, rule, accountConfig) || noticeDismissed;
     await beforeSession.page.waitForTimeout(300);
+    noticeDismissed = await dismissConfiguredPreCheckinOverlay(
+      beforeSession.page, target, new URL(beforeSession.page.url()).origin, accountConfig,
+    ) || noticeDismissed;
     const logoutMatches = [];
     for (const text of rule.logoutTexts) {
       const candidate = await waitForUniqueVisibleLocator(
@@ -1186,6 +1268,9 @@ async function runReauthCheckinForAccountInternal(target, config, account, optio
     await config[SUBMISSION_SCOPE]?.begin();
     await writeState(statePath, state, stateKey, buildReauthStateEntry(date, "started", now));
     const loginEvidenceReset = await resetReauthLoginEvidence(beforeSession.page, rule);
+    await writeState(statePath, await readState(statePath), stateKey, {
+      ...buildReauthStateEntry(date, 'evidence_reset', new Date()), loginEvidenceReset,
+    });
     await logoutMatches[0].click();
     const logout = await waitForReauthLogout(beforeSession.page, rule);
     await writeOAuthFlowDiagnostic({ flow: 'automatic_logout', provider: rule.provider,

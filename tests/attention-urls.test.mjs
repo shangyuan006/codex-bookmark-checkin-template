@@ -243,6 +243,20 @@ test("abandonment can select upstream and rate-limit deferrals without opening m
   });
 });
 
+test('explicit skip synchronization can resume after recording a marker without reopening manual work', () => {
+  for (const status of ['error', 'abandoned']) {
+    const options = { plan, latest: { ...latest, results: [{ origin: 'https://alpha.example', status }] },
+      requestedOrigins: ['https://alpha.example'], excludedOrigins: ['https://alpha.example'] };
+    assert.throws(() => buildAttentionHandoff(options), /不在当前待处理列表/);
+    const resumed = buildAttentionHandoff({ ...options, forAbandonment: true });
+    assert.equal(resumed.targets[0].origin, 'https://alpha.example');
+    assert.equal(resumed.targets[0].previousStatus, status);
+    assert.equal(buildAttentionHandoff({ ...options, requestedOrigins: [] }).targets.length, 0);
+  }
+  assert.throws(() => buildAttentionHandoff({ plan, latest,
+    requestedOrigins: ['https://done.example'], excludedOrigins: ['https://done.example'], forAbandonment: true }));
+});
+
 test("当天定向验证结果可为未终态完整日报补充人工交接证据", () => {
   const baseline = {
     runId: "20260728-120000",
@@ -440,7 +454,7 @@ test("multi-source handoff reads every live primary file and uses the newest mti
   }
 });
 
-test("loading manual attention unions the stored handoff with current pending sites", async () => {
+test("manual handoff never takes a site owned by verification or unions in legacy failure rows", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "manual-handoff-priority-"));
   const configDirectory = path.join(root, "config");
   const logsDirectory = path.join(root, "logs");
@@ -492,19 +506,14 @@ test("loading manual attention unions the stored handoff with current pending si
 
     const handoff = await loadAttentionHandoff(root);
     assert.equal(handoff.selectionMode, "handoff");
-    assert.equal(handoff.availableCount, 2);
-    assert.deepEqual(handoff.targets, [
-      {
-        origin: "https://alpha.example",
-        url: "https://alpha.example/current-checkin",
-        previousStatus: "clicked",
-      },
-      {
-        origin: "https://beta.example",
-        url: "https://beta.example/checkin",
-        previousStatus: "deferred",
-      },
-    ]);
+    assert.deepEqual(handoff.targets.map(target => target.origin), ["https://alpha.example"]);
+    await fs.writeFile(path.join(tmpDirectory, "manual-verification.json"), JSON.stringify({
+      state: "pending_verification", sourceRunId: "20260728-120000", authoritativeEvidenceRequired: true,
+      targets: [{ origin: "https://alpha.example", verificationStatus: "pending_verification" }],
+    }), "utf8");
+    assert.deepEqual((await loadAttentionHandoff(root)).targets, []);
+    await assert.rejects(() => loadAttentionHandoff(root, ["--origin", "https://alpha.example"]), /not|不在/);
+    assert.equal((await loadAttentionHandoff(root, ["--origin", "https://alpha.example", "--for-abandonment"])).targets.length, 1);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

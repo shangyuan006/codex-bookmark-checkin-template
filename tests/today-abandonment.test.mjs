@@ -70,7 +70,9 @@ async function createFixture({ activeSession = false, pendingVerificationOrigins
     fs.writeFile(path.join(tmpDirectory, "manual-handoff.json"), JSON.stringify({
       schemaVersion: 1,
       state: "awaiting_manual_handoff",
-      sourceRunId: `${date}-120000`,
+      sourceRunId: `${date}-115959`,
+      createdAt: new Date().toISOString(),
+      sourceFinishedAt: new Date().toISOString(),
       targetCount: 2,
       targets: [
         { origin: "https://two.example", previousStatus: "no_action" },
@@ -233,4 +235,42 @@ test("a fake completed record containing unresolved targets still blocks abandon
   } finally {
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   }
+});
+
+test('network unavailability records today-only reason and clears only matching same-day handoff targets across runs', async () => {
+  const fixtureRoot = await createFixture();
+  try {
+    const marker = path.join(fixtureRoot, 'tmp', 'manual-abandon.json');
+    const previous = JSON.parse(await fs.readFile(marker, 'utf8'));
+    previous.reasons = { 'https://one.example': 'network_unavailable', 'https://stale.example': 'network_unavailable' };
+    await fs.writeFile(marker, JSON.stringify(previous));
+    const result = spawnSync(powershellExecutable, ['-NoProfile', '-NonInteractive', '-File',
+      path.join(fixtureRoot, 'scripts', 'Set-TodayAbandonment.ps1'), '-Origins', 'https://two.example',
+      '-Reason', 'network_unavailable'], { cwd: fixtureRoot, encoding: 'utf8', timeout: 30000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout.trim()).reason, 'network_unavailable');
+    const saved = JSON.parse(await fs.readFile(marker, 'utf8'));
+    assert.equal(saved.date, localDateKey());
+    assert.deepEqual(saved.reasons, { 'https://one.example': 'network_unavailable', 'https://two.example': 'network_unavailable' });
+    const handoff = JSON.parse(await fs.readFile(path.join(fixtureRoot, 'tmp', 'manual-handoff.json'), 'utf8'));
+    assert.deepEqual(handoff.targets.map(target => target.origin), ['https://three.example']);
+    assert.equal(handoff.targetCount, 1);
+  } finally { await fs.rm(fixtureRoot, { recursive: true, force: true }); }
+});
+
+test('today network skip does not rewrite an older manual handoff', async () => {
+  const fixtureRoot = await createFixture();
+  try {
+    const file = path.join(fixtureRoot, 'tmp', 'manual-handoff.json');
+    const older = JSON.parse(await fs.readFile(file, 'utf8'));
+    older.sourceRunId = '20260101-120000';
+    older.createdAt = older.sourceFinishedAt = '2026-01-01T04:00:00Z';
+    const before = JSON.stringify(older);
+    await fs.writeFile(file, before);
+    const result = spawnSync(powershellExecutable, ['-NoProfile', '-NonInteractive', '-File',
+      path.join(fixtureRoot, 'scripts', 'Set-TodayAbandonment.ps1'), '-Origins', 'https://two.example',
+      '-Reason', 'network_unavailable'], { cwd: fixtureRoot, encoding: 'utf8', timeout: 30000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await fs.readFile(file, 'utf8'), before);
+  } finally { await fs.rm(fixtureRoot, { recursive: true, force: true }); }
 });

@@ -54,7 +54,14 @@ async function createFixture() {
   await Promise.all([
     fs.mkdir(configDirectory, { recursive: true }),
     fs.mkdir(logsDirectory, { recursive: true }),
+    fs.mkdir(path.join(fixtureRoot, 'src'), { recursive: true }),
     fs.mkdir(automationDirectory, { recursive: true }),
+  ]);
+  await Promise.all([
+    fs.writeFile(path.join(fixtureRoot, 'src/index.mjs'), '// health fixture\n'),
+    fs.writeFile(path.join(fixtureRoot, 'package.json'), JSON.stringify({ name: 'health-fixture', version: '1.0.0', dependencies: {} })),
+    fs.writeFile(path.join(fixtureRoot, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3,
+      packages: { '': { name: 'health-fixture', version: '1.0.0', dependencies: {} } } })),
   ]);
   const bookmarksPath = path.join(fixtureRoot, "Bookmarks");
   const browserExecutable = path.join(fixtureRoot, "msedge.exe");
@@ -244,6 +251,22 @@ test("health contract returns exit 0 only for today's complete result matching t
   assert.equal(result.report.checks.latestResultComplete, true);
   assert.equal(result.report.checks.latestAccountResultsConfirmed, true);
   assert.equal(result.report.checks.latestResultConfirmed, true);
+  assert.equal(result.report.checks.runtimeIntegrityValid, true);
+  assert.equal(result.report.runtimeIntegrity.baseline.status, 'absent');
+});
+
+test('health rejects inconsistent installed runtime dependencies', async context => {
+  const fixtureRoot = await createFixture();
+  context.after(() => fs.rm(fixtureRoot, { recursive: true, force: true }));
+  const manifestPath = path.join(fixtureRoot, 'package.json');
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  manifest.dependencies = { 'missing-runtime': '1.0.0' };
+  await fs.writeFile(manifestPath, JSON.stringify(manifest));
+  const result = runHealth(fixtureRoot, { mockWindowsState: true });
+  assert.equal(result.exitCode, 2, result.stderr);
+  assert.equal(result.report.checks.runtimeIntegrityReadable, true);
+  assert.equal(result.report.checks.runtimeIntegrityValid, false);
+  assert.ok(result.report.failedChecks.includes('runtimeIntegrityValid'));
 });
 
 test("health treats today's explicitly abandoned unresolved target as confirmed", async (context) => {
@@ -551,5 +574,5 @@ test("health implementation keeps the runtime budget and browser-neutral contrac
   assert.doesNotMatch(source, /SHA256\]::HashData/);
   assert.match(source, /windows_task_disabled/);
   assert.match(source, /schedulerStatus/);
-  assert.equal(packageJson.scripts.health, "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Test-CheckinHealth.ps1");
+  assert.equal(packageJson.scripts.health, "node src/health-cli.mjs");
 });

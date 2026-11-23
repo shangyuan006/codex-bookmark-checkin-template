@@ -11,10 +11,17 @@ const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const cleaner = path.join(root, "scripts", "Clear-AutomationChromeCache.ps1");
 
-async function runCleaner(configPath, apply = false) {
+const quotePowerShell = value => `'${value.replaceAll("'", "''")}'`;
+
+async function runCleaner(configPath, apply = false, queryFails = false) {
   const { stdout } = await execFileAsync(powershellExecutable, [
     "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-    "-File", cleaner, "-ConfigPath", configPath, ...(apply ? ["-Apply"] : []),
+    "-Command", `function Get-CimInstance { param($ClassName,$Filter,$ErrorAction)
+      if ($ClassName -ne 'Win32_Process' -or $Filter -ne "Name='chrome.exe'") { throw 'Unexpected process query' }
+      ${queryFails ? "throw 'Fixture process query failed'" : 'return @()'}
+    }; function Get-WmiObject { param($Class,$Filter,$ErrorAction) throw 'Fixture WMI query failed' }
+    ${queryFails ? "function Get-Process { param($ErrorAction) throw 'Fixture local inventory failed' }" : ''}
+    & ${quotePowerShell(cleaner)} -ConfigPath ${quotePowerShell(configPath)} ${apply ? '-Apply' : ''}`,
   ], { cwd: root, encoding: "utf8" });
   return JSON.parse(stdout);
 }
@@ -66,4 +73,14 @@ test("缓存白名单子树含 junction 时拒绝清理且保留目标", { skip:
     await fs.unlink(junction).catch(() => {});
     await fs.rm(value.sandbox, { recursive: true, force: true });
   }
+});
+
+test("进程查询持续失败时拒绝清理并保留缓存", async () => {
+  const value = await createSandbox("cache-cleaner-query-");
+  const cacheFile = path.join(value.cache, "entry.bin");
+  try {
+    await fs.writeFile(cacheFile, Buffer.alloc(16, 7));
+    await assert.rejects(runCleaner(value.configPath, true, true), /CheckinProcessQueryFailed|无法确认项目浏览器进程/);
+    assert.equal((await fs.stat(cacheFile)).size, 16);
+  } finally { await fs.rm(value.sandbox, { recursive: true, force: true }); }
 });

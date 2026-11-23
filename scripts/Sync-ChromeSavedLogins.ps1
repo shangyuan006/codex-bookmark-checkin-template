@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param()
+param([string[]]$Origins = @())
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -8,17 +8,14 @@ $config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\
 $node = Resolve-CheckinNode $config
 $browser = Resolve-CheckinBrowser $config
 $originHelper = Join-Path $root 'src\login-sync-origins.mjs'
-$origins = @($config.syncSavedLoginOrigins)
-if ($config.syncBookmarkSavedLogins -ne $false) {
-    if (-not (Test-Path -LiteralPath $node)) { throw "未找到 Node.js 运行时：$node" }
-    $discoveredText = & $node $originHelper
-    if ($LASTEXITCODE -ne 0) { throw '读取书签登录同步范围失败。' }
-    $parsedOrigins = $discoveredText | ConvertFrom-Json
-    $origins = @($parsedOrigins)
-}
-if ($origins.Count -eq 0) { return }
+$originArguments = @($originHelper)
+if ($Origins.Count -gt 0) { $originArguments += @('--origins', ($Origins -join ',')) }
+$discoveredText = & $node @originArguments
+if ($LASTEXITCODE -ne 0) { throw '读取书签登录同步范围失败。' }
+$authorizedOrigins = @($discoveredText | ConvertFrom-Json)
+if ($authorizedOrigins.Count -eq 0) { return }
 
-$allowedHosts = @($origins | ForEach-Object {
+$allowedHosts = @($authorizedOrigins | ForEach-Object {
     $uri = [uri][string]$_
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { throw "无效登录同步来源：$_" }
     $uri.DnsSafeHost
@@ -43,7 +40,10 @@ if (-not $sourceState.os_crypt.encrypted_key -or $sourceState.os_crypt.encrypted
 
 # Native PowerShell invocation strips quotes from JSON arguments. Use a
 # delimiter-safe host list; the Python helper still accepts the legacy JSON form.
-$allowedArgument = ($allowedHosts -join ',')
+$scoped = $Origins.Count -gt 0
+$allowedArgument = if ($scoped) { $authorizedOrigins -join ',' } else { $allowedHosts -join ',' }
+$scopeArgument = if ($scoped) { @('--exact-origins') } else { @() }
+$allowedCount = if ($scoped) { $authorizedOrigins.Count } else { $allowedHosts.Count }
 $copied = 0
 $databases = 0
 $populatedOriginCount = 0
@@ -51,7 +51,7 @@ foreach ($databaseName in @('Login Data', 'Login Data For Account')) {
     $source = Join-Path ([string]$config.sourceUserDataDir) "$([string]$config.sourceProfileDirectory)\$databaseName"
     $target = Join-Path $profilePath "Default\$databaseName"
     if (-not (Test-Path -LiteralPath $source) -or -not (Test-Path -LiteralPath $target)) { continue }
-    $resultText = & $python $helper $source $target $allowedArgument
+    $resultText = & $python $helper $source $target $allowedArgument @scopeArgument
     if ($LASTEXITCODE -ne 0) { throw "$($browser.DisplayName) 登录记录同步失败（$databaseName），退出码 $LASTEXITCODE。" }
     $result = $resultText | ConvertFrom-Json
     $copied += [int]$result.copied
@@ -60,5 +60,5 @@ foreach ($databaseName in @('Login Data', 'Login Data For Account')) {
     $databases += 1
 }
 if ($databases -eq 0) { throw "未找到可同步的 $($browser.DisplayName) 登录数据库。" }
-$missingOriginCount = [Math]::Max(0, $allowedHosts.Count - $populatedOriginCount)
-Write-Output "已从 $databases 个 $($browser.DisplayName) 密码库检查 $($allowedHosts.Count) 个书签来源：其中 $populatedOriginCount 个来源有保存记录，$missingOriginCount 个来源没有保存记录；同步 $copied 条加密登录记录。"
+$missingOriginCount = [Math]::Max(0, $allowedCount - $populatedOriginCount)
+Write-Output "已从 $databases 个 $($browser.DisplayName) 密码库检查 $allowedCount 个书签来源：其中 $populatedOriginCount 个来源有保存记录，$missingOriginCount 个来源没有保存记录；同步 $copied 条加密登录记录。"

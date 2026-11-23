@@ -48,7 +48,7 @@ export async function continueCloudflareRecovery({readState, clickChallenge, wai
       if (state.status === 'interactive_challenge') {
         const result = await clickChallenge();
         if (result.clicked) attempts += 1;
-        if (['challenge_not_unique','challenge_frame_not_unique','challenge_click_failed'].includes(result.outcome)) {
+        if (['challenge_not_unique','challenge_frame_not_unique','challenge_click_failed','challenge_verification_failed','challenge_obstructed'].includes(result.outcome)) {
           return cloudflareRecoveryHandoff(attempts);
         }
         nextClickAt = now() + settleMs;

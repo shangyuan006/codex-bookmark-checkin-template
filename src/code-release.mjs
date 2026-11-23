@@ -97,14 +97,19 @@ export async function previewRelease(root,bundle,{rollback=false}={}) {
   return {manifest,files};
 }
 
-async function assertNoManualSession(root) {
+export async function assertNoManualSession(root) {
   // Updating while a user is handing over a profile risks losing a new rule or
   // evidence. Refuse even a stale pending handoff; the operator must resolve it.
+  for (const relative of ['tmp/manual-session.json', 'tmp/agentrouter-manual-state.json', 'tmp/manual-handoff-launch.json']) {
+    const stat = await fs.lstat(path.join(root, relative)).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    if (stat) throw new Error('Resolve the active manual session before updating code');
+  }
   for (const relative of ['tmp/manual-handoff.json','tmp/manual-verification.json']) {
     const document = await fs.readFile(path.join(root,relative),'utf8').then(JSON.parse).catch(error=>{
       if(error.code==='ENOENT')return {};throw error;
     });
-    if (['pending','pending_verification','waiting_for_user','awaiting_user'].includes(document.state)) throw new Error('Resolve the manual handoff before updating code');
+    if (['pending','pending_verification','waiting_for_user','awaiting_user','awaiting_manual_handoff',
+      'awaiting_manual_verification','in_progress','starting'].includes(document.state)) throw new Error('Resolve the manual handoff before updating code');
   }
 }
 

@@ -480,7 +480,7 @@ test("progress callback errors propagate without rewriting a successful account 
 test("Agent Router closes configured overlays before opening the account menu", async () => {
   const source = await fs.readFile(new URL("../src/reauth-checkin.mjs", import.meta.url), "utf8");
   const dismissIndex = source.indexOf("await dismissConfiguredPreCheckinOverlay(");
-  const accountMenuIndex = source.indexOf("beforeSession.page.locator(rule.accountMenuSelector)");
+  const accountMenuIndex = source.indexOf("await openReauthAccountMenu(beforeSession.page");
   assert.notEqual(dismissIndex, -1);
   assert.notEqual(accountMenuIndex, -1);
   assert.ok(dismissIndex < accountMenuIndex);
@@ -570,7 +570,7 @@ test("manual Agent Router completion verifies the existing OAuth result without 
   const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
   assert.match(runner, /\[switch\]\$PostOAuthVerify/);
   assert.match(runner, /--post-oauth-verify/);
-  assert.match(runner, /未取得 signed 或 already_signed 权威结果/);
+  assert.match(runner, /未取得 signed 或 already_signed 完成证据/);
 });
 
 function stateIndex(source, expression) {

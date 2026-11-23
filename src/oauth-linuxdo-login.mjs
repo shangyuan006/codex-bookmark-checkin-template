@@ -42,7 +42,7 @@ export async function verifyLinuxDoRecoverySession(page, timeoutMs, onObservatio
   return status === 'valid' && isLinuxDoRecoveryLocation(page);
 }
 
-async function hasVisibleCloudflareChallenge(page) {
+export async function hasVisibleLinuxDoLoginChallenge(page) {
   const locator = page.locator([
     'iframe[src*="challenges.cloudflare.com" i]',
     'iframe[src*="/cdn-cgi/challenge-platform/" i]',
@@ -50,6 +50,10 @@ async function hasVisibleCloudflareChallenge(page) {
     'iframe[title*="security challenge" i]',
     '.cf-turnstile',
     '[data-sitekey][data-callback]',
+    'iframe[src*="hcaptcha.com" i]',
+    'iframe[title*="hcaptcha" i]',
+    '.h-captcha',
+    '.modal-container .captcha-container',
   ].join(", "));
   const count = await locator.count().catch(() => 0);
   for (let index = 0; index < count; index += 1) {
@@ -70,7 +74,7 @@ async function waitForLinuxDoLoginTransition(
       // A third-party login page is an unfinished login, not a restored
       // LinuxDO session. Never navigate it away or return success from a URL.
       if (!isLinuxDoRecoveryLocation(page)) break;
-      const challengeVisible = await hasVisibleCloudflareChallenge(page);
+      const challengeVisible = await hasVisibleLinuxDoLoginChallenge(page);
       challengeObserved ||= challengeVisible;
       if (!challengeVisible) {
         sessionProbes += 1;
@@ -83,7 +87,7 @@ async function waitForLinuxDoLoginTransition(
         if (probeBlocked || sessionProbes >= 3 || !isLinuxDoRecoveryLocation(page)) break;
       }
     }
-    const challengeVisible = await hasVisibleCloudflareChallenge(page);
+    const challengeVisible = await hasVisibleLinuxDoLoginChallenge(page);
     challengeObserved ||= challengeVisible;
     if (stopWhenChallengeClears && isLinuxDoLoginPage(page) && challengeObserved && !challengeVisible) {
       return { recovered: false, challengeObserved: true, challengeCleared: true };
@@ -99,13 +103,14 @@ export function shouldRetryLinuxDoLoginRecovery(result) {
   return !result?.recovered && !result?.submitted && !result?.challengeObserved;
 }
 
-export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now, verifySession = verifyLinuxDoRecoverySession } = {}) {
+export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now, verifySession = verifyLinuxDoRecoverySession,
+  socialProvider, beforeSubmit = async () => true } = {}) {
   if (!isLinuxDoLoginPage(page)) {
     return { recovered: false, submitted: false, challengeObserved: false };
   }
   const boundedWaitMs = Math.max(1_000, Math.min(120_000, Number(waitMs) || 60_000));
   const deadline = now() + boundedWaitMs;
-  let challengeObserved = await hasVisibleCloudflareChallenge(page);
+  let challengeObserved = await hasVisibleLinuxDoLoginChallenge(page);
   if (challengeObserved) {
     const initialChallenge = await waitForLinuxDoLoginTransition(page, deadline, {
       stopWhenChallengeClears: true,
@@ -116,8 +121,35 @@ export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now, v
       return { recovered: true, submitted: false, challengeObserved: true };
     }
     if (!initialChallenge.challengeCleared) {
-      return { recovered: false, submitted: false, challengeObserved: true };
+      return { recovered: false, submitted: false, challengeObserved: true,
+        ...(socialProvider !== undefined ? { outcome: 'login_challenge_pending' } : {}) };
     }
+  }
+
+  // A configured social channel is explicit. Do not silently switch accounts
+  // through another channel, or read the browser's saved credential values.
+  if (socialProvider !== undefined) {
+    if (!['GitHub', 'Google', 'Discord', 'Apple'].includes(socialProvider)) {
+      return { recovered: false, submitted: false, challengeObserved, outcome: 'login_not_configured' };
+    }
+    const button = page.getByRole('button', { name: `使用 ${socialProvider} 登录`, exact: true });
+    if (await button.count() !== 1 || !await button.isVisible().catch(() => false)) {
+      return { recovered: false, submitted: false, challengeObserved, outcome: 'login_control_unavailable' };
+    }
+    // Check actionability before reserving the single retained-session click.
+    // A verification modal intercepting the button is not a login attempt.
+    const ready = await button.click({ trial: true, timeout: Math.max(1, Math.min(1500, deadline - now())) })
+      .then(() => true, () => false);
+    if (!ready) return { recovered: false, submitted: false, challengeObserved,
+      outcome: 'login_click_blocked' };
+    if (!await beforeSubmit()) return { recovered: false, submitted: false, challengeObserved,
+      outcome: 'login_attempt_pending' };
+    await button.click({ timeout: Math.max(1, Math.min(5000, deadline - now())) });
+    const transition = await waitForLinuxDoLoginTransition(page, deadline, { now, verifySession });
+    return { recovered: transition.recovered, submitted: true,
+      challengeObserved: challengeObserved || transition.challengeObserved,
+      outcome: transition.recovered ? 'login_recovered'
+        : await hasVisibleLinuxDoLoginChallenge(page) ? 'login_challenge_pending' : 'login_submitted' };
   }
 
   const username = page.locator('input#login-account-name:visible, input[name="login"]:visible');
@@ -163,6 +195,8 @@ export async function recoverSavedLinuxDoLogin(page, waitMs, { now = Date.now, v
   }
   if (!submit) return { recovered: false, submitted: false, challengeObserved };
 
+  if (!await beforeSubmit()) return { recovered: false, submitted: false, challengeObserved,
+    outcome: 'login_attempt_pending' };
   await submit.click();
   const transition = await waitForLinuxDoLoginTransition(page, deadline, { now, verifySession });
   challengeObserved ||= transition.challengeObserved;

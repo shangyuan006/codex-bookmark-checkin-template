@@ -48,8 +48,10 @@ test('a frame invisible to DOM selectors is still a challenge; a response alone 
   const frame={visible:true,challengeLike:true,resolvedState:false,responsePresent:false};
   let state=await readNativeCheckinState(page(),origin,config,{verifySession:valid,readFrames:async()=>[frame]});
   assert.equal(state.state.status,'interactive_challenge');
+  assert.equal(state.cloudflareUnresolved,true);
   state=await readNativeCheckinState(page(),origin,config,{verifySession:valid,readFrames:async()=>[{...frame,responsePresent:true}]});
   assert.equal(state.state.status,'ready');
+  assert.equal(state.cloudflareUnresolved,false);
   state=await readNativeCheckinState(page({bodyText:'.'.repeat(100),controlTexts:['今日已签到']}),origin,config,{verifySession:valid,readFrames:async()=>[{...frame,responsePresent:true}]});
   assert.equal(state.state.status,'already_signed');
 });
@@ -67,6 +69,7 @@ test('resolved Cloudflare evidence never resolves an unrelated captcha',async()=
   const result=await readNativeCheckinState(page({challengeEvidence:[{visible:true,cloudflare:false,resolvedState:false,responsePresent:false}]}),origin,config,
     {verifySession:valid,readFrames:async()=>[{visible:true,challengeLike:true,resolvedState:false,responsePresent:true}]});
   assert.equal(result.state.status,'interactive_challenge');
+  assert.equal(result.cloudflareUnresolved,false);
 });
 
 test('origins without session configuration retain existing behavior',async()=>{
@@ -78,7 +81,7 @@ function frame(url,{visible=true,checked=false,detached=false}={}) {
   return {url:()=>url,frameElement:async()=>{
     if(detached)throw new Error('detached');
     return {isVisible:async()=>visible,boundingBox:async()=>({x:1,y:1,width:300,height:65})};
-  },evaluate:async()=>checked};
+  },evaluate:async()=>({resolvedState:checked,failed:false,loading:false,checkboxReady:!checked})};
 }
 
 test('frame evidence permits only visible HTTPS Cloudflare frames and contains no token value',async()=>{
@@ -89,7 +92,8 @@ test('frame evidence permits only visible HTTPS Cloudflare frames and contains n
     frame('https://challenges.cloudflare.com.evil.example/widget'),
     frame('https://challenges.cloudflare.com/stale',{detached:true}),
   ],evaluate:async()=>true};
-  assert.deepEqual(await readCloudflareFrameEvidence(active,origin),[{visible:true,challengeLike:true,resolvedState:false,responsePresent:true}]);
+  assert.deepEqual(await readCloudflareFrameEvidence(active,origin),[{visible:true,challengeLike:true,
+    resolvedState:false,failed:false,loading:false,checkboxReady:true,responsePresent:true}]);
 });
 
 test('one response cannot resolve multiple Cloudflare frames',async()=>{

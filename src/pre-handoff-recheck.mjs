@@ -9,19 +9,30 @@ const bounded = (value, fallback, min, max) => Number.isFinite(value)
 function eligibleRule(result, target, config, now) {
   const rule = config.preHandoffReadOnlyRecheckRules?.[target.origin];
   if (!rule || rule.enabled === false || completed.has(result.status)
-    || result.failureCode !== 'submission_quarantined' || result.submissionAttempted !== true
+    || result.failureCode !== 'submission_quarantined'
     || result.preHandoffReadOnlyRecheck?.attempted
     || (target.accountKey ?? 'default') !== 'default' || result.accountResults?.length
     || (target.actionType ?? 'checkin') !== 'checkin'
     || (result.accountKey ?? 'default') !== 'default' || (result.actionType ?? 'checkin') !== 'checkin'
     || result.quarantine?.actionType !== 'checkin'
     || config.reauthCheckinRules?.[target.origin] || config.sequentialActionRules?.[target.origin]
-    || (config.agentrouterAccounts ?? []).some(account => account.origin === target.origin)
-    || !isCurrentCheckinCycle(target.origin, result.quarantine?.firstAttemptAt, config, now)) return null;
+    || (config.agentrouterAccounts ?? []).some(account => account.origin === target.origin)) return null;
+  const cycle = checkinCycle(target.origin, config, now);
+  const currentSubmission = result.submissionAttempted === true
+    && isCurrentCheckinCycle(target.origin, result.quarantine?.firstAttemptAt, config, now);
+  // An explicitly opted-in calendar can be observed again even when an older
+  // uncertain action blocked today's run. Today's proof never clears that lock.
+  const historicalCalendar = rule.includeHistoricalCalendarLocks === true
+    && (config.calendarDayCheckinOrigins ?? []).includes(target.origin)
+    && result.submissionAttempted === false && result.quarantine?.pendingCount > 0
+    && Number.isFinite(Date.parse(result.quarantine?.firstAttemptAt))
+    && Date.parse(result.quarantine.firstAttemptAt) < Date.parse(cycle.startAt);
+  if (!currentSubmission && !historicalCalendar) return null;
   return {
     delayMs: bounded(rule.delayMs, 15_000, 0, 30_000),
     timeoutMs: bounded(rule.timeoutMs, 30_000, 30_000, 60_000),
-    cycleId: checkinCycle(target.origin, config, now).id,
+    cycleId: cycle.id,
+    historicalCalendar,
   };
 }
 
@@ -39,7 +50,8 @@ export async function recheckBeforeManualHandoff(results, targets, config, {
     if (!target || cleanupFailed || !canLaunch()) continue;
     const rule = eligibleRule(original, target, config, now());
     if (!rule) continue;
-    const diagnostics = { attempted: true, readOnly: true, delayMs: rule.delayMs, outcome: 'unconfirmed' };
+    const diagnostics = { attempted: true, readOnly: true, delayMs: rule.delayMs, outcome: 'unconfirmed',
+      ...(rule.historicalCalendar ? { historicalCalendar: true } : {}) };
     let context;
     let observation;
     const started = now().getTime();
@@ -80,8 +92,11 @@ export async function recheckBeforeManualHandoff(results, targets, config, {
     updated[index] = diagnostics.outcome === 'confirmed'
       ? { origin: target.origin, title: original.title, folderNames: original.folderNames,
           ...(original.recovery ? { recovery: original.recovery } : {}),
+          ...(original.calendarDiagnostics ? { initialCalendarDiagnostics: original.calendarDiagnostics } : {}),
           ...observation, preHandoffReadOnlyRecheck: diagnostics }
-      : { ...original, preHandoffReadOnlyRecheck: diagnostics };
+      : { ...original, ...(observation?.calendarDiagnostics
+          ? { recheckCalendarDiagnostics: observation.calendarDiagnostics } : {}),
+          preHandoffReadOnlyRecheck: diagnostics };
     await onResult(updated[index], index);
   }
   return updated;

@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [switch]$Abandon,
+    [switch]$SaveOnly,
     [string[]]$Origins = @(),
     [int[]]$Selection = @()
 )
@@ -14,6 +15,15 @@ $verificationPath = Join-Path $root 'tmp\manual-verification.json'
 $handoffPath = Join-Path $root 'tmp\manual-handoff.json'
 $abandonPath = Join-Path $root 'tmp\manual-abandon.json'
 $navigationExtensionPath = Join-Path $root 'tmp\manual-precheckin-extension'
+
+function Write-ManualSessionClosure([string]$Reason) {
+    $helper = Join-Path $root 'src\manual-session-lifecycle.mjs'
+    if (-not (Test-Path -LiteralPath $helper)) { return }
+    . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+    $closureConfig = Get-Content -Raw -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+    & (Resolve-CheckinNode $closureConfig) $helper $Reason
+    if ($LASTEXITCODE -ne 0) { throw '窗口已关闭，但关闭原因尚未落盘；保留会话记录。' }
+}
 
 function Remove-ManualNavigationExtension {
     $tmpRoot = [System.IO.Path]::GetFullPath((Join-Path $root 'tmp'))
@@ -48,6 +58,11 @@ function Clear-ManualContinuationState {
 
 function Write-ManualAbandonment($Targets) {
     [void](Write-TodayManualAbandonment -Path $abandonPath -Targets @($Targets))
+    if (Test-Path -LiteralPath (Join-Path $root 'logs\latest.json')) {
+        . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+        $abandonConfig = Get-Content -Raw -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+        Sync-TodayAbandonmentReport -Root $root -Node (Resolve-CheckinNode $abandonConfig)
+    }
 }
 
 function Resolve-ManualAbandonmentSelection($Targets) {
@@ -101,6 +116,7 @@ function Get-ManualVerificationTargets($SessionState) {
         $resolved += [ordered]@{
             origin = "$($uri.Scheme)://$($uri.Authority)"
             previousStatus = [string]$item.previousStatus
+            loginRecoveryRequired = $item.loginRecoveryRequired -eq $true
             verificationStatus = 'pending_verification'
         }
     }
@@ -108,6 +124,28 @@ function Get-ManualVerificationTargets($SessionState) {
 }
 
 function Write-ManualVerification($SessionState, $VerificationTargets) {
+    $abandonedOrigins = Get-TodayAbandonedOrigins -Path $abandonPath
+    $VerificationTargets = @($VerificationTargets | Where-Object {
+        $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
+        -not $origin -or -not $abandonedOrigins.ContainsKey($origin)
+    })
+    if ($VerificationTargets.Count -eq 0) { return }
+    $retainedTargets = @()
+    if (Test-Path -LiteralPath $verificationPath) {
+        $existing = Get-Content -Raw -Encoding UTF8 -LiteralPath $verificationPath | ConvertFrom-Json
+        $sourceDay = ([string]$SessionState.sourceRunId -split '-', 2)[0]
+        if ($sourceDay -match '^\d{8}$' -and [string]$existing.sourceRunId -like "$sourceDay-*" `
+            -and [string]$existing.state -eq 'pending_verification' -and $existing.authoritativeEvidenceRequired -eq $true) {
+            $retainedTargets = @($existing.targets | Where-Object {
+                $_.origin -notin @($VerificationTargets.origin) -and -not $abandonedOrigins.ContainsKey([string]$_.origin)
+            } | ForEach-Object {
+                if (-not $_.PSObject.Properties['manualSessionId']) {
+                    $_ | Add-Member -NotePropertyName manualSessionId -NotePropertyValue ([string]$existing.manualSessionId)
+                }
+                $_
+            })
+        }
+    }
     $closedAt = (Get-Date).ToUniversalTime().ToString('o')
     $verification = [ordered]@{
         schemaVersion = 1
@@ -115,6 +153,7 @@ function Write-ManualVerification($SessionState, $VerificationTargets) {
         createdAt = $closedAt
         manualSessionStartedAt = [string]$SessionState.startedAt
         manualSessionClosedAt = $closedAt
+        manualSessionId = [string]$SessionState.launchMarker
         sourceRunId = $SessionState.sourceRunId
         sourceFinishedAt = $SessionState.sourceFinishedAt
         selectionMode = [string]$SessionState.selectionMode
@@ -122,7 +161,7 @@ function Write-ManualVerification($SessionState, $VerificationTargets) {
         bookmarkLastModifiedAt = $SessionState.bookmarkLastModifiedAt
         successInferredFromManualInteraction = $false
         authoritativeEvidenceRequired = $true
-        targets = @($VerificationTargets)
+        targets = @($VerificationTargets) + $retainedTargets
     }
     [System.IO.Directory]::CreateDirectory((Split-Path -Parent $verificationPath)) | Out-Null
     $temporaryPath = "$verificationPath.$PID.tmp"
@@ -183,12 +222,10 @@ function Set-ManualAbandonmentContinuation($SessionState, $VerificationTargets) 
     if (@($split.Remaining).Count -gt 0) {
         Write-ManualVerification $SessionState $split.Remaining
     }
-    else {
-        Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue
-    }
     return $split
 }
 
+try {
 if (-not (Test-Path -LiteralPath $statePath)) {
     if ($Abandon -and ($Origins.Count -gt 0 -or $Selection.Count -gt 0)) {
         throw '没有正在运行的手动登录会话，无法解析部分放弃目标。'
@@ -214,7 +251,7 @@ if ($state -and [string]$state.mode -eq 'live_checkin') {
     if ($Abandon) { $null = Set-ManualAbandonmentContinuation $state $verificationTargets }
     if ($liveProcess) {
         [System.IO.File]::WriteAllText($signalPath, (@{
-            sessionId = [string]$state.sessionId; command = 'close'
+            sessionId = [string]$state.sessionId; command = 'close'; reason = $(if ($Abandon) { 'abandoned' } else { 'user_requested' })
         } | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
         if (-not $liveProcess.WaitForExit(20000)) {
             throw '同页窗口尚未完成关闭；保留会话记录，请稍后复核，勿重复启动。'
@@ -226,10 +263,10 @@ if ($state -and [string]$state.mode -eq 'live_checkin') {
             throw '同页辅助进程已退出，但项目浏览器仍存在；保留状态以防重复打开。'
         }
         if (-not $Abandon -and $verificationTargets.Count -gt 0) { Write-ManualVerification $state $verificationTargets }
+        Write-ManualSessionClosure $(if ($Abandon) { 'abandoned' } elseif ($liveProcess) { 'user_requested' } else { 'external_close' })
         Remove-Item -LiteralPath $statePath -Force
     }
     Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
-    if ($Abandon) { Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue }
     Write-Output '同页窗口已关闭；关闭动作不作为签到成功证据。'
     return
 }
@@ -293,6 +330,7 @@ if ($state -and [string]$state.mode -eq 'native') {
             Write-ManualVerification $state $verificationTargets
             Update-ManualHandoffForContinuation $verificationTargets
         }
+        Write-ManualSessionClosure $(if ($Abandon) { 'abandoned' } else { 'external_close' })
         Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
         Remove-ManualNavigationExtension
@@ -316,6 +354,18 @@ if ($state -and [string]$state.mode -eq 'native') {
         return
     }
 
+    if ($state.controlledCheckin -eq $true -and -not $Abandon -and -not $SaveOnly) {
+        $continuation = & (Join-Path $PSScriptRoot 'Resume-ManualCheckin.ps1') -ReadyOnly -Json | ConvertFrom-Json
+        if ($continuation.state -in @('busy', 'session_closed', 'session_changed')) {
+            Write-Output $continuation.message
+            return
+        }
+        if ($continuation.unresolvedCount -gt 0) {
+            Write-Output '同页接续尚未确认完成，窗口已保留；请处理当前验证，或明确使用 -SaveOnly 保存关闭。'
+            return
+        }
+    }
+
     $closeTargets = @($targets | ForEach-Object {
         Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue
     } | Where-Object { $_.MainWindowHandle -ne 0 })
@@ -336,6 +386,7 @@ if ($state -and [string]$state.mode -eq 'native') {
         Write-ManualVerification $state $verificationTargets
         Update-ManualHandoffForContinuation $verificationTargets
     }
+    Write-ManualSessionClosure $(if ($Abandon) { 'abandoned' } else { 'user_requested' })
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $signalPath -Force -ErrorAction SilentlyContinue
     Remove-ManualNavigationExtension
@@ -344,6 +395,21 @@ if ($state -and [string]$state.mode -eq 'native') {
     }
     elseif ($canCreateVerification) {
         Write-Output "机器人专用浏览器已保存会话并正常关闭；已记录 $($verificationTargets.Count) 个等待权威复核的站点。"
+        if (-not $SaveOnly -and $state.controlledCheckin -ne $true -and [string]$state.launchMarker -cmatch '^[a-f0-9]{32}$') {
+            . (Join-Path $PSScriptRoot 'ManualVerification.ps1')
+            $todayAbandoned = Get-TodayAbandonedOrigins -Path $abandonPath
+            $loginOrigins = @($verificationTargets | Where-Object {
+                (Test-ManualLoginContinuationTarget $_) -and -not $todayAbandoned.ContainsKey($_.origin)
+            } | ForEach-Object { $_.origin } | Sort-Object -Unique)
+            if ($loginOrigins.Count -gt 0) {
+                try {
+                    & (Join-Path $PSScriptRoot 'Run-Checkin.ps1') -Origins $loginOrigins -Attempts 1 `
+                        -SuppressReport -ResumeManualSessionId ([string]$state.launchMarker)
+                    if ($LASTEXITCODE -ne 0) { Write-Warning '定向续跑未全部确认：未完成站点仍待复核。' }
+                }
+                catch { Write-Warning '定向续跑未能启动：已保存登录状态，未完成站点仍待复核。' }
+            }
+        }
     }
     else {
         Write-Output '机器人专用浏览器已保存会话并正常关闭；旧版会话没有可用的定向复核元数据。'
@@ -364,4 +430,21 @@ if ($Abandon) {
 }
 else {
     Write-Output '已请求旧版手动登录会话保存并正常关闭。'
+}
+}
+finally {
+    $pendingAccountScript = Join-Path $PSScriptRoot 'Invoke-PendingAccountVerification.ps1'
+    if (-not (Test-Path -LiteralPath $statePath) -and (Test-Path -LiteralPath $pendingAccountScript)) {
+        & $pendingAccountScript
+    }
+    if (-not (Test-Path -LiteralPath $statePath) -and $state) {
+        $historyPath = Join-Path $root 'tmp\manual-session-history.json'
+        $history = if (Test-Path -LiteralPath $historyPath) { Get-Content -Raw -LiteralPath $historyPath | ConvertFrom-Json } else { $null }
+        $identity = if ($state.sessionId) { [string]$state.sessionId } else { [string]$state.launchMarker }
+        $closure = @($history.sessions | Where-Object identity -CEQ $identity | Select-Object -Last 1)
+        $continueScript = Join-Path $PSScriptRoot 'Continue-ManualHandoff.ps1'
+        if ($closure.Count -eq 1 -and [string]$closure[0].closeReason -in @('completed', 'abandoned') -and (Test-Path -LiteralPath $continueScript)) {
+            & $continueScript
+        }
+    }
 }

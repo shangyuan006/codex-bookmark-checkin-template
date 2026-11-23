@@ -1,6 +1,9 @@
 import { normalizeText } from "./detector.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
 import { beforePageSubmission } from './submission-guard.mjs';
+import { readChallengeWidgetReadiness, challengePointIsUnobstructed } from './challenge-widget-readiness.mjs';
+import { normalizeNativeVerificationRecovery } from './native-checkin-recovery.mjs';
+import { clickClosedShadowChallengeControl } from './closed-shadow-challenge.mjs';
 
 const ACTION_SELECTOR = 'button, a, [role="button"], input[type="button"], input[type="submit"]';
 
@@ -54,6 +57,7 @@ export function normalizeNativeCheckinActionRule(raw) {
     clickChallenge: raw.clickChallenge === true,
     challengeFrameStableMs: Math.max(3000, Math.min(5000, Number(raw.challengeFrameStableMs) || 4000)),
     ...(dailyUnsignedTextPattern ? { dailyUnsignedTextPattern } : {}),
+    ...(raw.verificationRecovery ? { verificationRecovery: normalizeNativeVerificationRecovery(raw.verificationRecovery) } : {}),
   };
 }
 
@@ -312,6 +316,10 @@ async function inspectNativeChallengeControls(page, expectedOrigin) {
     if (!duplicate) frameClickCandidates.push(frameBox);
   };
   let allowedFrameCount = 0;
+  let readyFrameCount = 0, failedFrameCount = 0, loadingFrameCount = 0;
+  let unreadableFrameCount = 0, notReadyFrameCount = 0;
+  let loadedFrameCount = 0, emptyFrameCount = 0, missingCheckboxFrameCount = 0;
+  let readyFrameElement = null, readyFrame = null;
   for (const frame of page.frames()) {
     if (!nativeChallengeFrameIsAllowed(frame.url(), expectedOrigin)) continue;
     const frameElement = await frame.frameElement().catch(() => null);
@@ -319,6 +327,18 @@ async function inspectNativeChallengeControls(page, expectedOrigin) {
     if (!await visibleChallengeFrame(frameElement, frameBox)) continue;
     allowedFrameCount += 1;
     addFrameClickCandidate(frameBox);
+    const readiness = await readChallengeWidgetReadiness(frame, { includeDiagnostics: true });
+    loadedFrameCount += Number(readiness.documentLoaded === true);
+    emptyFrameCount += Number(readiness.documentEmpty === true);
+    missingCheckboxFrameCount += Number(readiness.documentLoaded === true && readiness.checkboxCandidateCount === 0);
+    failedFrameCount += Number(readiness.failed);
+    loadingFrameCount += Number(readiness.loading);
+    unreadableFrameCount += Number(readiness.inspectionState === 'unreadable');
+    notReadyFrameCount += Number(readiness.inspectionState === 'not_ready');
+    if (!readiness.checkboxReady) continue;
+    readyFrameCount += 1;
+    readyFrameElement = frameElement;
+    readyFrame = frame;
     const controls = frame.locator([
       'input[type="checkbox"]',
       '[role="checkbox"]',
@@ -377,8 +397,10 @@ async function inspectNativeChallengeControls(page, expectedOrigin) {
     directCandidateCount: directCandidates.length,
     labelCandidateCount: labelCandidates.length,
     frameClickCandidateCount: frameClickCandidates.length,
+    readyFrameCount, failedFrameCount, loadingFrameCount, unreadableFrameCount, notReadyFrameCount,
+    loadedFrameCount, emptyFrameCount, missingCheckboxFrameCount,
   };
-  return { candidates, frameClickCandidates, details };
+  return { candidates, frameClickCandidates, details, readyFrameElement, readyFrame };
 }
 
 export async function clickVisibleNativeChallengeControl(page, expectedOrigin, rawRule) {
@@ -386,8 +408,15 @@ export async function clickVisibleNativeChallengeControl(page, expectedOrigin, r
   if (!rule.clickChallenge) return { clicked: false, outcome: "challenge_not_configured" };
   assertBookmarkNavigation(page.url(), [expectedOrigin]);
 
+  const closedShadow = await clickClosedShadowChallengeControl(page, expectedOrigin, { stableMs: rule.challengeFrameStableMs });
+  if (closedShadow) {
+    if (closedShadow.clicked) await confirmSameOriginAfterChallengeClick(page, expectedOrigin);
+    return closedShadow;
+  }
+
   const deadline = Date.now() + rule.challengeFrameStableMs + 5000;
   let previousBox = null;
+  let previousFrame = null;
   let stableSince = 0;
   let sawFrameCandidate = false;
   let latestDetails = null;
@@ -403,6 +432,7 @@ export async function clickVisibleNativeChallengeControl(page, expectedOrigin, r
     }
     const { candidates, frameClickCandidates, details } = inspection;
     latestDetails = details;
+    if (details.failedFrameCount > 0) return { clicked: false, outcome: 'challenge_verification_failed', details };
     if (details.allowedFrameCount > 1 || details.allowedParentFrameCount > 1) {
       return { clicked: false, outcome: "challenge_frame_not_unique", details };
     }
@@ -416,23 +446,25 @@ export async function clickVisibleNativeChallengeControl(page, expectedOrigin, r
     if (!box && !sawFrameCandidate && !allowedFramePresent) {
       return { clicked: false, outcome: "challenge_not_found", details };
     }
-    if (!box) {
+    if (!box || details.readyFrameCount !== 1) {
       previousBox = null;
       stableSince = 0;
-    } else if (!nativeChallengeFrameGeometryMatches(previousBox, box)) {
+    } else if (previousFrame !== inspection.readyFrame || !nativeChallengeFrameGeometryMatches(previousBox, box)) {
+      previousFrame = inspection.readyFrame;
       previousBox = box;
       stableSince = Date.now();
     } else if (Date.now() - stableSince >= rule.challengeFrameStableMs) {
       const stableDetails = { ...details, frameStableMs: Date.now() - stableSince };
+      if (!await challengePointIsUnobstructed(page, box, inspection.readyFrameElement)) {
+        return { clicked: false, outcome: 'challenge_obstructed', details: stableDetails };
+      }
       try {
         if (candidates.length === 1) {
           await candidates[0].click({ timeout: 5_000 });
           await confirmSameOriginAfterChallengeClick(page, expectedOrigin);
           return { clicked: true, outcome: "challenge_clicked", details: stableDetails };
         }
-        await page.mouse.click(box.x + Math.min(38, box.width * 0.15), box.y + box.height / 2);
-        await confirmSameOriginAfterChallengeClick(page, expectedOrigin);
-        return { clicked: true, outcome: "challenge_frame_clicked", details: stableDetails };
+        return { clicked: false, outcome: 'challenge_control_unreadable', details: stableDetails };
       } catch {
         return { clicked: false, outcome: "challenge_click_failed", details: stableDetails };
       }
@@ -442,7 +474,10 @@ export async function clickVisibleNativeChallengeControl(page, expectedOrigin, r
 
   return {
     clicked: false,
-    outcome: sawFrameCandidate ? "challenge_frame_not_stable" : "challenge_not_found",
+    outcome: latestDetails?.unreadableFrameCount > 0 ? 'challenge_frame_unreadable'
+      : latestDetails?.loadingFrameCount > 0 ? 'challenge_loading'
+      : sawFrameCandidate && latestDetails?.readyFrameCount !== 1 ? 'challenge_not_ready'
+      : sawFrameCandidate ? "challenge_frame_not_stable" : "challenge_not_found",
     details: latestDetails,
   };
 }

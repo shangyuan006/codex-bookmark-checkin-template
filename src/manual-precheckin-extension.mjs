@@ -41,7 +41,9 @@ function normalizeHandoffItems(document) {
 
 export function manualPrecheckinContentScript(rules) {
   const rule = rules[location.origin];
-  if (!rule || location.pathname === rule.expectedPath) return;
+  if (!rule) return;
+  const report = state => { document.documentElement.dataset.manualPrecheckinState = state; };
+  if (location.pathname === rule.expectedPath) { report('complete'); return; }
 
   const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
   const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
@@ -61,9 +63,39 @@ export function manualPrecheckinContentScript(rules) {
   const accessibleName = (element) => normalize(
     element.getAttribute("aria-label") || element.innerText || element.value || element.textContent,
   );
+  // Split CSS lists without splitting commas in quoted text or attribute values.
+  // Only the reviewed, exact Playwright :text-is() suffix is translated.
+  const select = selector => {
+    let start = 0, depth = 0, quote = null, escaped = false;
+    const parts = [];
+    for (let i = 0; i < selector.length; i++) {
+      const c = selector[i];
+      if (escaped) { escaped = false; continue; }
+      if (c === '\\') { escaped = true; continue; }
+      if (quote) { if (c === quote) quote = null; continue; }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === '(' || c === '[') depth++;
+      if (c === ')' || c === ']') depth--;
+      if (c === ',' && depth === 0) { parts.push(selector.slice(start, i)); start = i + 1; }
+      if (depth < 0) throw new Error('unsupported_selector');
+    }
+    parts.push(selector.slice(start));
+    if (quote || depth || escaped) throw new Error('unsupported_selector');
+    const matches = parts.flatMap(part => {
+      const text = part.trim().match(/^(.*):text-is\(\s*(['"])((?:\\.|[^\\])*?)\2\s*\)$/);
+      const css = text ? text[1].trim() || '*' : part.trim();
+      if (!css || /:text-is\(|:has-text\(|:text\(|>>/.test(css)) throw new Error('unsupported_selector');
+      let elements;
+      try { elements = [...document.querySelectorAll(css)]; }
+      catch { throw new Error('unsupported_selector'); }
+      const exact = text && normalize(text[3].replace(/\\(['"\\])/g, '$1'));
+      return text ? elements.filter(element => normalize(element.innerText || element.textContent) === exact) : elements;
+    });
+    return [...new Set(matches)];
+  };
   const locate = (step) => {
     const candidates = step.selector
-      ? [...document.querySelectorAll(step.selector)]
+      ? select(step.selector)
       : roleCandidates(step.role).filter((element) => accessibleName(element) === step.name);
     if (candidates.length > 20) throw new Error("candidate set too large");
     const matches = candidates.filter((element) => visible(element)
@@ -82,7 +114,8 @@ export function manualPrecheckinContentScript(rules) {
     throw new Error("candidate was not found");
   };
 
-  void (async () => {
+  report('navigating');
+  return (async () => {
     const initialOrigin = location.origin;
     for (const step of rule.steps) {
       const candidate = await waitForCandidate(step);
@@ -97,7 +130,8 @@ export function manualPrecheckinContentScript(rules) {
       }
       await delay(100);
     }
-  })().catch(() => {});
+    report('complete');
+  })().catch(error => { report(error.message === 'unsupported_selector' ? 'unsupported_selector' : 'navigation_failed'); });
 }
 
 function extensionSource(rules) {

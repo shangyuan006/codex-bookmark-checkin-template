@@ -14,7 +14,7 @@ test("手动会话状态只记录复核所需字段，不持久化书签 URL", a
   assert.ok(targetProjection, "manual-session target projection must be present");
   assert.deepEqual(
     [...targetProjection.matchAll(/^\s+(\w+)\s*=/gm)].map((match) => match[1]),
-    ["origin", "previousStatus"],
+    ["origin", "previousStatus", "loginRecoveryRequired"],
   );
   assert.doesNotMatch(targetProjection, /\burl\s*=/i);
   assert.match(source, /\$arguments \+= @\(\$items \| ForEach-Object \{ \[string\]\$_\.url \}\)/);

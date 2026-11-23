@@ -203,7 +203,7 @@ test("provider handoff distinguishes CF verification, rate limits, and confirmed
         fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
           `function Resolve-CheckinNode { param($Config) return ${quotePowerShell(process.execPath)} }`,
           "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'unused.exe'; ProcessName = 'fixture-never.exe' } }",
-          "function Get-CimInstance { param($ClassName) return @() }",
+          "function Get-CimInstance { param($ClassName) return @() }; function Get-CheckinProfileBrowserProcesses { param($Config,$ProfilePath) return @() }",
           "function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru) return [pscustomobject]@{ Id = 123 } }",
           "function Wait-CheckinVisibleBrowserWindow { param($Config, $ProfilePath, $LaunchMarker) return [pscustomobject]@{ ProcessId = 123; ProcessStartedAt = (Get-Date).ToUniversalTime().ToString('o') } }",
         ].join("\r\n"), "utf8"),
@@ -290,7 +290,7 @@ test("LinuxDO Agent Router stage tolerates private OAuth progress on stderr", as
       fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
         "function Resolve-CheckinNode { param($Config) return " + quotePowerShell(process.execPath) + " }",
         "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'unused.exe'; ProcessName = 'codex-agentrouter-test-never.exe'; DisplayName = 'Test Edge' } }",
-        "function Get-CimInstance { param($ClassName) return @() }",
+        "function Get-CimInstance { param($ClassName) return @() }; function Get-CheckinProfileBrowserProcesses { param($Config,$ProfilePath) return @() }",
       ].join("\r\n"), "utf8"),
       fs.writeFile(path.join(scriptsDirectory, "Run-Checkin.ps1"), [
         "param([string]$ReauthAccountKey, [switch]$PostOAuthVerify, [int]$Attempts, [switch]$SuppressReport)",
@@ -349,9 +349,9 @@ test("LinuxDO Agent Router stage tolerates private OAuth progress on stderr", as
 
 test("LinuxDO restart recovery continues into OAuth after the logout boundary is established", async () => {
   const source = await fs.readFile(openPath, "utf8");
-  const restartBlock = source.match(/if \(\$recoveryAction -eq 'restart'\) \{[\s\S]*?\n    \}/)?.[0] ?? "";
+  const restartBlock = source.match(/if \(\$recoveryAction -in @\('restart', 'verify_logout'\)\) \{[\s\S]*?\n    \}/)?.[0] ?? "";
   const oauthIndex = source.indexOf("$oauthArguments = @(");
-  const restartIndex = source.indexOf("if ($recoveryAction -eq 'restart')");
+  const restartIndex = source.indexOf("if ($recoveryAction -in @('restart', 'verify_logout'))");
 
   assert.ok(restartIndex >= 0);
   assert.ok(oauthIndex > restartIndex);
@@ -390,7 +390,7 @@ test("Agent Router OAuth failure rechecks the isolated target before opening a m
       fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
         "function Resolve-CheckinNode { param($Config) return " + quotePowerShell(process.execPath) + " }",
         "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'must-not-start.exe'; ProcessName = 'codex-agentrouter-test-never.exe'; DisplayName = 'Test Edge' } }",
-        "function Get-CimInstance { param($ClassName) return @() }",
+        "function Get-CimInstance { param($ClassName) return @() }; function Get-CheckinProfileBrowserProcesses { param($Config,$ProfilePath) return @() }",
       ].join("\r\n"), "utf8"),
       fs.writeFile(path.join(sourceDirectory, "prepare-native-browser-profile.mjs"), "process.exitCode = 0;\n", "utf8"),
       fs.writeFile(path.join(sourceDirectory, "oauth-provider-session.mjs"), "process.stdout.write(JSON.stringify({ status: 'valid' }) + '\\n');\n", "utf8"),
@@ -464,7 +464,7 @@ test("LinuxDO provider helper skips the visible page when the existing session i
       fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
         "function Resolve-CheckinNode { param($Config) return " + quotePowerShell(process.execPath) + " }",
         "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'must-not-start.exe'; ProcessName = 'codex-agentrouter-test-never.exe'; DisplayName = 'Test Edge' } }",
-        "function Get-CimInstance { param($ClassName) return @() }",
+        "function Get-CimInstance { param($ClassName) return @() }; function Get-CheckinProfileBrowserProcesses { param($Config,$ProfilePath) return @() }",
       ].join("\r\n"), "utf8"),
       fs.writeFile(path.join(sourceDirectory, "prepare-native-browser-profile.mjs"), "process.exitCode = 0;\n", "utf8"),
       fs.writeFile(path.join(sourceDirectory, "oauth-provider-session.mjs"), "process.stdout.write(JSON.stringify({ status: 'valid' }) + '\\n');\n", "utf8"),
@@ -699,7 +699,7 @@ test("LinuxDO provider helper does not open a visible page for an indeterminate 
       fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
         "function Resolve-CheckinNode { param($Config) return " + quotePowerShell(process.execPath) + " }",
         "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'must-not-start.exe'; ProcessName = 'codex-agentrouter-test-never.exe'; DisplayName = 'Test Edge' } }",
-        "function Get-CimInstance { param($ClassName) return @() }",
+        "function Get-CimInstance { param($ClassName) return @() }; function Get-CheckinProfileBrowserProcesses { param($Config,$ProfilePath) return @() }",
         "function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru) [System.IO.File]::WriteAllText(" + quotePowerShell(launchRecordPath) + ", ($ArgumentList | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false)); return [pscustomobject]@{ Id = 4242; StartTime = [datetime]::UtcNow } }",
         "function Wait-CheckinVisibleBrowserWindow { return [pscustomobject]@{ ProcessId = 4343; ProcessStartedAt = [datetime]::UtcNow.ToString('o') } }",
       ].join("\r\n"), "utf8"),
@@ -789,7 +789,7 @@ test("LinuxDO provider helper opens the manual page only after definitive invali
       fs.writeFile(path.join(scriptsDirectory, "Resolve-Runtime.ps1"), [
         "function Resolve-CheckinNode { param($Config) return " + quotePowerShell(process.execPath) + " }",
         "function Resolve-CheckinBrowser { param($Config) return [pscustomobject]@{ Executable = 'mock-edge.exe'; ProcessName = 'codex-agentrouter-test-never.exe'; DisplayName = 'Test Edge' } }",
-        "function Get-CimInstance { param($ClassName) return @() }",
+        "function Get-CimInstance { param($ClassName) return @() }; function Get-CheckinProfileBrowserProcesses { param($Config,$ProfilePath) return @() }",
         "function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru) [System.IO.File]::WriteAllText(" + quotePowerShell(launchRecordPath) + ", ($ArgumentList | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false)); return [pscustomobject]@{ Id = 4242; StartTime = [datetime]::UtcNow } }",
         "function Wait-CheckinVisibleBrowserWindow { return [pscustomobject]@{ ProcessId = 4343; ProcessStartedAt = [datetime]::UtcNow.ToString('o') } }",
       ].join("\r\n"), "utf8"),

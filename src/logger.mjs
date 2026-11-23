@@ -6,10 +6,15 @@ import {
   redactPrivateResultText,
 } from "./security.mjs";
 import { isTerminalResult } from "./result-contract.mjs";
-import { reconcileCheckinResult, normalizeBoundEvidenceResult, clearResolvedFailureFields } from "./checkin-evidence.mjs";
+import { reconcileCheckinResult, normalizeBoundEvidenceResult, clearResolvedFailureFields, bindSuccessEvidence } from "./checkin-evidence.mjs";
 import { syncManualCompletion } from "./manual-result-reconciliation.mjs";
+import { applyTodayAbandonment, readTodayAbandonment } from './manual-abandonment.mjs';
+import { newerUnresolvedObservation, failureObservation } from './result-observation.mjs';
+import { sanitizeSubmissionDiagnostics } from './sequential-click-diagnostics.mjs';
+import { normalizeResultActionEntries } from './sequential-action-evidence.mjs';
 
 export function sanitizeForPersistence(value) {
+  value = normalizeResultActionEntries(value);
   if (typeof value === "string") return redactPrivateResultText(value);
   if (Array.isArray(value)) return value.map(sanitizeForPersistence);
   if (!value || typeof value !== "object") return value;
@@ -17,7 +22,23 @@ export function sanitizeForPersistence(value) {
   // They are diagnostic input, never required completion evidence.
   return Object.fromEntries(Object.entries(value)
     .filter(([key]) => key !== "controls")
-    .map(([key, item]) => [key, sanitizeForPersistence(item)]));
+    .map(([key, item]) => [key, ['submissionDiagnostics', 'verificationRecoveryDiagnostics'].includes(key)
+      ? sanitizeSubmissionDiagnostics(item) : sanitizeForPersistence(item)]));
+}
+
+// Scoped continuations must persist failed observations as well as completion.
+// The normal merger keeps authoritative completion and today's abandonment.
+export async function writeScopedCheckinResult(projectRoot, target, observation, config = {}, {
+  startedAt = new Date().toISOString(), finishedAt = new Date().toISOString(),
+} = {}) {
+  const result = bindSuccessEvidence({ ...observation, origin: target.origin, title: target.title,
+    folderNames: target.folderNames, observedAt: observation.observedAt ?? finishedAt }, target, config);
+  const logs = path.join(projectRoot, 'logs'), log = await createRunLog(logs);
+  const report = { runId: log.runId, startedAt, finishedAt, runState: 'final', isComplete: true,
+    scopeComplete: false, plannedTotal: 1, processedTotal: 1, selectedTotal: 1, selectedProcessedTotal: 1,
+    selectedOrigins: [target.origin], summary: summarizeResults([result]), results: [result] };
+  await writeRunResult(logs, log, report, { updateLatest: false, reconcileLatest: true });
+  return { result, report };
 }
 
 function completeFinalReport(report) {
@@ -54,10 +75,11 @@ function completionEvidenceTime(result) {
   return Date.parse(result?.evidence?.confirmedAt??'');
 }
 
-function promoteResult(current, incoming, now) {
+function promoteResult(current, incoming, now, observationTimes = {}) {
   const resolvedCurrent = completionEvidenceStrength(current, now) > 0
     ? clearResolvedFailureFields(current) : current;
-  if (!incoming || !isTerminalResult(incoming,now)) return resolvedCurrent;
+  if (!incoming || !isTerminalResult(incoming,now)) return newerUnresolvedObservation(resolvedCurrent, incoming, { ...observationTimes, now }) ?? resolvedCurrent;
+  if ((current.accountKey ?? 'default') !== (incoming.accountKey ?? 'default')) return resolvedCurrent;
   if ((incoming.actionType ?? "checkin") !== (current.actionType ?? "checkin")) return resolvedCurrent;
   const incomingStrength = completionEvidenceStrength(incoming, now);
   if (["signed", "already_signed"].includes(incoming.status) && incomingStrength === 0) return resolvedCurrent;
@@ -69,6 +91,16 @@ function promoteResult(current, incoming, now) {
     && (!currentStrength || completionEvidenceTime(incoming) >= completionEvidenceTime(current));
   if (!statusPromotion && !strongerEvidence) return resolvedCurrent;
   const promoted = { ...current, ...incoming };
+  if (incomingStrength > 0 && !completionEvidenceStrength(current, now)) {
+    // A native status probe can omit a reason. Never inherit the failure text
+    // from the result which this new, bound completion has just replaced.
+    if (!String(incoming.reason ?? '').trim()) {
+      promoted.reason = incoming.evidence?.source === 'user_rule'
+        ? '本地明确配置的完成条件已满足' : '页面或接口已明确确认今日签到完成';
+    }
+    promoted.observationHistory = [...(current.observationHistory ?? []),
+      failureObservation(current, current.observedAt ?? observationTimes.currentAt)].slice(-8);
+  }
   if (currentStrength > incomingStrength || (currentStrength && incomingStrength
     && completionEvidenceTime(incoming) < completionEvidenceTime(current))) {
     promoted.evidence = current.evidence;
@@ -102,10 +134,11 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
     || runDate(incoming.runId) !== latestDate) return null;
 
   const incomingByOrigin = new Map(incoming.results
-    .filter((result) => result?.origin && isTerminalResult(result,reconciledAt)
+    .filter((result) => result?.origin
       && (!["signed", "already_signed"].includes(result.status)
         || completionEvidenceStrength(result, reconciledAt) > 0))
     .map((result) => [result.origin, result]));
+  const observationTimes = { currentAt: latest.finishedAt, incomingAt: incoming.finishedAt };
   const bookmarkPlan = currentBookmarkPlan(incoming);
   if (bookmarkPlan) {
     const currentOrigins = new Set(bookmarkPlan.origins);
@@ -115,12 +148,12 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
       || [...incomingByOrigin.keys()].some((origin) => !currentOrigins.has(origin))) return null;
 
     const newOrigins = bookmarkPlan.origins.filter((origin) => !latestByOrigin.has(origin));
-    if (newOrigins.some((origin) => !incomingByOrigin.has(origin))) return null;
+    if (newOrigins.some((origin) => !isTerminalResult(incomingByOrigin.get(origin), reconciledAt))) return null;
     const results = bookmarkPlan.origins.map((origin) => {
       const current = latestByOrigin.get(origin);
       const candidate = incomingByOrigin.get(origin);
       if (!current) return candidate;
-      return promoteResult(current, candidate, reconciledAt);
+      return promoteResult(current, candidate, reconciledAt, observationTimes);
     });
     const changed = newOrigins.length > 0
       || results.some((result, index) => result !== latestByOrigin.get(bookmarkPlan.origins[index]));
@@ -159,7 +192,7 @@ export function mergeAuthoritativeDailyResults(latest, incoming, reconciledAt = 
   let changed = false;
   const results = latest.results.map((current) => {
     const candidate = incomingByOrigin.get(current.origin);
-    const promoted = promoteResult(current, candidate, reconciledAt);
+    const promoted = promoteResult(current, candidate, reconciledAt, observationTimes);
     if (promoted !== current) changed = true;
     return promoted;
   });
@@ -192,8 +225,8 @@ function localRunId(date = new Date()) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
-export async function createRunLog(rootDirectory) {
-  const runId = localRunId();
+export async function createRunLog(rootDirectory, executionAttemptId = null) {
+  const runId = `${localRunId()}${executionAttemptId ? `-${executionAttemptId}` : ""}`;
   const directory = path.join(rootDirectory, runId);
   await ensurePrivateDirectory(directory);
   return { runId, directory };
@@ -208,16 +241,18 @@ export async function writeRunResult(rootDirectory, runLog, result, {
   const latestFile = path.join(rootDirectory, "latest.json");
   const at=Number.isFinite(Date.parse(result.finishedAt??''))?new Date(result.finishedAt):new Date();
   const normalizedResults=(result.results??[]).map(entry=>normalizeBoundEvidenceResult(entry,undefined,at));
-  const safeResult = sanitizeForPersistence({...result,results:normalizedResults,
-    ...(result.summary?{summary:summarizeResults(normalizedResults)}:{})});
+  const abandonment = await readTodayAbandonment(path.dirname(path.resolve(rootDirectory)), now);
+  const safeResult = sanitizeForPersistence(applyTodayAbandonment({...result,results:normalizedResults,
+    ...(result.summary?{summary:summarizeResults(normalizedResults)}:{})}, abandonment, now));
   let manualSource=safeResult;
   await atomicWriteJson(runFile, safeResult);
   if (updateLatest) {
     await atomicWriteJson(latestFile, safeResult);
   } else if (reconcileLatest) {
     const latest = await fs.readFile(latestFile, "utf8").then(JSON.parse).catch(() => null);
-    const reconciled = mergeAuthoritativeDailyResults(latest, safeResult);
-    if (reconciled) { await atomicWriteJson(latestFile, reconciled); manualSource=reconciled; }
+    const merged = mergeAuthoritativeDailyResults(latest, safeResult, now);
+    const reconciled = applyTodayAbandonment(merged ?? latest, abandonment, now);
+    if (reconciled && (merged || reconciled !== latest)) { await atomicWriteJson(latestFile, reconciled); manualSource=reconciled; }
   }
   if(safeResult.runState==="final" && safeResult.isComplete===true) {
     await syncManualCompletion(path.dirname(path.resolve(rootDirectory)),manualSource,{now});

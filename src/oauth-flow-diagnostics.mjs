@@ -7,7 +7,11 @@ import {sanitizeOAuthPageObservation, sanitizeOAuthCallbackDiagnostics, sanitize
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const flows = new Set(['automatic_provider', 'automatic_provider_after_refresh', 'automatic_target',
-  'manual_provider', 'manual_target', 'manual_target_oauth', 'automatic_logout']);
+  'manual_provider', 'manual_target', 'manual_target_oauth', 'automatic_logout', 'automatic_native_target']);
+const continuationOutcomes = new Set(['confirmation_not_configured', 'session_confirmed', 'page_not_unique',
+  'page_not_found', 'provider_pending', 'target_unconfirmed', 'inspection_failed']);
+const loginRecoveryOutcomes = new Set(['login_not_configured', 'login_control_unavailable', 'login_click_blocked',
+  'login_attempt_pending', 'login_recovered', 'login_challenge_pending', 'login_submitted', 'login_required']);
 
 export function sanitizeOAuthFlowDiagnostic(entry, now = new Date()) {
   if (!flows.has(entry?.flow)) return null;
@@ -19,6 +23,8 @@ export function sanitizeOAuthFlowDiagnostic(entry, now = new Date()) {
     oauthStage:outcome.oauthStage ?? 'helper_failed',
     stages:(Array.isArray(entry.stages) ? entry.stages : []).filter(stage=>OAUTH_DIAGNOSTIC_STAGES.has(stage)).slice(-64),
     elapsedMs:Number.isFinite(entry.elapsedMs) ? Math.max(0,Math.min(600_000,Math.round(entry.elapsedMs))) : null,
+    ...(continuationOutcomes.has(entry.continuationOutcome) ? { continuationOutcome: entry.continuationOutcome } : {}),
+    ...(loginRecoveryOutcomes.has(entry.loginRecoveryOutcome) ? { loginRecoveryOutcome: entry.loginRecoveryOutcome } : {}),
     ...sanitizeOAuthPageObservation(entry),
     ...sanitizeOAuthCallbackDiagnostics(entry.callbackDiagnostics),
     ...sanitizeOAuthTimingDiagnostics(entry),

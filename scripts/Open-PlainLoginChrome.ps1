@@ -7,6 +7,7 @@ param(
     [int]$RemoteDebuggingPort = 0,
     [switch]$NativeMinimal,
     [switch]$TrackManualSession,
+    [switch]$ControlledCheckin,
     [string]$UserDataDirOverride
 )
 
@@ -30,11 +31,13 @@ if ($UserDataDirOverride) {
 $node = Resolve-CheckinNode $config
 $browser = Resolve-CheckinBrowser $config
 $statePath = Join-Path $root 'tmp\manual-session.json'
-$verificationPath = Join-Path $root 'tmp\manual-verification.json'
 $navigationExtensionPath = Join-Path $root 'tmp\manual-precheckin-extension'
 $navigationInputPath = Join-Path $root 'tmp\manual-precheckin-extension.input.json'
 
-if ($TrackManualSession -and (-not $NativeMinimal -or $Offscreen -or $RemoteDebuggingPort -gt 0)) {
+if ($ControlledCheckin -and (-not $TrackManualSession -or $UserDataDirOverride -or $RemoteDebuggingPort -lt 1024 -or $RemoteDebuggingPort -gt 65535)) {
+    throw '受控签到必须使用默认项目配置、跟踪会话和有效的本机调试端口。'
+}
+if ($TrackManualSession -and (-not $NativeMinimal -or $Offscreen -or ($RemoteDebuggingPort -gt 0 -and -not $ControlledCheckin))) {
     throw '手动登录会话必须使用可见的最小原生模式，且不得启用远程调试。'
 }
 if ($TrackManualSession -and $Urls.Count -gt 0) {
@@ -48,7 +51,14 @@ if ($Origins.Count -gt 0 -and $Selection.Count -gt 0) {
 }
 
 if (Test-Path -LiteralPath $statePath) {
-    & (Join-Path $PSScriptRoot 'Close-ManualLogin.ps1')
+    $previousSession = try { Get-Content -Raw -Encoding UTF8 -LiteralPath $statePath | ConvertFrom-Json } catch { $null }
+    if ($previousSession.mode -eq 'native' -and $previousSession.controlledCheckin -ne $true) {
+        # Replacing the window is not a confirmation that login finished.
+        & (Join-Path $PSScriptRoot 'Close-ManualLogin.ps1') -SaveOnly
+    }
+    else {
+        & (Join-Path $PSScriptRoot 'Close-ManualLogin.ps1')
+    }
     $deadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 500
@@ -120,8 +130,16 @@ if ($selectedAgentRouterItems.Count -gt 0) {
     })
 }
 if (@($items).Count -eq 0) { throw '当前没有符合选择条件的待处理站点。' }
+if ($ControlledCheckin) {
+    $controlledPlanRaw = @(& $node (Join-Path $root 'src\manual-native-continuation.mjs') --plan @attentionArguments)
+    if ($LASTEXITCODE -ne 0) { throw '无法校验受控签到规则。' }
+    $controlledPlan = ($controlledPlanRaw -join [Environment]::NewLine) | ConvertFrom-Json
+    if (@($items | Where-Object { @($controlledPlan.origins) -notcontains [string]$_.origin }).Count -gt 0) {
+        throw '受控签到仅接受当前书签中有明确原生动作规则的目标。'
+    }
+}
 $manualNavigationEnabled = $false
-if ($TrackManualSession) {
+if ($TrackManualSession -and -not $ControlledCheckin) {
     [System.IO.Directory]::CreateDirectory((Split-Path -Parent $navigationInputPath)) | Out-Null
     $navigationInput = [ordered]@{
         targets = @($items | Select-Object `
@@ -164,13 +182,14 @@ if (-not $NativeMinimal) {
         '--disable-renderer-backgrounding'
     )
 }
-if ($Offscreen -or -not $NativeMinimal) {
+if ($Offscreen -or -not $NativeMinimal -or $TrackManualSession) {
     $arguments += @(
         "--window-position=$windowPosition",
         '--window-size=1400,900'
     )
 }
 if ($RemoteDebuggingPort -gt 0) {
+    $arguments += '--remote-debugging-address=127.0.0.1'
     $arguments += "--remote-debugging-port=$RemoteDebuggingPort"
     $arguments += "--remote-allow-origins=http://127.0.0.1:$RemoteDebuggingPort"
 }
@@ -189,11 +208,11 @@ catch {
     throw
 }
 if ($TrackManualSession) {
-    Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue
     $processStartedAt = try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null }
     $state = [ordered]@{
         schemaVersion = 2
         pid = $process.Id
+        windowReady = $false
         mode = 'native'
         startedAt = (Get-Date).ToUniversalTime().ToString('o')
         processStartedAt = $processStartedAt
@@ -205,11 +224,14 @@ if ($TrackManualSession) {
         bookmarkPlanGeneratedAt = $handoff.bookmarkPlanGeneratedAt
         bookmarkLastModifiedAt = $handoff.bookmarkLastModifiedAt
         preCheckinNavigationEnabled = $manualNavigationEnabled
+        controlledCheckin = [bool]$ControlledCheckin
+        nativeDebugPort = if ($ControlledCheckin) { $RemoteDebuggingPort } else { 0 }
         targetCount = @($items).Count
         targets = @($items | ForEach-Object {
             [ordered]@{
                 origin = [string]$_.origin
                 previousStatus = [string]$_.previousStatus
+                loginRecoveryRequired = $_.loginRecoveryRequired -eq $true
             }
         })
     }
@@ -219,5 +241,11 @@ if ($TrackManualSession) {
         ($state | ConvertTo-Json -Depth 6),
         [System.Text.UTF8Encoding]::new($false)
     )
+    $stableWindow = Wait-CheckinVisibleBrowserWindow -Config $config -ProfilePath ([string]$config.automationUserDataDir) -LaunchMarker $launchMarker
+    if (-not $stableWindow) { throw '人工浏览器没有出现稳定可见窗口；保留会话记录，不能提示用户已打开页面。' }
+    $state.pid = [int]$stableWindow.ProcessId
+    $state.processStartedAt = [string]$stableWindow.ProcessStartedAt
+    $state.windowReady = $true
+    [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
 }
 Write-Output "已使用无自动化标记的原生 $($browser.DisplayName) 打开 $(@($items).Count) 个待处理站点。"

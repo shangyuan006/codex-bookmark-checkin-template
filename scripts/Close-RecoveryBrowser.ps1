@@ -20,3 +20,5 @@ while (@(Get-CheckinAutomationBrowserProcesses $config).Count -gt 0 -and (Get-Da
 if (@(Get-CheckinAutomationBrowserProcesses $config).Count -gt 0) {
     throw '登录恢复浏览器未能正常保存并退出，停止后续自动恢复。'
 }
+$pendingAccountScript = Join-Path $PSScriptRoot 'Invoke-PendingAccountVerification.ps1'
+if (Test-Path -LiteralPath $pendingAccountScript) { & $pendingAccountScript }

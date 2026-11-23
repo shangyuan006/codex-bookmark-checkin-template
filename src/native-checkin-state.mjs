@@ -8,6 +8,7 @@ import {readAfterNavigation} from './page-state-read.mjs';
 import {dailyReadinessEvidence} from './checkin-evidence.mjs';
 import {partitionSubmissions} from './submission-guard.mjs';
 import {getConfiguredPreCheckinNavigationRule, navigateConfiguredPreCheckinPage} from './pre-checkin-navigation.mjs';
+import {inspectConfiguredManualCheckinRoute} from './manual-checkin-route.mjs';
 
 const NATIVE_CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="turnstile" i], iframe[src*="challenge" i], .cf-turnstile, .h-captcha, .g-recaptcha, cap-widget, altcha-widget';
 
@@ -15,7 +16,7 @@ export async function resumeNativeDailyCycle(scope, current, expectedOrigin, con
   if (!current?.dailyReadiness || current.state?.status !== 'ready') return false;
   const pending = await scope.pending();
   if (!pending.length || partitionSubmissions(pending, {origin:expectedOrigin}, config).current.length) return false;
-  await scope.beginNewCycleAfterVerifiedReadiness(current.dailyReadiness);
+  await scope.prepareNewCycleAfterVerifiedReadiness(current.dailyReadiness);
   return true;
 }
 
@@ -24,7 +25,7 @@ export async function resumeNativeDailyCycle(scope, current, expectedOrigin, con
 // rule, its configured result page; never submit another check-in request.
 export async function waitForNativeReadOnlyCompletion(page, expectedOrigin, config = {}, {
   timeoutMs = 30_000, pollMs = 1000, readState = readNativeCheckinState, now = Date.now,
-  onObservation = () => {},
+  onObservation = () => {}, waitForCloudflareCompletion = false, delay = ms => page.waitForTimeout(ms),
 } = {}) {
   const startedAt = now(), deadline = startedAt + Math.max(0, Number(timeoutMs) || 0);
   const interval = Math.max(1, Number(pollMs) || 1000);
@@ -49,17 +50,18 @@ export async function waitForNativeReadOnlyCompletion(page, expectedOrigin, conf
   do {
     const current = await readState(page, expectedOrigin, config);
     polls++;
-    const waitingForChallenge = current.state.status === 'interactive_challenge'
+    const waitingForCloudflare = waitForCloudflareCompletion && current.cloudflareUnresolved === true;
+    const waitingForChallenge = waitingForCloudflare || (current.state.status === 'interactive_challenge'
       && current.state.failureCode === 'safeline_client_challenge'
-      && current.challengeLoading === true && current.challengeRequiresInteraction !== true;
+      && current.challengeLoading === true && current.challengeRequiresInteraction !== true);
     const blocked = terminal.has(current.state.status) && !waitingForChallenge;
     if (waitingForChallenge) challengeWaitPolls++;
     const completed = ['signed', 'already_signed'].includes(current.state.status);
     const outcome = completed ? 'completed' : current.dailyReadiness ? 'daily_readiness'
       : blocked ? 'blocked' : now() >= deadline ? 'timed_out' : waitingForChallenge ? 'challenge_loading' : 'waiting';
     observe(current, outcome);
-    if (blocked || current.dailyReadiness || now() >= deadline) return current;
-    if (!navigationChecked && current.state.status === 'ready' && current.siteBodyLoaded
+    if (blocked || (!waitForCloudflareCompletion && current.dailyReadiness) || now() >= deadline) return current;
+    if (!waitForCloudflareCompletion && !navigationChecked && current.state.status === 'ready' && current.siteBodyLoaded
       && current.pageLoaded === true && current.authenticated === true
       && navigationRule?.readOnlyFallbackToExpectedPath === true) {
       navigationChecked = true;
@@ -87,7 +89,7 @@ export async function waitForNativeReadOnlyCompletion(page, expectedOrigin, conf
         observe(current, 'waiting');
       }
     }
-    await page.waitForTimeout(Math.min(interval, Math.max(0, deadline - now())));
+    await delay(Math.min(interval, Math.max(0, deadline - now())));
   } while (true);
 }
 
@@ -100,9 +102,11 @@ export async function readNativeCheckinState(page,expectedOrigin,config={}, {
     const snapshot = await page.evaluate(readPageSnapshot, NATIVE_CHALLENGE_SELECTOR);
     const frames=await readFrames(page,expectedOrigin);
     const frameResolved=frames.length===1&&(frames[0].resolvedState||frames[0].responsePresent);
-    const evidence=[...snapshot.challengeEvidence.map(item=>frameResolved&&item.cloudflare?{...item,responsePresent:true}:item),...frames];
+    const evidence=[...snapshot.challengeEvidence.map(item=>frameResolved&&item.cloudflare?{...item,responsePresent:true}:item),
+      ...frames.map(item=>({...item,cloudflare:true}))];
     const unresolved=evidence.some(item=>item.visible&&!item.resolvedState&&!item.responsePresent);
     const resolved=evidence.some(item=>item.visible&&(item.resolvedState||item.responsePresent));
+    const cloudflareUnresolved=evidence.some(item=>item.cloudflare&&item.visible&&!item.resolvedState&&!item.responsePresent);
     let state=classifyPageText({url:page.url(),title:await page.title(),bodyText:snapshot.bodyText,
       hasPassword:snapshot.hasPassword,challengeSelectors:unresolved,resolvedChallengeSelectors:resolved&&!unresolved,
       confirmedCheckinControl:snapshot.controlTexts.some(matchesNativeCompletedControlText),
@@ -121,13 +125,16 @@ export async function readNativeCheckinState(page,expectedOrigin,config={}, {
         if (session?.status==='unknown') state={status:'unconfirmed',reason:'原生登录会话尚未取得权威确认'};
       }
     }
+    if (state.status === 'ready') {
+      state = await inspectConfiguredManualCheckinRoute(page, {origin:expectedOrigin}, config) ?? state;
+    }
     // Only explicit current-day negative text on a loaded authenticated page
     // can release an older cycle. A ready button or absent completion cannot.
     const dailyUnsigned = state.status==='ready' && snapshot.loaded===true && snapshot.authenticated===true
       && !unresolved && unsignedRule?.dailyUnsignedTextPattern
       && new RegExp(unsignedRule.dailyUnsignedTextPattern,'iu').test(snapshot.bodyText);
     const safeLineChallenge = state.failureCode === 'safeline_client_challenge';
-    return {state,siteBodyLoaded,pageLoaded:snapshot.loaded===true,authenticated:snapshot.authenticated===true,
+    return {state,siteBodyLoaded,pageLoaded:snapshot.loaded===true,authenticated:snapshot.authenticated===true,cloudflareUnresolved,
       challengeLoading: safeLineChallenge && snapshot.safeLinePrompt === true && snapshot.safeLineControlEnabled !== true,
       challengeRequiresInteraction: safeLineChallenge && snapshot.safeLineControlEnabled === true,
       attendanceEndpoint:/\/(?:attendance|check[-_]?in|showup)(?:\.php)?(?:[/?#]|$)/i.test(page.url()),

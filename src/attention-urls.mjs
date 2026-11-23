@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { readBookmarkPlan } from "./bookmarks.mjs";
 import { isTerminalResult } from "./result-contract.mjs";
 import { requiresBookmarkReview } from './site-migration.mjs';
+import { pendingManualVerificationOrigins } from './manual-verification-guard.mjs';
 
 export const ATTENTION_STATUSES = new Set([
   "error",
@@ -67,6 +68,14 @@ async function loadCurrentManualHandoffOrigins(rootDirectory, latest) {
   const expectedDate = runDate(latest?.runId);
   if (expectedDate && runDate(document.sourceRunId) !== expectedDate) return null;
   return document.targets.map((target) => target?.origin);
+}
+
+async function loadVerificationOwnedOrigins(rootDirectory, latest) {
+  const document = await fs.readFile(path.join(rootDirectory, 'tmp', 'manual-verification.json'), 'utf8')
+    .then(JSON.parse)
+    .catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  if (runDate(document?.sourceRunId) !== (runDate(latest?.runId) ?? localDateKey())) return [];
+  return pendingManualVerificationOrigins(document);
 }
 
 export function mergeAttentionEvidence(latest, runReports = []) {
@@ -178,6 +187,8 @@ export function buildAttentionHandoff({
           origin: target.origin,
           url: target.candidates[0],
           previousStatus: result.status,
+          ...(result.loginRecoveryRequired === true || result.failureCode === 'login_recovery_requires_manual'
+            ? { loginRecoveryRequired: true } : {}),
           ...(result.manualBrowserMode === 'native' ? {manualBrowserMode:'native'} : {}),
         };
       })
@@ -197,12 +208,17 @@ export function buildAttentionHandoff({
       const target = targetByOrigin.get(origin);
       const previous = resultByOrigin.get(origin);
       if (!target?.candidates?.length) return null;
-      if (excludedOriginSet.has(origin)) return null;
+      // Re-recording an explicit skip must be resumable after its marker was
+      // written but report/queue synchronization failed. This mode never opens
+      // a browser; ordinary manual requests still respect today's exclusion.
+      if (excludedOriginSet.has(origin) && !forAbandonment) return null;
       if (!canSelectExplicitly(previous)) return null;
       return {
         origin,
         url: target.candidates[0],
         previousStatus: previous?.status ?? "new_target",
+        ...(previous?.loginRecoveryRequired === true || previous?.failureCode === 'login_recovery_requires_manual'
+          ? { loginRecoveryRequired: true } : {}),
         ...(previous?.manualBrowserMode === 'native' ? {manualBrowserMode:'native'} : {}),
       };
     });
@@ -214,11 +230,7 @@ export function buildAttentionHandoff({
   } else if (Array.isArray(handoffOrigins)) {
     selectionMode = "handoff";
     const pendingByOrigin = new Map(pending.map((target) => [target.origin, target]));
-    const combinedOrigins = [
-      ...handoffOrigins.map(normalizeRequestedOrigin),
-      ...pending.map((target) => target.origin),
-    ];
-    targets = [...new Set(combinedOrigins)]
+    targets = [...new Set(handoffOrigins.map(normalizeRequestedOrigin))]
       .map((origin) => {
         if (pendingByOrigin.has(origin)) return pendingByOrigin.get(origin);
         const target = targetByOrigin.get(origin);
@@ -229,6 +241,8 @@ export function buildAttentionHandoff({
           origin,
           url: target.candidates[0],
           previousStatus: previous?.status ?? "new_target",
+          ...(previous?.loginRecoveryRequired === true || previous?.failureCode === 'login_recovery_requires_manual'
+            ? { loginRecoveryRequired: true } : {}),
           ...(previous?.manualBrowserMode === 'native' ? {manualBrowserMode:'native'} : {}),
         };
       })
@@ -301,7 +315,10 @@ export async function loadAttentionHandoff(rootDirectory, argv = []) {
     handoffOrigins,
     selection,
     forAbandonment,
-    excludedOrigins: await loadCurrentAbandonedOrigins(rootDirectory, attentionLatest),
+    excludedOrigins: [
+      ...await loadCurrentAbandonedOrigins(rootDirectory, attentionLatest),
+      ...(forAbandonment ? [] : await loadVerificationOwnedOrigins(rootDirectory, attentionLatest)),
+    ],
     bookmarkLastModifiedAt,
   });
 }

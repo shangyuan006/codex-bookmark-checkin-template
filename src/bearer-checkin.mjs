@@ -92,7 +92,7 @@ export function classifyBearerCheckinObservation(observed) {
   return { status: "unconfirmed", reason: "Bearer check-in could not be authoritatively verified" };
 }
 
-export async function runBearerCheckinInBrowser({ activeRule, sessionOnly = false }) {
+export async function runBearerCheckinInBrowser({ activeRule, sessionOnly = false, readOnly = false }) {
   const maxAccessTokenLength = 16 * 1024;
   const fetchJson = async (url, options = {}) => {
     const controller = new AbortController();
@@ -162,7 +162,7 @@ export async function runBearerCheckinInBrowser({ activeRule, sessionOnly = fals
   };
 
   const before = await readStatus();
-  if (before.state !== "ready") return before;
+  if (before.state !== "ready" || readOnly) return before;
 
   const submitted = await fetchJson(activeRule.checkinUrl, { method: "POST", headers });
   if (unauthorized(submitted)) return { state: "unauthorized" };

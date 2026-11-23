@@ -64,12 +64,13 @@ test('configured session verification must become valid and stay on the same pag
   assert.equal(rejected.loggedIn, false);
 });
 
-test('closing the OAuth window ends waiting, and a remaining provider control blocks success', async () => {
+test('closing the OAuth window ends waiting, and a provider control without authenticated evidence blocks success', async () => {
   const f = fixture(); f.close();
   assert.equal((await waitForOAuthTargetSession(f.context, origin, config, f.options)).elapsedMs, 0);
   const login = fixture(); login.setUrl(origin + '/console');
   assert.equal((await waitForOAuthTargetSession(login.context, origin, config, {
     ...login.options, hasProviderControl: async () => true,
+    readSurface: async () => ({ kind: 'target_content', ready: true, authenticatedControl: false }),
   })).loggedIn, false);
 });
 

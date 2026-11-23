@@ -36,7 +36,8 @@ export function applyPreferredCandidates(targets, state, config = {}) {
       if (!/^https?:$/.test(preferred.protocol) || !allowedOrigins.has(preferred.origin)) return target;
       // Navigation rules need the live bookmark entry point; a prior result URL
       // can be a login page or a check-in page that cannot be opened directly.
-      if (config.preCheckinNavigationRules?.[target.origin]
+      if ((config.preCheckinNavigationRules?.[target.origin] || config.sequentialActionRules?.[target.origin]
+        || config.samePageManualCheckinRules?.[target.origin])
         && !target.candidates.includes(preferred.href)) return target;
       return {
         ...target,

@@ -1,24 +1,8 @@
 [CmdletBinding()]
-param()
+param([string]$Root)
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
-$git = Get-Command git -ErrorAction SilentlyContinue
-
-if ($git -and (Test-Path -LiteralPath (Join-Path $root '.git'))) {
-    $relativeFiles = @(
-        & $git.Source -C $root ls-files
-        & $git.Source -C $root ls-files --others --exclude-standard
-    ) | Select-Object -Unique | Where-Object { $_ -ne 'logs/.gitkeep' }
-}
-else {
-    $relativeFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object {
-        $_.FullName.Substring($root.Length + 1).Replace('\', '/')
-    } | Where-Object {
-        $_ -notmatch '^(node_modules|data|logs|tmp|outputs|work|\.git)/' -and
-        $_ -notin @('config/config.json', 'config/config.local.json', 'config/qa-rules.local.json', 'setup/answers.json')
-    })
-}
+$root = if ($Root) { [System.IO.Path]::GetFullPath($Root) } else { Split-Path -Parent $PSScriptRoot }
 
 $patterns = [ordered]@{
     'Windows user path' = '(?i)[A-Z]:\\Users\\[^\\\s''"]+'
@@ -30,31 +14,24 @@ $patterns = [ordered]@{
     'Assigned secret' = '(?i)[''"]?(password|passwd|cookie|authorization|secret|api[_-]?key|access[_-]?token)[''"]?\s*[:=]\s*[''"][^{}$%<][^''"]{5,}[''"]'
 }
 
-$findings = @()
 $binaryExtensions = '^\.(png|jpg|jpeg|gif|webp|ico|bmp|tiff?|zip|gz|7z|rar|pdf|exe|dll|pdb|woff2?|ttf|otf)$'
-foreach ($relative in $relativeFiles) {
-    $fullPath = Join-Path $root $relative
-    if (-not (Test-Path -LiteralPath $fullPath)) { continue }
-    if ([System.IO.Path]::GetExtension($fullPath) -match $binaryExtensions) {
-        $findings += [pscustomobject]@{ file = $relative; line = 0; rule = 'Binary file in public scope' }
-        continue
+# Node uses NUL-delimited Git paths, rejects links, and redacts filenames that
+# contain private values. Binary file in public scope remains a blocking finding.
+try {
+    . (Join-Path $PSScriptRoot 'Resolve-Runtime.ps1')
+    $node = Resolve-CheckinNode $null
+    $policy = [ordered]@{
+        patterns = @($patterns.GetEnumerator() | ForEach-Object { @{ rule = $_.Key; pattern = $_.Value } })
+        binaryExtensions = $binaryExtensions
     }
-    $lineNumber = 0
-    $lines = try { @(Get-Content -LiteralPath $fullPath -ErrorAction Stop) } catch {
-        $findings += [pscustomobject]@{ file = $relative; line = 0; rule = 'Unreadable public file' }
-        @()
-    }
-    foreach ($line in $lines) {
-        $lineNumber += 1
-        foreach ($entry in $patterns.GetEnumerator()) {
-            if ($relative -eq 'scripts/Scan-PublicSafety.ps1' -and $entry.Key -eq 'Assigned secret') { continue }
-            if ($line -match $entry.Value) {
-                $findings += [pscustomobject]@{ file = $relative; line = $lineNumber; rule = $entry.Key }
-            }
-        }
-    }
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $output = @($policy | ConvertTo-Json -Depth 6 -Compress | & $node (Join-Path (Split-Path -Parent $PSScriptRoot) 'src/private-value-scan.mjs') '--root' $root '--patterns-stdin' 2>$null)
+    $scanExitCode = $LASTEXITCODE
+    $result = ($output -join [Environment]::NewLine) | ConvertFrom-Json
+    if ($null -eq $result.safe) { throw 'Invalid scan report' }
+    $result | ConvertTo-Json -Depth 6
+    exit $scanExitCode
+} catch {
+    @{ safe = $false; scannedFiles = 0; findings = @(@{ file = '[scanner]'; line = 0; rule = 'Public safety scan failed' }) } | ConvertTo-Json -Depth 6
+    exit 2
 }
-
-$result = [ordered]@{ safe = $findings.Count -eq 0; scannedFiles = $relativeFiles.Count; findings = $findings }
-$result | ConvertTo-Json -Depth 6
-if ($findings.Count -gt 0) { exit 1 }

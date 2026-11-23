@@ -12,7 +12,7 @@ import { powershellExecutable } from "./helpers/powershell.mjs";
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const dependencies = ["CheckinContract.generated", "Run-Checkin", "Resolve-Runtime", "RunLock", "ManualVerification", "ResultContract",
-  "ManualAbandonment", "NativeFallbackPolicy", "PreflightScope", "CheckinCycle", "TaskRetryPolicy", "TaskRuntimeBudget"];
+  "ManualAbandonment", "NativeFallbackPolicy", "PreflightScope", "CheckinCycle", "TaskRetryPolicy", "TaskRuntimeBudget", "CheckinExecutionReport"];
 
 test("第二个 wrapper 在命名互斥被占用时快速退出且不启动签到", async () => {
   const tmpRoot = path.join(root, "tmp");
@@ -50,12 +50,15 @@ test("第二个 wrapper 在命名互斥被占用时快速退出且不启动签�
       .finally(() => clearTimeout(startupTimer));
     assert.match(String(ready), /READY/);
     const started = Date.now();
-    const { stdout } = await execFileAsync(powershellExecutable, [
+    await assert.rejects(execFileAsync(powershellExecutable, [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
       "-File", path.join(fixture, "scripts", "Run-Checkin.ps1"), "-DryRun", "-SuppressReport",
-    ], { cwd: fixture, encoding: "utf8", windowsHide: true, timeout: 15_000 });
+    ], { cwd: fixture, encoding: "utf8", windowsHide: true, timeout: 15_000 }), error => {
+      assert.equal(error.code, 75);
+      assert.equal(error.stdout.trim(), '');
+      return true;
+    });
     assert.ok(Date.now() - started < 5000);
-    assert.equal(stdout.trim(), "");
     for (const marker of ["plan-invoked", "worker-invoked"]) {
       assert.equal(await fs.access(path.join(fixture, "tmp", marker)).then(() => true).catch(() => false), false);
     }

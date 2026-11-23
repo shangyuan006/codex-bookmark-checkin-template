@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 export async function continueNativeCheckinAfterLogin(target, config, loginOutcome, { runPreflight, readConfirmations }) {
   if (!loginOutcome?.succeeded || loginOutcome.authoritativeCheckinStatus) return null;
   const rule = (config.nativeChallengePreflight ?? []).find(entry => {
-    try { return new URL(entry.url).origin === target.origin && (entry.action || entry.newApiCheckin); }
+    try { return new URL(entry.url).origin === target.origin && (entry.action || entry.newApiCheckin || entry.calendarDayCheckin || entry.dailyFormCheckin || entry.samePageCheckin); }
     catch { return false; }
   });
   if (!rule) return null;
@@ -25,18 +25,25 @@ export async function continueNativeCheckinAfterLogin(target, config, loginOutco
       evidence: confirmation.evidence,
       cycle: confirmation.cycle,
       submissionAttempted: confirmation.submissionAttempted,
+      actionResults: confirmation.actionResults,
+      requiredActionTypes: confirmation.requiredActionTypes,
+      submissionTrackedPerAction: confirmation.submissionTrackedPerAction,
       nativePreflight: true,
       safeLineDiagnostics: confirmation.safeLineDiagnostics,
       readOnlyDiagnostics: confirmation.readOnlyDiagnostics,
+      formDiagnostics: confirmation.formDiagnostics,
+      calendarDiagnostics: confirmation.calendarDiagnostics,
       readOnlyRecheck: confirmation.readOnlyRecheck === true,
     };
   }
-  if (confirmation?.status === 'interactive_challenge'
-    && confirmation.failureCode === 'safeline_client_challenge'
+  if (['interactive_challenge','needs_attention'].includes(confirmation?.status)
+    && ['safeline_client_challenge','cloudflare_verification_unresolved','submission_quarantined',
+      'daily_form_readiness_unconfirmed','daily_form_completion_unconfirmed',
+      'same_page_verification_unresolved','same_page_login_required','same_page_completion_unconfirmed'].includes(confirmation.failureCode)
     && confirmation.retryable === false) {
     return {
       status: confirmation.status,
-      reason: '原生登录恢复后的签到遇到雷池验证，停止自动重试并转人工处理',
+      reason: confirmation.reason ?? '原生登录恢复后尚未取得签到完成证据，停止自动重试并转人工处理',
       failureCode: confirmation.failureCode,
       retryable: false,
       url: confirmation.url,
@@ -44,6 +51,16 @@ export async function continueNativeCheckinAfterLogin(target, config, loginOutco
       actionAttempted: confirmation.actionAttempted === true,
       actionOutcome: confirmation.actionOutcome,
       nativePreflight: true,
+      submissionAttempted: confirmation.submissionAttempted,
+      actionResults: confirmation.actionResults,
+      requiredActionTypes: confirmation.requiredActionTypes,
+      submissionTrackedPerAction: confirmation.submissionTrackedPerAction,
+      submissionObservation: confirmation.submissionObservation,
+      quarantine: confirmation.quarantine,
+      formDiagnostics: confirmation.formDiagnostics,
+      calendarDiagnostics: confirmation.calendarDiagnostics,
+      cloudflareDiagnostics: confirmation.cloudflareDiagnostics,
+      ...(confirmation.manualBrowserMode === 'native' ? { manualBrowserMode: 'native' } : {}),
       safeLineDiagnostics: confirmation.safeLineDiagnostics,
       readOnlyDiagnostics: confirmation.readOnlyDiagnostics,
       readOnlyRecheck: confirmation.readOnlyRecheck === true,

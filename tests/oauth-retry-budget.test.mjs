@@ -12,12 +12,27 @@ const callbackFailure = { status: 'needs_attention', succeeded: false, oauthStag
   providerAuthorizationChallengeClicks: 1, terminationReason: 'wait_timeout', timeoutPhase: 'callback',
   callbackWaitDiagnostics: { outcome: 'target_not_returned', polls: 361, elapsedMs: 90_000, budgetMs: 90_000 } };
 
-test('a departed LinuxDO authorization without a callback stops identical automatic attempts', async () => {
-  let calls = 0;
+test('SSO stalls persist across automatic helpers while retaining one native continuation', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oauth-sso-budget-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const binding = { file: path.join(dir, 'budget.json'), key: 'test', cycle: 'cycle', limit: 3 };
+  await updateOAuthRetryBudget(binding, 'automatic');
+  await updateOAuthRetryBudget(binding, 'automatic', { status: 'needs_attention', oauthStage: 'linuxdo_sso_stalled' });
+  assert.deepEqual(await inspectOAuthRetryBudget(binding), { automaticAllowed: false, nativeAllowed: true });
+  assert.equal((await updateOAuthRetryBudget(binding, 'automatic')).allowed, false);
+  assert.equal((await updateOAuthRetryBudget(binding, 'native')).allowed, true);
+  assert.equal((await updateOAuthRetryBudget(binding, 'native')).allowed, false);
+  assert.deepEqual(await inspectOAuthRetryBudget({ ...binding, cycle: 'new-logout' }), { automaticAllowed: true, nativeAllowed: true });
+});
+
+test('a departed LinuxDO authorization stops identical retries and permits one native recovery', async () => {
+  let calls = 0, nativeCalls = 0;
   const result = await runTargetFirstLinuxDoOAuthWithRetry({ provider: 'LinuxDO', linuxDoSessionStrategy: 'target_oauth' }, {},
-    { oauthAttempts: 3 }, { runHelper: async () => { calls++; return callbackFailure; } });
+    { oauthAttempts: 3 }, { runHelper: async () => { calls++; return callbackFailure; },
+      runNative: async () => { nativeCalls++; return { succeeded: false, oauthStage: 'helper_failed' }; } });
   assert.equal(calls, 1);
-  assert.equal(result, callbackFailure);
+  assert.equal(nativeCalls, 1);
+  assert.deepEqual(result, { ...callbackFailure, nativeRecoveryAttempted: true });
   const failure = reauthLoginFailureResult('LinuxDO', result.oauthStage, { diagnostics: result });
   assert.equal(failure.retryable, false);
   assert.equal(failure.timeoutPhase, 'callback');
@@ -49,13 +64,15 @@ test('callback stalls persist across helper invocations but leave one native con
   assert.doesNotMatch(await fs.readFile(binding.file, 'utf8'), /private-fixture|authorization_departed/);
 });
 
-test('an unresolved provider challenge stops automatic retries immediately and retains manual eligibility', async () => {
-  let calls = 0;
+test('an unresolved provider challenge allows one native recovery and then retains manual eligibility', async () => {
+  let calls = 0, nativeCalls = 0;
   const failure = { succeeded: false, oauthStage: 'provider_authorization', authorizationOutcome: 'provider_challenge_unresolved' };
   const result = await runTargetFirstLinuxDoOAuthWithRetry({ provider: 'LinuxDO', linuxDoSessionStrategy: 'target_oauth' }, {},
-    { oauthAttempts: 3 }, { runHelper: async () => { calls++; return failure; } });
+    { oauthAttempts: 3 }, { runHelper: async () => { calls++; return failure; },
+      runNative: async () => { nativeCalls++; return { succeeded: false, oauthStage: 'helper_failed' }; } });
   assert.equal(calls, 1);
-  assert.equal(result, failure);
+  assert.equal(nativeCalls, 1);
+  assert.deepEqual(result, { ...failure, nativeRecoveryAttempted: true });
   assert.equal(reauthLoginFailureResult('LinuxDO', result.oauthStage, { diagnostics: result }).retryable, false);
 });
 

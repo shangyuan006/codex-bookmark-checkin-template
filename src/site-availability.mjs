@@ -1,4 +1,13 @@
 // Return fixed, non-sensitive diagnostics; raw browser errors can contain URLs.
+export function classifyDocumentHttpStatus(status) {
+  if (!Number.isInteger(status) || status < 400 || status > 599) return null;
+  if (status === 401) return { status: 'login_required', failureCode: 'document_http_401',
+    documentStatus: status, reason: '页面返回 HTTP 401，需要恢复登录' };
+  return { status: 'deferred', retryCause: status === 429 ? 'rate_limit' : 'upstream_unavailable',
+    failureCode: status === 429 ? 'document_http_rate_limit' : status >= 500 ? 'document_http_server_error' : 'document_http_client_error',
+    documentStatus: status, reason: `页面返回 HTTP ${status}，本轮不重复探测，等待后续核验` };
+}
+
 export function classifyNavigationFailure(error) {
   const text = String(error?.message ?? error ?? '');
   if (/\b(?:ERR_CERT_[A-Z_]+|CERT_HAS_EXPIRED|CERT_NOT_YET_VALID|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|ERR_TLS_CERT_ALTNAME_INVALID)\b/.test(text)) {

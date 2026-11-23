@@ -8,6 +8,7 @@ import { completionEvidenceKind, normalizeBoundEvidenceResult } from './checkin-
 import { loadStatusHistory } from './status-history.mjs';
 import { readSubmissionJournal } from './submission-guard.mjs';
 import { isConfirmedNotAvailable } from './result-contract.mjs';
+import { resultDisplayReason } from './result-presentation.mjs';
 
 const states=new Set(CHECKIN_CONTRACT.statuses);
 const statusLabel=value=>CHECKIN_CONTRACT.statusLabels[value]??value;
@@ -48,7 +49,7 @@ export function statusPageModel(report={},handoff={},verification={},profiles=[]
     complete:report.isComplete===true&&report.runState==='final',
     rows:displayResults.map(result=>({
       host:host(result.origin),status:abandoned.has(result.origin)?'abandoned':states.has(result.status)?result.status:'unconfirmed',
-      reason:abandoned.has(result.origin)?'今日按用户要求跳过，不再重试':redactPrivateResultText(String(result.reason??'')).slice(0,240),
+      reason:abandoned.has(result.origin)?'今日按用户要求跳过，不再重试':redactPrivateResultText(resultDisplayReason(result)).slice(0,400),
       evidence:abandoned.has(result.origin)?'user_today_skip':code(result.evidence?.source??result.evidence?.sources?.[0]),
       evidenceKind:completionEvidenceKind(result,now),
       excluded:isConfirmedNotAvailable(result,now)||abandoned.has(result.origin)||result.status==='abandoned',

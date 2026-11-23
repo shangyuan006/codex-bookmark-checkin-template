@@ -28,6 +28,11 @@ test("manual entry launches one selected live session and the close command targ
     (await fs.readFile(path.join(repository, "scripts/Resolve-Runtime.ps1"), "utf8")) + String.raw`
 function Resolve-CheckinNode($Config) { return $Config.nodeExecutable }
 function Get-CheckinAutomationBrowserProcesses { return @() }
+function Get-CheckinProfileBrowserProcesses { return @([pscustomobject]@{ProcessId=2147483646}) }
+function Get-Process { param($Id,$ErrorAction)
+  if($Id -eq 2147483646) { return [pscustomobject]@{MainWindowHandle=1;Responding=$true} }
+  Microsoft.PowerShell.Management\Get-Process -Id $Id -ErrorAction $ErrorAction
+}
 `);
   await fs.writeFile(path.join(root, "scripts/Open-PlainLoginChrome.ps1"), "throw 'Unrelated native entry must not be launched'");
   await fs.writeFile(path.join(root, "config/config.json"), JSON.stringify({ nodeExecutable: process.execPath,

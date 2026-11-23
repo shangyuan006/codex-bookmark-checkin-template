@@ -36,6 +36,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: Run offline Edge check-in continuation regressions
+        env:
+          CHECKIN_BROWSER_FIXTURES: '1'
+        run: node --test tests/login-only-checkin.test.mjs
+      - run: npm run modules:check
+      - run: npm run integrity:check
       - name: Scan tracked files for private data
         shell: pwsh
         run: ./scripts/Scan-PublicSafety.ps1

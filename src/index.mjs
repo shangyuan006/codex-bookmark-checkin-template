@@ -54,6 +54,7 @@ import {
   localRunDate,
   isRetryEligible,
   recoveryEntriesForResults,
+  withRecoveryProgress,
   filterAutomaticRetryOrigins,
   isResumeRetryEligible,
   nextDeferredRetryAt,
@@ -62,6 +63,8 @@ import { checkinCycle, expireCycleResult } from './checkin-cycle.mjs';
 import { closeAutomationContext, automationCleanupAllowsRecovery } from "./automation-context-close.mjs";
 import { normalizeBoundEvidenceResult } from './checkin-evidence.mjs';
 import { recheckBeforeManualHandoff } from './pre-handoff-recheck.mjs';
+import { applyTodayAbandonment, readTodayAbandonment } from './manual-abandonment.mjs';
+import { captureRuntimeCode } from './runtime-integrity.mjs';
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.dirname(sourceDirectory);
@@ -84,6 +87,11 @@ const dryRun = process.argv.includes("--dry-run");
 const listPreflightTargets = process.argv.includes("--list-preflight-targets");
 const ignoreNativePreflight = process.argv.includes("--ignore-native-preflight");
 const automaticRetry = process.argv.includes("--automatic-retry");
+const executionAttemptIndex = process.argv.indexOf("--execution-attempt-id");
+const executionAttemptId = executionAttemptIndex >= 0 ? process.argv[executionAttemptIndex + 1] ?? "" : null;
+if (executionAttemptId !== null && !/^[a-f0-9]{32}-[1-9]\d?$/.test(executionAttemptId)) {
+  throw new Error("Invalid execution attempt ID");
+}
 const nativePreflightAttemptIndex = process.argv.indexOf("--native-preflight-attempt");
 const nativePreflightAttemptId = nativePreflightAttemptIndex >= 0 ? process.argv[nativePreflightAttemptIndex + 1] : null;
 const limitIndex = process.argv.indexOf("--limit");
@@ -219,6 +227,7 @@ try {
       resumeBase = JSON.parse(await fs.readFile(resolvedResume, "utf8"));
       if (!Array.isArray(resumeBase?.results)) throw new Error("续跑报告缺少站点结果");
       resumeBase.results = resumeBase.results.map(result => expireCycleResult(result, config, new Date(), resumeBase.finishedAt));
+      resumeBase = applyTodayAbandonment(resumeBase, await readTodayAbandonment(rootDirectory));
       if (!isCurrentLocalRunId(resumeBase.runId)) throw new Error("续跑报告不是今天生成的，拒绝复用旧签到结果");
       const resumeFingerprint = String(
         resumeBase.planFingerprint ?? resumeBase.bookmarkSummary?.planFingerprint ?? "",
@@ -244,7 +253,8 @@ try {
       selectedOrigins = filterAutomaticRetryOrigins(selectedOrigins, resumeBase.results);
     }
     await cleanupOldLogs(logsRoot, config.logRetentionDays);
-    const runLog = await createRunLog(logsRoot);
+    const runLog = await createRunLog(logsRoot, executionAttemptId);
+    const runtimeCode = await captureRuntimeCode(rootDirectory);
     const startedAt = new Date();
     const siteState = await loadSiteState(siteStatePath);
     const qaCache = await loadQaCache(qaCachePath);
@@ -268,8 +278,8 @@ try {
       selectedTargets.filter(target => !getConfiguredReauthRule(target, config)
         && !configuredNoCheckinResult(target, config)), nativeWafPreflight,
     );
-    const nativeCompletedResults = nativeResults.filter(result => ['signed', 'already_signed'].includes(result.status));
-    const nativeHandoffResults = nativeResults.filter(result => result.retryable === false);
+    const nativeCompletedResults = nativeResults.filter(result => isTerminalResult(result));
+    const nativeHandoffResults = nativeResults.filter(result => result.retryable === false && !isTerminalResult(result));
     results.push(...nativeCompletedResults);
     results.push(...nativeHandoffResults);
     const nativeOrigins = new Set(results.map(result => result.origin));
@@ -317,6 +327,8 @@ try {
       const completedSelectedResults = selectedCompletedProgressResults();
       await atomicWriteJson(path.join(runLog.directory, "progress.json"), sanitizeForPersistence({
         runId: runLog.runId,
+        ...(executionAttemptId ? { executionAttemptId } : {}),
+        runtimeCode,
         planFingerprint: planMetadata.planFingerprint,
         runState: "in_progress",
         isComplete: false,
@@ -614,6 +626,7 @@ try {
             recoveredResult = await runOneTarget(recoveryContext, target, false);
           }
           recoveredResult = applyLoginRecoveryHandoff(recoveredResult, loginOutcome);
+          recoveredResult = withRecoveryProgress(recoveredResult, initialResult, { loginRecovered: loginOutcome?.succeeded === true });
           const priorHistory = initialResult.recovery?.history ?? [];
           results[resultIndex] = {
             origin: target.origin,
@@ -661,13 +674,15 @@ try {
         ?? { origin: target.origin, title: target.title, folderNames: target.folderNames, status: "error", reason: "续跑未生成站点结果" })
       : results;
     const currentOrigins = new Set(results.map((result) => result.origin));
-    const finalResults = advanceAttemptedDeferredRetries(
+    const retriedResults = advanceAttemptedDeferredRetries(
       assembledResults.map((result) => normalizeBoundEvidenceResult(currentOrigins.has(result.origin) ? deferUnresolvedLogin(result, config, finishedAt) : result,config,finishedAt)),
       currentOrigins,
       resumeBase?.results,
       config,
       finishedAt,
     );
+    const finalResults = applyTodayAbandonment({ runId: runLog.runId, results: retriedResults },
+      await readTodayAbandonment(rootDirectory, finishedAt), finishedAt).results;
     const summary = summarizeResults(finalResults);
     const processedTotal = finalResults.length;
     const isComplete = processedTotal === plannedTotal;
@@ -677,6 +692,8 @@ try {
     const scopeComplete = selectedTotal > 0 && selectedProcessedTotal === selectedTotal;
     const output = {
       runId: runLog.runId,
+      ...(executionAttemptId ? { executionAttemptId } : {}),
+      runtimeCode,
       planFingerprint: planMetadata.planFingerprint,
       runState: "final",
       plannedTotal,

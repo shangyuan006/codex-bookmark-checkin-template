@@ -186,6 +186,20 @@ try {
 }
 
 $minimumTargets = [Math]::Max(1, [int]$config.minimumBookmarkTargetCount)
+$runtimeIntegrity = $null
+$runtimeIntegrityReadable = $false
+try {
+    $integrityScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\runtime-integrity.mjs'
+    $integrityOutput = @(& $node $integrityScript '--root' $root 2>$null)
+    $integrityExitCode = $LASTEXITCODE
+    if ($integrityOutput.Count -gt 0) {
+        $runtimeIntegrity = ($integrityOutput -join [Environment]::NewLine) | ConvertFrom-Json
+        $runtimeIntegrityReadable = $runtimeIntegrity.schemaVersion -eq 1 -and $null -ne $runtimeIntegrity.ok
+    }
+} catch {
+    $runtimeIntegrity = $null
+    $runtimeIntegrityReadable = $false
+}
 $latestPlannedTotal = if ($latest -and $null -ne $latest.plannedTotal) { [int]$latest.plannedTotal } else { 0 }
 $latestProcessedTotal = if ($latest -and $null -ne $latest.processedTotal) { [int]$latest.processedTotal } elseif ($latest) { @($latest.results).Count } else { 0 }
 $latestRunToday = $latest -and [string]$latest.runId -like "$(Get-Date -Format 'yyyyMMdd')-*"
@@ -442,6 +456,8 @@ $duplicateProfileGroups = @($allProfileEntries | Group-Object { $_.path.ToLowerI
 })
 $checks = [ordered]@{
     configPresent = $true
+    runtimeIntegrityReadable = [bool]$runtimeIntegrityReadable
+    runtimeIntegrityValid = [bool]$runtimeIntegrityReadable -and $integrityExitCode -eq 0 -and $runtimeIntegrity.ok -eq $true
     bookmarksReadable = Test-HealthBookmarkSources $config
     currentPlanReadable = [bool]$currentPlanReadable
     browserExecutablePresent = Test-HealthPath $browserExecutable
@@ -514,6 +530,8 @@ $healthy = $failedChecks.Count -eq 0
     schedulerNextEligibleAt = if ($schedulerState -and $schedulerState.nextEligibleAt) { try { ([datetime]$schedulerState.nextEligibleAt).ToString('o') } catch { [string]$schedulerState.nextEligibleAt } } else { $null }
     schedulerReportComplete = if ($schedulerState) { [bool]$schedulerState.reportComplete } else { $false }
     notificationQuarantinedCount = $notificationQuarantinedCount
+    runtimeIntegrity = $runtimeIntegrity
+    latestRunCodeStatus = if ($latest.runtimeCode.status -ne 'recorded' -or -not $latest.runtimeCode.codeFingerprint) { 'not_recorded' } elseif (-not $runtimeIntegrityReadable) { 'unknown' } elseif ($latest.runtimeCode.codeFingerprint -eq $runtimeIntegrity.codeFingerprint) { 'matching' } else { 'different' }
     checks = $checks
 } | ConvertTo-Json -Depth 6
 if (-not $healthy) { exit 2 }

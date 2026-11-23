@@ -2,7 +2,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
-    [string[]]$Origins
+    [string[]]$Origins,
+    [ValidateSet('user_requested', 'network_unavailable')]
+    [string]$Reason = 'user_requested',
+    [switch]$PreserveSession
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,10 +20,17 @@ $verificationPath = Join-Path $root 'tmp\manual-verification.json'
 $handoffPath = Join-Path $root 'tmp\manual-handoff.json'
 $abandonPath = Join-Path $root 'tmp\manual-abandon.json'
 
-if (Test-Path -LiteralPath $manualSessionPath) {
+$config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
+$mutexName = if ($config.runMutexName) { [string]$config.runMutexName } else { 'Local\CodexBookmarkCheckinRun' }
+$mutex = [System.Threading.Mutex]::new($false, $mutexName)
+$owned = $false
+try {
+try { $owned = $mutex.WaitOne(10000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+if (-not $owned) { throw '签到任务仍在操作当前会话，请稍后记录今日放弃。' }
+if ((Test-Path -LiteralPath $manualSessionPath) -and -not $PreserveSession) {
     throw '普通人工窗口仍在跟踪中；请使用 Close-ManualLogin.ps1 -Abandon 正常关闭并记录。'
 }
-if (Test-Path -LiteralPath $agentRouterSessionPath) {
+if ((Test-Path -LiteralPath $agentRouterSessionPath) -and -not $PreserveSession) {
     throw 'Agent Router 人工窗口仍在跟踪中；请先完成或关闭该专用会话。'
 }
 $requested = @{}
@@ -30,6 +40,55 @@ foreach ($rawOrigin in @($Origins)) {
     $requested[$origin] = $true
 }
 if ($requested.Count -eq 0) { throw '至少需要一个今日放弃 origin。' }
+
+if ($PreserveSession) {
+    if (-not (Test-Path -LiteralPath $manualSessionPath)) { throw '保留窗口模式需要当前受控会话。' }
+    $session = Get-Content -Raw -Encoding UTF8 -LiteralPath $manualSessionPath | ConvertFrom-Json
+    $todayPrefix = (Get-Date).ToString('yyyyMMdd') + '-'
+    $profileMatches = [string]::Equals([IO.Path]::GetFullPath([string]$session.profile),
+        [IO.Path]::GetFullPath([string]$config.automationUserDataDir), [StringComparison]::OrdinalIgnoreCase)
+    if ([int]$session.schemaVersion -lt 2 -or $session.mode -ne 'native' -or $session.controlledCheckin -ne $true -or $session.windowReady -ne $true `
+        -or -not $profileMatches -or [string]$session.sourceRunId -notlike "$todayPrefix*" `
+        -or [string]$session.launchMarker -notmatch '^[a-f0-9]{32}$' `
+        -or [int]$session.pid -le 0 -or $null -eq (ConvertTo-CheckinUtcDateTime $session.processStartedAt) `
+        -or [int]$session.nativeDebugPort -lt 1024 -or [int]$session.nativeDebugPort -gt 65535 `
+        -or @($session.targets).Count -ne [int]$session.targetCount -or [int]$session.targetCount -lt 1) {
+        throw '保留窗口模式只接受今天的有效受控项目会话。'
+    }
+    foreach ($origin in @($requested.Keys)) {
+        if (@($session.targets | Where-Object { (ConvertTo-ManualAbandonmentOrigin $_.origin) -eq $origin }).Count -ne 1) {
+            throw '放弃目标不在当前受控会话中，保留其余页面。'
+        }
+    }
+    $owners = @(Get-CheckinManualSessionBrowserProcesses -Config $config -State $session -ProfilePath $session.profile)
+    if ($owners.Count -ne 1 -or [int]$owners[0].ProcessId -ne [int]$session.pid) {
+        throw '无法确认受控会话身份，拒绝记录部分放弃。'
+    }
+    if (Test-Path -LiteralPath $agentRouterSessionPath) {
+        # Record only selected ordinary targets while the independent account
+        # window remains open. Neither browser profile is closed or modified.
+        $dedicated = Get-Content -Raw -Encoding UTF8 -LiteralPath $agentRouterSessionPath | ConvertFrom-Json
+        . (Join-Path $PSScriptRoot 'AgentRouterAccount.ps1')
+        $accountKey = ConvertTo-AgentRouterAccountKey $dedicated.accountKey
+        $accounts = @($config.agentrouterAccounts | Where-Object {
+            $configuredKey = [string]$_.accountKey
+            if (-not $configuredKey) { $configuredKey = [string]$_.accountId }
+            if (-not $configuredKey) { $configuredKey = [string]$_.id }
+            (ConvertTo-AgentRouterAccountKey $configuredKey) -ceq $accountKey
+        })
+        $dedicatedOrigin = if ($accounts.Count -eq 1) { ConvertTo-ManualAbandonmentOrigin $accounts[0].origin } else { $null }
+        $dedicatedProfile = if ($accounts.Count -eq 1 -and $accounts[0].automationUserDataDir) {
+            $profileValue = [string]$accounts[0].automationUserDataDir
+            [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($profileValue)) { $profileValue } else { Join-Path $root $profileValue }))
+        } else { $null }
+        if (-not $dedicatedOrigin -or -not $dedicatedProfile -or -not $dedicated.profile `
+            -or -not [string]::Equals($dedicatedProfile, [IO.Path]::GetFullPath([string]$dedicated.profile), [StringComparison]::OrdinalIgnoreCase) `
+            -or [string]::Equals($dedicatedProfile, [IO.Path]::GetFullPath([string]$session.profile), [StringComparison]::OrdinalIgnoreCase) `
+            -or $requested.ContainsKey($dedicatedOrigin)) {
+            throw '专用账号会话不独立或目标重叠，保留窗口且不记录放弃。'
+        }
+    }
+}
 
 $pendingVerification = $null
 if (Test-Path -LiteralPath $verificationPath) {
@@ -64,7 +123,6 @@ if ($null -ne $pendingVerification) {
     }
 }
 
-$config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'config\config.json') | ConvertFrom-Json
 $node = Resolve-CheckinNode $config
 $attentionArguments = @((Join-Path $root 'src\attention-urls.mjs'), '--for-abandonment')
 foreach ($origin in @($requested.Keys | Sort-Object)) {
@@ -88,7 +146,8 @@ foreach ($target in $targets) {
     }
 }
 
-$document = Write-TodayManualAbandonment -Path $abandonPath -Targets $targets
+$document = Write-TodayManualAbandonment -Path $abandonPath -Targets $targets -Reason $Reason
+Sync-TodayAbandonmentReport -Root $root -Node $node
 if ($null -ne $pendingVerification) {
     $remainingTargets = @($pendingVerification.Document.targets | Where-Object {
         $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
@@ -122,7 +181,7 @@ if ($null -ne $pendingVerification) {
 }
 if (Test-Path -LiteralPath $handoffPath) {
     $handoff = try { Get-Content -Raw -Encoding UTF8 -LiteralPath $handoffPath | ConvertFrom-Json } catch { $null }
-    if ($handoff -and [string]$handoff.sourceRunId -eq [string]$selection.sourceRunId) {
+    if ($handoff -and (Test-ManualVerificationCurrentDayDocument $handoff (Get-Date))) {
         $remaining = @($handoff.targets | Where-Object {
             $origin = ConvertTo-ManualAbandonmentOrigin $_.origin
             -not $origin -or -not $requested.ContainsKey($origin)
@@ -151,4 +210,10 @@ if (Test-Path -LiteralPath $handoffPath) {
     date = [string]$document.date
     addedCount = $targets.Count
     totalAbandonedCount = @($document.origins).Count
+    reason = $Reason
 } | ConvertTo-Json
+}
+finally {
+    if ($owned) { [void]$mutex.ReleaseMutex() }
+    $mutex.Dispose()
+}

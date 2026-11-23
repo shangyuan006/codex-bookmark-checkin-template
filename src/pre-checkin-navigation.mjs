@@ -1,6 +1,7 @@
 import { classifyPageText, normalizeText } from "./detector.mjs";
 import { assertBookmarkNavigation } from "./security.mjs";
-import { dailyReadinessEvidence } from "./checkin-evidence.mjs";
+import { dailyReadinessEvidence, successEvidence } from "./checkin-evidence.mjs";
+import { readCloudflareFrameEvidence } from "./challenge-frame-state.mjs";
 
 const PRE_CHECKIN_NAVIGATION_ROLES = new Set(["button", "link", "menuitem"]);
 
@@ -16,6 +17,18 @@ function dailyUnsignedFormRule(raw) {
   };
   const actionText = normalizeText(raw.actionText ?? "");
   if (!actionText || actionText.length > 80) throw new Error("daily unsigned form requires an exact action text");
+  const actionTexts = raw.actionTexts ?? [actionText];
+  if (!Array.isArray(actionTexts) || !actionTexts.length || actionTexts.length > 4
+    || actionTexts.some(text => typeof text !== 'string' || !text.trim() || text.length > 80)) {
+    throw new Error('daily unsigned form requires bounded exact action texts');
+  }
+  if (raw.pendingChallenge != null && raw.pendingChallenge !== "turnstile") {
+    throw new Error("daily unsigned form pending challenge must be turnstile");
+  }
+  if (raw.continuationWaitMs != null && (!Number.isInteger(raw.continuationWaitMs)
+    || raw.continuationWaitMs < 0 || raw.continuationWaitMs > 60000)) {
+    throw new Error('daily unsigned form continuation wait must be between 0 and 60000 milliseconds');
+  }
   let pendingAction;
   if (raw.pendingAction != null) {
     const selector = String(raw.pendingAction.selector ?? "").trim();
@@ -25,8 +38,24 @@ function dailyUnsignedFormRule(raw) {
     }
     pendingAction = { selector, text, disabled: true };
   }
+  let verifiedAction;
+  if (raw.verifiedAction != null) {
+    const selector = String(raw.verifiedAction.selector ?? '').trim();
+    const text = normalizeText(raw.verifiedAction.text ?? '');
+    const label = value => raw.ignoreActionDecorations === true
+      ? value.replace(/[\p{P}\p{S}\s]/gu, '') : value;
+    if (raw.pendingChallenge !== 'turnstile' || !selector || selector.length > 300
+      || !text || text.length > 80 || !actionTexts.some(value => label(normalizeText(value)) === label(text))) {
+      throw new Error('daily unsigned verified action requires an exact configured Turnstile submit control');
+    }
+    verifiedAction = { selector, text };
+  }
   return { visibleSelectors: selectors("visibleSelectors"), nonEmptyValueSelectors: selectors("nonEmptyValueSelectors"),
-    emptyValueSelectors: selectors("emptyValueSelectors"), actionText, ...(pendingAction ? { pendingAction } : {}) };
+    emptyValueSelectors: selectors("emptyValueSelectors"), actionText, actionTexts: [...new Set([actionText, ...actionTexts])],
+    ignoreActionDecorations: raw.ignoreActionDecorations === true, ...(pendingAction ? { pendingAction } : {}),
+    ...(verifiedAction ? { verifiedAction } : {}),
+    ...(raw.continuationWaitMs > 0 ? { continuationWaitMs: raw.continuationWaitMs } : {}),
+    ...(raw.pendingChallenge ? { pendingChallenge: raw.pendingChallenge } : {}) };
 }
 
 export function getConfiguredPreCheckinNavigationRule(target, activeOrigin, config) {
@@ -80,10 +109,19 @@ export function getConfiguredPreCheckinNavigationRule(target, activeOrigin, conf
       ...(allowHidden ? { allowHidden: true } : {}),
     };
   });
+  let completedTextPattern;
+  if (raw.completedTextPattern != null) {
+    if (typeof raw.completedTextPattern !== "string" || !raw.completedTextPattern.trim()
+      || raw.completedTextPattern.length > 300 || new RegExp(raw.completedTextPattern, "iu").test("")) {
+      throw new Error("pre-check-in completion pattern must be bounded and non-empty");
+    }
+    completedTextPattern = raw.completedTextPattern;
+  }
 
   return {
     expectedPath,
     steps,
+    ...(completedTextPattern ? { completedTextPattern } : {}),
     ...(raw.dailyUnsignedForm ? { dailyUnsignedForm: dailyUnsignedFormRule(raw.dailyUnsignedForm) } : {}),
     ...(raw.readOnlyFallbackToExpectedPath === true ? { readOnlyFallbackToExpectedPath: true } : {}),
     ...(normalizedTerminalPaths.length > 0 ? { terminalPaths: normalizedTerminalPaths } : {}),
@@ -101,12 +139,8 @@ export function getConfiguredPreCheckinNavigationRule(target, activeOrigin, conf
 // Negative daily evidence must come from the current authenticated form reached
 // through the site's visible navigation. A button or missing success text alone
 // must never release an older uncertain submission.
-export async function inspectConfiguredDailyUnsignedForm(page, target, activeOrigin, config) {
-  const rule = getConfiguredPreCheckinNavigationRule(target, activeOrigin, config);
-  if (!rule?.dailyUnsignedForm) return null;
-  const url = assertBookmarkNavigation(page.url(), target.allowedOrigins ?? [target.origin]);
-  if (new URL(url).origin !== activeOrigin || new URL(url).pathname !== rule.expectedPath) return null;
-  const snapshot = await page.evaluate(form => {
+async function readConfiguredDailyFormSnapshot(page, form) {
+  return page.evaluate(form => {
     const visible = element => {
       if (!element) return false;
       const box = element.getBoundingClientRect(), style = getComputedStyle(element);
@@ -119,31 +153,136 @@ export async function inspectConfiguredDailyUnsignedForm(page, target, activeOri
         && (String(element.value).trim().length > 0) === nonEmpty;
     };
     const pending = form.pendingAction ? unique(form.pendingAction.selector) : null;
+    const response = unique('input[name="cf-turnstile-response"]');
+    const label = value => form.ignoreActionDecorations ? String(value).replace(/[\p{P}\p{S}\s]/gu, '')
+      : String(value).replace(/\s+/g, ' ').trim();
+    const controls = [...document.querySelectorAll('button,input[type="submit"]')];
+    const action = controls.filter(element => visible(element)
+      && form.actionTexts.some(text => label(element.innerText || element.value || '') === label(text)));
+    const pendingActionReady = !!pending && visible(pending) && ["BUTTON", "INPUT"].includes(pending.tagName)
+      && (pending.disabled === true || pending.getAttribute("aria-disabled") === "true")
+      && label(pending.innerText || pending.value || '') === label(form.pendingAction.text);
+    const responseForm = response?.closest('form');
+    const boundControl = action.length === 1 ? action[0] : pendingActionReady ? pending : null;
+    const sameOriginForm = responseForm && (() => {
+      try { const override = boundControl?.getAttribute('formaction');
+        const destination = new URL(override ?? responseForm.action ?? location.href, location.href);
+        return destination.origin === location.origin && !destination.username && !destination.password;
+      } catch { return false; }
+    })();
+    const boundResponse = !!sameOriginForm && responseForm === boundControl?.closest('form')
+      && [...form.nonEmptyValueSelectors, ...form.emptyValueSelectors].every(selector => unique(selector)?.closest('form') === responseForm);
+    const challengeSelectors = [...document.querySelectorAll('#sl-check,.cf-turnstile,iframe[src*="captcha" i],iframe[src*="challenge" i],iframe[src*="turnstile" i],.h-captcha,.g-recaptcha,altcha-widget')].some(visible);
+    const verified = form.verifiedAction ? unique(form.verifiedAction.selector) : null;
+    // Some sites consume the widget response before enabling their server-issued
+    // submit form. This fallback requires an explicit local label, the same
+    // bound form and no remaining visible challenge; a ready button alone is
+    // never sufficient.
+    const verifiedActionReady = !!verified && verified === boundControl && visible(verified)
+      && ['BUTTON', 'INPUT'].includes(verified.tagName) && !verified.disabled
+      && verified.getAttribute('aria-disabled') !== 'true'
+      && label(verified.innerText || verified.value || '') === label(form.verifiedAction.text)
+      && boundResponse && !challengeSelectors;
+    const verifiedTurnstile = form.pendingChallenge === 'turnstile' && boundResponse
+      && (String(response.value ?? '').trim() !== '' || verifiedActionReady) && action.length === 1
+      && !action[0].disabled && action[0].getAttribute('aria-disabled') !== 'true';
     return {
       bodyText: String(document.body?.innerText ?? ""),
       loaded: document.readyState === "complete",
       authenticated: [...document.querySelectorAll("a")].some(a => visible(a) && /log[-_]?out|exit\.php/i.test(a.getAttribute("href") ?? "")),
       hasPassword: [...document.querySelectorAll('input[type="password"]')].some(visible),
-      challengeSelectors: [...document.querySelectorAll('.cf-turnstile,iframe[src*="challenge" i],iframe[src*="turnstile" i],.h-captcha,.g-recaptcha,altcha-widget')].some(visible),
+      challengeSelectors,
+      pendingTurnstile: form.pendingChallenge === "turnstile" && !!response
+        && String(response.value ?? "").trim() === "" && boundResponse,
+      verifiedTurnstile,
+      actionIndex: action.length === 1 ? controls.indexOf(action[0]) : -1,
+      otherChallengeSelectors: [...document.querySelectorAll('#sl-check,.h-captcha,.g-recaptcha,altcha-widget,iframe[src*="captcha" i]:not([src*="challenges.cloudflare.com" i])')].some(visible),
       formReady: form.visibleSelectors.every(selector => visible(unique(selector)))
         && form.nonEmptyValueSelectors.every(selector => valueMatches(selector, true))
-        && form.emptyValueSelectors.every(selector => valueMatches(selector, false)),
-      pendingActionReady: !!pending && visible(pending) && ["BUTTON", "INPUT"].includes(pending.tagName)
-        && (pending.disabled === true || pending.getAttribute("aria-disabled") === "true")
-        && String(pending.innerText || pending.value || "").replace(/\s+/g, " ").trim() === form.pendingAction.text,
+        && form.emptyValueSelectors.every(selector => valueMatches(selector, false)
+          || verifiedTurnstile && unique(selector) === response),
+      pendingActionReady,
     };
-  }, rule.dailyUnsignedForm);
-  // The configured slider belongs to the unsigned form. Its instructional text
-  // is not a separate blocking challenge; actual external widgets still block.
-  const state = classifyPageText({ url, ...snapshot, resolvedChallengeSelectors: true });
-  if (!snapshot.loaded || !snapshot.authenticated || snapshot.hasPassword || snapshot.challengeSelectors || !snapshot.formReady
+  }, form);
+}
+
+export async function inspectConfiguredDailyUnsignedForm(page, target, activeOrigin, config) {
+  const rule = getConfiguredPreCheckinNavigationRule(target, activeOrigin, config);
+  if (!rule?.dailyUnsignedForm) return null;
+  const url = assertBookmarkNavigation(page.url(), target.allowedOrigins ?? [target.origin]);
+  if (new URL(url).origin !== activeOrigin || new URL(url).pathname !== rule.expectedPath) return null;
+  const snapshot = await readConfiguredDailyFormSnapshot(page, rule.dailyUnsignedForm);
+  // This proves only that today's server-issued form is unsigned. Verification
+  // stays pending and the ordinary challenge phase must finish before submit.
+  const frames = rule.dailyUnsignedForm.pendingChallenge === "turnstile" && (snapshot.pendingTurnstile || snapshot.verifiedTurnstile)
+    ? await readCloudflareFrameEvidence(page, activeOrigin) : [];
+  const pendingTurnstile = snapshot.pendingTurnstile === true && !snapshot.otherChallengeSelectors
+    && frames.length === 1 && !frames[0].responsePresent && !frames[0].resolvedState;
+  const verifiedTurnstile = snapshot.verifiedTurnstile === true && !snapshot.otherChallengeSelectors
+    && frames.length <= 1 && frames.every(frame => frame.responsePresent || frame.resolvedState);
+  const challengeAllowed = pendingTurnstile || verifiedTurnstile;
+  // Configured form instructions are not a separate blocking challenge. Only
+  // the explicitly bound pending widget may prove unsigned readiness.
+  const state = classifyPageText({ url, ...snapshot, challengeSelectors: snapshot.challengeSelectors && !challengeAllowed,
+    resolvedChallengeSelectors: true });
+  if (!snapshot.loaded || !snapshot.authenticated || snapshot.hasPassword || (snapshot.challengeSelectors && !challengeAllowed) || !snapshot.formReady
+    || (rule.dailyUnsignedForm.pendingChallenge === 'turnstile' && !challengeAllowed)
     || state.status !== "ready") return null;
-  if (!snapshot.pendingActionReady) {
+  if (!snapshot.pendingActionReady && !verifiedTurnstile) {
     const action = page.getByText(rule.dailyUnsignedForm.actionText, { exact: true });
     if (await action.count() !== 1 || !await action.isVisible() || !await action.isEnabled()) return null;
   }
   if (page.url() !== url) return null;
   return dailyReadinessEvidence(target, config, { observedOrigin: activeOrigin });
+}
+
+export async function findConfiguredVerifiedFormAction(page, target, activeOrigin, config) {
+  const rule = getConfiguredPreCheckinNavigationRule(target, activeOrigin, config);
+  if (rule?.dailyUnsignedForm?.pendingChallenge !== 'turnstile'
+    || new URL(page.url()).pathname !== rule.expectedPath) return null;
+  if (!await inspectConfiguredDailyUnsignedForm(page, target, activeOrigin, config)) return null;
+  const snapshot = await readConfiguredDailyFormSnapshot(page, rule.dailyUnsignedForm);
+  if (!snapshot.verifiedTurnstile || snapshot.actionIndex < 0) return null;
+  const action = page.locator('button,input[type="submit"]').nth(snapshot.actionIndex);
+  return await action.isVisible() && await action.isEnabled() ? action : null;
+}
+
+export async function inspectConfiguredFormCompletion(page, config = {}) {
+  if (!Object.values(config.preCheckinNavigationRules ?? {}).some(rule => rule?.completedTextPattern)) return null;
+  let url;
+  try { url = new URL(page.url()); } catch { return null; }
+  const target = { origin: url.origin, allowedOrigins: [url.origin] };
+  const rule = getConfiguredPreCheckinNavigationRule(target, url.origin, config);
+  if (!rule?.completedTextPattern || url.pathname !== rule.expectedPath) return null;
+  const snapshot = await page.evaluate(({ pattern, actionTexts, ignoreActionDecorations }) => {
+    const visible = element => {
+      const box = element.getBoundingClientRect(), style = getComputedStyle(element);
+      return box.width > 0 && box.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const bodyText = String(document.body?.innerText ?? '');
+    return {
+      bodyText, loaded: document.readyState === 'complete',
+      matched: new RegExp(pattern, 'iu').test(bodyText),
+      authenticated: [...document.querySelectorAll('a')].some(a => visible(a) && /log[-_]?out|exit\.php/i.test(a.getAttribute('href') ?? '')),
+      hasPassword: [...document.querySelectorAll('input[type="password"]')].some(visible),
+      challengeSelectors: [...document.querySelectorAll('#sl-check,.cf-turnstile,iframe[src*="captcha" i],iframe[src*="challenge" i],iframe[src*="turnstile" i],.h-captcha,.g-recaptcha,altcha-widget')].some(visible),
+      actionVisible: [...document.querySelectorAll('button,input[type="submit"]')].some(element => visible(element)
+        && actionTexts.some(text => {
+          const label = value => ignoreActionDecorations ? String(value).replace(/[\p{P}\p{S}\s]/gu, '') : String(value).replace(/\s+/g, ' ').trim();
+          return label(element.innerText || element.value || '') === label(text);
+        })),
+    };
+  }, { pattern: rule.completedTextPattern, actionTexts: rule.dailyUnsignedForm?.actionTexts ?? [],
+    ignoreActionDecorations: rule.dailyUnsignedForm?.ignoreActionDecorations === true });
+  const state = classifyPageText({ url: url.href, ...snapshot });
+  if (!snapshot.loaded || !snapshot.authenticated || !snapshot.matched || snapshot.hasPassword
+    || snapshot.challengeSelectors || snapshot.actionVisible || page.url() !== url.href
+    || !['ready', 'signed', 'already_signed'].includes(state.status)
+    || state.reason === '页面明确显示尚未签到') return null;
+  const frames = await readCloudflareFrameEvidence(page, url.origin);
+  if (frames.some(frame => !frame.responsePresent && !frame.resolvedState) || page.url() !== url.href) return null;
+  return { status: 'signed', reason: '配置的签到结果页明确确认完成',
+    evidence: successEvidence('page_text', 'configured_form_completion') };
 }
 
 export function getConfiguredPreCheckinTerminalPath(pageUrl, target, activeOrigin, config) {
@@ -171,11 +310,13 @@ export async function verifyMissingNavigationControl(page, target, activeOrigin,
   const allowedOrigins = target.allowedOrigins ?? [target.origin];
   let previousUrl = null;
   for (let observation = 0; observation < 2; observation += 1) {
+    if (/^(?:chrome|edge)-error:\/\//.test(page.url())) return { terminalUnconfirmed: { status: 'needs_attention',
+      failureCode: 'terminal_browser_error', reason: '浏览器错误页不能证明首页签到入口已消失' } };
     const url = assertBookmarkNavigation(page.url(), allowedOrigins);
     if (!rule.terminalMissingControlPaths.includes(new URL(url).pathname)) {
       return { terminalUnconfirmed: { status: "unconfirmed", reason: "签到入口消失，但当前页面不是配置的首页", failureCode: "terminal_home_unconfirmed" } };
     }
-    const snapshot = await page.evaluate(() => {
+    const snapshot = await page.evaluate(({ origin, expectedPath }) => {
       const visible = (element) => {
         const box = element.getBoundingClientRect();
         const style = getComputedStyle(element);
@@ -185,19 +326,32 @@ export async function verifyMissingNavigationControl(page, target, activeOrigin,
       const controls = [...document.querySelectorAll('a,button,input[type="submit"],[role="button"]')].filter(visible);
       return {
         bodyText,
+        errorDocument: !!document.querySelector('#main-frame-error') && /\bERR_BLOCKED_BY_CLIENT\b/.test(bodyText),
         loaded: document.readyState === "complete" && bodyText.trim().length > 100,
         authenticated: controls.some((element) => /log[-_]?out|exit\.php/i.test(element.getAttribute("href") ?? "")
           || /^(?:退出|登出|注销|退出登录|Log out|Logout)$/i.test(String(element.innerText ?? "").trim())),
+        expectedNavigationPresent: controls.some(element => {
+          if (element.tagName !== 'A' || !element.getAttribute('href')) return false;
+          try {
+            const destination = new URL(element.getAttribute('href'), location.href);
+            return destination.origin === origin && destination.pathname === expectedPath;
+          } catch { return false; }
+        }),
         hasPassword: [...document.querySelectorAll('input[type="password"]')].some(visible),
         challengeSelectors: [...document.querySelectorAll('#sl-check,iframe[src*="captcha" i],iframe[src*="challenge" i],iframe[src*="turnstile" i],.cf-turnstile,.h-captcha,.g-recaptcha,altcha-widget')].some(visible),
       };
-    });
+    }, { origin: activeOrigin, expectedPath: rule.expectedPath });
+    if (snapshot.errorDocument) return { terminalUnconfirmed: { status: 'needs_attention',
+      failureCode: 'daily_form_browser_request_blocked', reason: '客户端拦截错误页不能证明首页签到入口已消失' } };
     const state = classifyPageText({ url, ...snapshot });
     if (["login_required", "interactive_challenge", "managed_challenge", "deferred"].includes(state.status)) {
       return { terminalUnconfirmed: state };
     }
     if (!snapshot.loaded || !snapshot.authenticated || snapshot.hasPassword) {
       return { terminalUnconfirmed: { status: "unconfirmed", reason: "签到入口消失，但首页加载或有效登录尚未确认", failureCode: "terminal_session_unconfirmed" } };
+    }
+    if (snapshot.expectedNavigationPresent) {
+      return { terminalUnconfirmed: { status: "unconfirmed", reason: "首页仍有通往签到页的可见链接，不能按旧入口消失确认完成", failureCode: "terminal_navigation_changed" } };
     }
     const locator = navigationLocator(page, rule.steps[stepIndex]);
     const count = await locator.count();
