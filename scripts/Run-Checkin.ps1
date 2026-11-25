@@ -364,28 +364,7 @@ try {
         if ($null -ne $pendingManualVerification `
             -and $null -ne $resumeCandidate `
             -and [string]$pendingManualVerification.Document.sourceRunId -like "$todayPrefix*") {
-            if ($requestedOrigins.Count -eq 0) {
-                $manualVerification = $pendingManualVerification
-            }
-            else {
-                $pendingOriginSet = @{}
-                foreach ($origin in @($pendingManualVerification.Origins)) {
-                    $pendingOriginSet[[string]$origin] = $true
-                }
-                $requestedOriginsArePending = $true
-                foreach ($origin in @($requestedOrigins)) {
-                    if (-not $pendingOriginSet.ContainsKey([string]$origin)) {
-                        $requestedOriginsArePending = $false
-                        break
-                    }
-                }
-                if ($requestedOriginsArePending) {
-                    $manualVerification = [pscustomobject]@{
-                        Document = $pendingManualVerification.Document
-                        Origins = @($requestedOrigins)
-                    }
-                }
-            }
+            $manualVerification = Select-ManualVerificationScope $pendingManualVerification @($requestedOrigins)
         }
         elseif ($null -ne $pendingManualVerification) {
             Write-Warning '手动复核记录不是今天的有效运行，未强制续跑；请重新打开待处理站点。'
@@ -433,6 +412,10 @@ try {
     }
     else {
         for ($attempt = 1; $attempt -le $runAttempts; $attempt++) {
+            if ($attempt -gt 1 -and $null -ne $manualVerification) {
+                $verificationRetryScope = if ($requestedOrigins.Count -gt 0) { @($requestedOrigins) } else { @($manualVerification.Origins) }
+                $manualVerification = Select-ManualVerificationScope (Get-PendingManualVerification -Path $manualVerificationPath) @($verificationRetryScope)
+            }
             $manualAttemptUpdate = $null
             $needsNativeFallbackRetry = $false
             $runArguments = @($arguments)
@@ -446,7 +429,9 @@ try {
                 }
                 $runArguments += @(
                     '--consume-manual-verification',
-                    '--consume-manual-verification-subset'
+                    '--consume-manual-verification-subset',
+                    '--manual-verification-scope',
+                    $(if (@($manualVerification.Origins).Count) { @($manualVerification.Origins) -join ',' } else { 'none' })
                 )
             }
             elseif ($attempt -gt 1 -and $requestedOrigins.Count -eq 0 -and $null -ne $resumeCandidate) {
@@ -478,7 +463,7 @@ try {
                         -not $previousOriginSet.ContainsKey($targetOrigin) -or $pendingOriginSet.ContainsKey($targetOrigin)
                     })
                 }
-                if ($null -ne $manualVerification) {
+                if ($null -ne $manualVerification -and $requestedOrigins.Count -eq 0) {
                     $manualOriginSet = @{}
                     foreach ($origin in @($manualVerification.Origins)) {
                         $manualOriginSet[[string]$origin] = $true
@@ -594,7 +579,7 @@ try {
                     Write-Warning '首轮仍有原生 fallback 站点未确认；继续第二轮原生签到复核。'
                 }
             }
-            if ($null -ne $manualVerification -and $null -ne $freshCandidate) {
+            if ($null -ne $manualVerification -and @($manualVerification.Origins).Count -gt 0 -and $null -ne $freshCandidate) {
                 $manualAttemptUpdate = Update-ManualVerificationState `
                     -Pending $manualVerification `
                     -Report $freshCandidate.Report `
@@ -615,6 +600,7 @@ try {
                 $runnerMessage = "签到程序已结束，但第 $attempt 次尝试未生成完整的 final 报告。"
             }
             if ($null -ne $manualVerification `
+                -and @($manualVerification.Origins).Count -gt 0 `
                 -and $null -ne $freshCandidate `
                 -and (Test-IsCompleteFinalReport $freshCandidate.Report) `
                 -and ($null -eq $manualAttemptUpdate -or -not $manualAttemptUpdate.Updated)) {
@@ -626,7 +612,7 @@ try {
                 if ($nodeExitCode -eq 0) { break }
             }
             if ($attempt -lt $runAttempts) {
-                if ($null -ne $manualVerification) {
+                if ($null -ne $manualVerification -and $requestedOrigins.Count -eq 0) {
                     if ($null -ne $manualAttemptUpdate -and $manualAttemptUpdate.Updated -and $manualAttemptUpdate.Complete) {
                         Write-Warning '人工复核目标已全部确认；未选中的其他异常不会触发重复访问。'
                         break

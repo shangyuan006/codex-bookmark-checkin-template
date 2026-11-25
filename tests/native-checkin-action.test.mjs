@@ -134,7 +134,7 @@ test("原生 New API 签到只接受接口权威状态", async () => {
   assert.match(source, /await scope\.begin\(\)/);
   assert.match(source, /status: "unconfirmed"/);
   assert.match(source, /newApiConfirmed,/);
-  assert.match(source, /if \(executeNewApiCheckin\) await inspectNewApiWithRawCdp\(\)/);
+  assert.match(source, /if \(executeNewApiCheckin\) await runInspection\(inspectNewApiWithRawCdp\)/);
 });
 
 test("原生签到从实际点击后重新计算完整确认等待窗口", async () => {

@@ -61,6 +61,17 @@ export function assertManualVerificationExecution(document, options = {}) {
   }
   if (options.allowSubset === true) {
     const pendingOriginSet = new Set(pendingOrigins);
+    if (options.verificationOrigins != null) {
+      const requested = [...options.verificationOrigins];
+      const verificationOrigins = [...new Set(requested.map(normalizeOrigin).filter(Boolean))].sort();
+      const intersection = selectedOrigins.filter(origin => pendingOriginSet.has(origin));
+      if (!selectedOrigins.length || requested.length !== verificationOrigins.length
+        || verificationOrigins.length !== intersection.length
+        || verificationOrigins.some((origin, index) => origin !== intersection[index])) {
+        throw new Error('人工复核范围必须精确等于请求范围与待复核记录的交集');
+      }
+      return;
+    }
     if (selectedOrigins.length === 0
       || selectedOrigins.some((origin) => !pendingOriginSet.has(origin))) {
       throw new Error("人工复核子集消费范围必须是待复核记录的非空子集");

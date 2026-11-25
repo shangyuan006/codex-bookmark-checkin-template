@@ -3,6 +3,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const run = promisify(execFile);
 const privateFiles = new Set(['config/config.json', 'config/config.local.json',
@@ -12,6 +13,12 @@ const identityKeys = /^(?:accountId|siteAccountId|expectedAccountId|userId|usern
 const secretKeys = /^(?:token|botToken|telegramToken|webhook|webhookUrl|apiKey|accessToken|secret|password)$/i;
 const scopeKeys = /^(?:mobileFolderNames|containerFolderNames|targetFolderNames|folderPath|bookmarkFolderPath)$/i;
 const genericValues = new Set(['github', 'linuxdo', 'linux-do', 'default', 'example', 'placeholder', 'changeme', 'yourname', 'username']);
+// Public upstream copyright contacts must remain in the license. The exception
+// applies only to this reviewed document's complete text, normalizing CRLF.
+// All exact private-value checks and all non-email rules still apply.
+const publicLicenseHashes = new Map([
+  ['THIRD_PARTY_NOTICES.md', '14631ff198122bc7620b09f597409c9452e0912784c81d5352d8f4fb569a833c'],
+]);
 
 function decode(bytes) {
   if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le', { fatal: true }).decode(bytes.subarray(2));
@@ -130,11 +137,14 @@ export async function scanPrivateValues(root, { patterns = [], binaryExtensions 
     let text;
     try { text = decode(bytes); }
     catch { findings.push({ file, line: 0, rule: 'Binary or invalid text in public scope' }); continue; }
+    const reviewedLicense = publicLicenseHashes.has(relative)
+      && createHash('sha256').update(text.replaceAll('\r\n', '\n')).digest('hex') === publicLicenseHashes.get(relative);
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
       const rules = new Set(values.filter(entry => contains(lines[index], entry.value)).map(entry => entry.rule));
       for (const entry of regexes) {
         if (relative === 'scripts/Scan-PublicSafety.ps1' && entry.rule === 'Assigned secret') continue;
+        if (reviewedLicense && entry.rule === 'Email address') continue;
         if (entry.regex.test(lines[index])) rules.add(entry.rule);
       }
       for (const rule of rules) findings.push({ file, line: index + 1, rule });

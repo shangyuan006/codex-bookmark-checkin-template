@@ -25,6 +25,7 @@ import { continueNativeSamePage } from './same-page-sequential.mjs';
 import { verifyNativeVisitCheckin } from './native-visit-checkin.mjs';
 import { selectNativeErrorPage, recoverNativeErrorPage } from './native-error-recovery.mjs';
 import { readCheckinFeatureStatus } from './checkin-feature-status.mjs';
+import { nativeInspectionError, nativeInspectionFailure } from './native-inspection-diagnostics.mjs';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright-core");
@@ -42,6 +43,7 @@ const executeDailyForm = inspectionMode === 'execute-daily-form' || inspectionMo
 const executeSamePage = inspectionMode === 'execute-same-page' || inspectionMode === 'verify-same-page';
 const encodedActionRule = process.argv[6] || "";
 const continuationOnly = process.argv.includes('--continuation-only');
+let inspectionPhase = 'connection';
 const actionRule = executeCheckin
   ? normalizeNativeCheckinActionRule(JSON.parse(Buffer.from(encodedActionRule, "base64").toString("utf8")))
   : null;
@@ -129,17 +131,31 @@ async function inspectNewApiWithRawCdp() {
   }));
 }
 
+async function runInspection(inspect) {
+  try {
+    await inspect();
+  } catch (error) {
+    const actionType = executeSamePage ? config.samePageManualCheckinRules?.[expectedOrigin]?.sequentialActionType : 'checkin';
+    const pending = await createSubmissionScope(config.submissionJournalPath,
+      { origin: expectedOrigin, actionType }, config).pending();
+    const attempted = partitionSubmissions(pending, { origin: expectedOrigin }, config).current.length > 0;
+    console.log(JSON.stringify({ ...nativeInspectionFailure(error, inspectionPhase),
+      ...(attempted ? { actionAttempted: true, submissionAttempted: true } : {}) }));
+  }
+}
+
 async function inspectWithPlaywright() {
   const browser = await connectOverCdpWithRetry(chromium, port, {
     timeoutMs: Math.max(5000, Math.min(15_000, maxWaitSeconds * 1000)),
     attemptTimeoutMs: 2000,
     retryDelayMs: 500,
-  });
+  }).catch(() => { throw nativeInspectionError('connection_failed', 'connection'); });
   let submissionWatcher = null;
   let browserErrorRecovery = null;
   const emit = result => console.log(JSON.stringify({ ...result,
     ...(browserErrorRecovery ? { browserErrorRecovery } : {}) }));
   try {
+  inspectionPhase = 'page_selection';
   const pageDeadline = Date.now() + maxWaitSeconds * 1000;
   let page = null;
   while (!page && Date.now() <= pageDeadline) {
@@ -151,7 +167,8 @@ async function inspectWithPlaywright() {
       browser.contexts().flatMap(context => context.pages()), { origin: expectedOrigin }, config);
     if (!page) await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  if (!page) throw new Error("target origin was not found in the native browser");
+  if (!page) throw nativeInspectionError('target_missing', 'page_selection');
+  inspectionPhase = 'page_observation';
   const feature = await readCheckinFeatureStatus(page.request, { origin: expectedOrigin }, config);
   if (feature) { emit(feature); return; }
   if (executeDailyForm || executeSamePage) {
@@ -187,7 +204,7 @@ async function inspectWithPlaywright() {
   const guardedPages = new WeakSet(executeCheckin ? [page] : []);
   const resolvePage = async () => {
     const newest = selectNewestOriginPage(browser.contexts().flatMap(context => context.pages()), expectedOrigin);
-    if (!newest) throw new Error('native target page is temporarily unavailable');
+    if (!newest) throw nativeInspectionError('target_unavailable', 'page_selection');
     attachSubmissionScope(newest, scope);
     if (executeCheckin && !guardedPages.has(newest)) {
       await guardPageSubmissions(newest, submissionTarget, scope, { readOnly: () => !mayExecuteCheckin });
@@ -381,8 +398,10 @@ async function inspectWithPlaywright() {
       }
       if (explicitlyConfirmed || endpointReady || (executeCheckin && !actionAttempted) || confirmationTimedOut
         || current.state.failureCode === 'cloudflare_verification_unresolved') break;
-    } catch {
-      if (Date.now() >= confirmationDeadline) throw new Error("native page did not stabilize before the deadline");
+    } catch (error) {
+      if (Date.now() >= confirmationDeadline) {
+        throw error?.inspectionCategory ? error : nativeInspectionError('page_unstable', 'page_observation');
+      }
     }
     await page.waitForTimeout(1000);
   } while (true);
@@ -405,5 +424,5 @@ async function inspectWithPlaywright() {
   }
 }
 
-if (executeNewApiCheckin) await inspectNewApiWithRawCdp();
-else await inspectWithPlaywright();
+if (executeNewApiCheckin) await runInspection(inspectNewApiWithRawCdp);
+else await runInspection(inspectWithPlaywright);

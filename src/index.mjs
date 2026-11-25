@@ -100,6 +100,10 @@ const originsIndex = process.argv.indexOf("--origins");
 const resumeIndex = process.argv.indexOf("--resume-report");
 const consumeManualVerification = process.argv.includes("--consume-manual-verification");
 const consumeManualVerificationSubset = process.argv.includes("--consume-manual-verification-subset");
+const verificationScopeIndex = process.argv.indexOf('--manual-verification-scope');
+const verificationScope = verificationScopeIndex < 0 ? null
+  : process.argv[verificationScopeIndex + 1] === 'none' ? []
+    : String(process.argv[verificationScopeIndex + 1] ?? '').split(',');
 const reauthAccountKeyIndex = process.argv.indexOf("--reauth-account-key");
 const reauthAccountKey = reauthAccountKeyIndex >= 0
   ? String(process.argv[reauthAccountKeyIndex + 1] ?? "").trim() || null
@@ -163,6 +167,7 @@ if (!dryRun && !listPreflightTargets && !reauthAccountKey) {
   assertManualVerificationExecution(manualVerification, {
     consume: consumeManualVerification,
     allowSubset: consumeManualVerificationSubset,
+    verificationOrigins: verificationScope,
     resumeRequested: Boolean(requestedResumePath),
     selectedOrigins,
     runDate: localRunDate(),
@@ -269,6 +274,10 @@ try {
     const originFilteredTargets = selectedOrigins
       ? preferredTargets.filter((target) => selectedOrigins.has(target.origin))
       : preferredTargets;
+    if (verificationScope) {
+      const verificationSet = new Set(verificationScope);
+      originFilteredTargets.sort((a, b) => Number(verificationSet.has(b.origin)) - Number(verificationSet.has(a.origin)));
+    }
     const selectedTargets = limit
       ? originFilteredTargets.slice(offset, offset + limit)
       : originFilteredTargets.slice(offset);

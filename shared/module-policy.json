@@ -10,6 +10,7 @@
     "src/health-cli.mjs",
     "src/code-release.mjs",
     "src/status-dashboard.mjs",
+    "src/checkin-final-state.mjs",
     "src/unknown-summary.mjs",
     "src/preflight.mjs",
     "src/inspect-target.mjs",

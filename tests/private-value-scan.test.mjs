@@ -89,3 +89,32 @@ test('PowerShell scan retains regex and binary checks while using actual private
   assert.ok(!JSON.stringify(result).includes(['person', 'synthetic.invalid.txt'].join('@')));
   assert.doesNotMatch(JSON.stringify(result), /test-personal-identity/);
 });
+
+test('copyright email exception requires the complete reviewed license at its exact path', async t => {
+  const root = await fixture(t);
+  const license = (await fs.readFile(new URL('../THIRD_PARTY_NOTICES.md', import.meta.url), 'utf8')).replaceAll('\r\n', '\n');
+  const emailRule = { rule: 'Email address', pattern: '\\b[^\\s@]+@[^\\s@]+\\.[A-Za-z]{2,}\\b' };
+  const options = { patterns: [emailRule] };
+  const file = path.join(root, 'THIRD_PARTY_NOTICES.md');
+  for (const contents of [license, license.replaceAll('\n', '\r\n')]) {
+    await fs.writeFile(file, contents);
+    assert.equal((await scanPrivateValues(root, options)).safe, true);
+  }
+  await fs.writeFile(path.join(root, 'source.mjs'), license);
+  let report = await scanPrivateValues(root, options);
+  assert.ok(report.findings.some(item => item.file === 'source.mjs' && item.rule === 'Email address'));
+  await fs.unlink(path.join(root, 'source.mjs'));
+  await fs.writeFile(file, license + '\n' + ['private-person', 'synthetic.invalid'].join('@'));
+  report = await scanPrivateValues(root, options);
+  assert.equal(report.safe, false);
+  assert.ok(report.findings.some(item => item.file === 'THIRD_PARTY_NOTICES.md' && item.rule === 'Email address'));
+});
+
+test('reviewed public license still undergoes private-value and non-email checks', async t => {
+  const root = await fixture(t, { username: 'Libor Skarvada' });
+  await fs.copyFile(new URL('../THIRD_PARTY_NOTICES.md', import.meta.url), path.join(root, 'THIRD_PARTY_NOTICES.md'));
+  const report = await scanPrivateValues(root, { patterns: [{ rule: 'Other sentinel', pattern: 'libgd' }] });
+  assert.equal(report.safe, false);
+  assert.ok(report.findings.some(item => item.rule === 'Private identity value'));
+  assert.ok(report.findings.some(item => item.rule === 'Other sentinel'));
+});

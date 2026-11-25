@@ -10,6 +10,7 @@
     "preflight": "node src/preflight.mjs",
     "dry-run": "node src/index.mjs --dry-run",
     "status": "node src/status-dashboard.mjs",
+    "status:final": "node src/checkin-final-state.mjs",
     "unknown:summary": "node src/unknown-summary.mjs",
     "contract:generate": "node scripts/generate-checkin-contract.mjs",
     "contract:check": "node scripts/generate-checkin-contract.mjs --check",

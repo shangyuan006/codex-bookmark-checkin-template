@@ -239,6 +239,14 @@ function Get-PendingManualVerification([string]$Path) {
     return [pscustomobject]@{ Document = $document; Origins = $origins }
 }
 
+function Select-ManualVerificationScope($Pending, [string[]]$Origins = @()) {
+    if ($null -eq $Pending) { return $null }
+    $selected = if ($Origins.Count -eq 0) { @($Pending.Origins) } else {
+        @($Origins | Where-Object { $_ -in @($Pending.Origins) })
+    }
+    return [pscustomobject]@{ Document = $Pending.Document; Origins = @($selected) }
+}
+
 function Get-ManualVerificationRetryOrigins($Pending, $Report, [datetime]$RetryAt) {
     if ($null -eq $Pending -or -not (Test-ManualVerificationFinalReport $Report)) { return @() }
     $resultByOrigin = @{}

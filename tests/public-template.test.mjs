@@ -115,7 +115,7 @@ test("原生预热只能访问当前书签目标或其显式关联 origin", asyn
 
 test("人工定向复核时原生预热与指定 origin 取交集", async () => {
   const runner = await fs.readFile(new URL("../scripts/Run-Checkin.ps1", import.meta.url), "utf8");
-  const manualScope = runner.match(/if \(\$null -ne \$manualVerification\) \{\s*\$manualOriginSet = @\{\}([\s\S]*?)\n\s*\}/)?.[1] ?? "";
+  const manualScope = runner.match(/if \(\$null -ne \$manualVerification -and \$requestedOrigins\.Count -eq 0\) \{\s*\$manualOriginSet = @\{\}([\s\S]*?)\n\s*\}/)?.[1] ?? "";
 
   assert.match(runner, /\$parsedPreflightTargets = \(\$targetOutput -join \[Environment\]::NewLine\) \| ConvertFrom-Json/);
   assert.match(runner, /\$currentPreflightTargets = @\(\$parsedPreflightTargets\)/);

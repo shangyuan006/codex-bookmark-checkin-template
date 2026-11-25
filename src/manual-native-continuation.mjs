@@ -17,6 +17,8 @@ import { localRunDate } from './retry-policy.mjs';
 import { configuredNativeVisitRule } from './native-visit-checkin.mjs';
 import { sanitizeSequentialClickDiagnostics } from './sequential-click-diagnostics.mjs';
 import { checkinCycle } from './checkin-cycle.mjs';
+import { nativeInspectionFailure, parseNativeInspectionOutput } from './native-inspection-diagnostics.mjs';
+import { readSubmissionJournal, partitionSubmissions } from './submission-guard.mjs';
 
 const execute = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -25,7 +27,7 @@ const sameProfile = (a, b) => typeof a === 'string' && typeof b === 'string'
 const observationKey = results => JSON.stringify(results.map(result => Object.fromEntries(
   ['origin', 'status', 'reason', 'failureCode', 'actionAttempted', 'submissionAttempted', 'evidence',
     'cycle', 'actionResults', 'requiredActionTypes', 'firstSubmissionFailure', 'submissionDiagnostics',
-    'verificationRecoveryDiagnostics'].map(key => [key, result[key]]))));
+    'verificationRecoveryDiagnostics', 'continuationDiagnostics'].map(key => [key, result[key]]))));
 
 export function controlledManualRule(target, config) {
   const samePage = getSamePageManualRule(target, config);
@@ -120,11 +122,19 @@ export async function continueControlledManualSession(projectRoot, config, state
           ...(readyOnly ? ['--continuation-only'] : []),
           ...(previous?.browserErrorRecovery?.attempted ? ['--no-error-recovery'] : [])],
         { cwd: projectRoot, windowsHide: true, timeout: 240000, maxBuffer: 1024 * 1024 });
-        return JSON.parse(stdout);
+        return parseNativeInspectionOutput(stdout);
       }))(target, rule);
-    } catch {
-      result = { status: 'needs_attention', failureCode: 'manual_continuation_unconfirmed',
-        reason: '同页接续未取得完成信号，保留项目窗口', retryable: false };
+    } catch (error) {
+      result = nativeInspectionFailure(error);
+      // A helper can fail after reserving an intent. Keep that fact even if
+      // no JSON result reached the parent; it never authorizes another click.
+      const journal = await readSubmissionJournal(config.submissionJournalPath
+        ?? path.join(projectRoot, 'data/submission-journal.json')).catch(() => null);
+      const pending = (journal?.entries ?? []).filter(entry => entry.identity?.siteOrigin === target.origin
+        && ['intent', 'uncertain'].includes(entry.state));
+      if (partitionSubmissions(pending, target, config, now).current.length) {
+        result.actionAttempted = true; result.submissionAttempted = true;
+      }
     }
     const first = previous?.firstSubmissionFailure ?? result.firstSubmissionFailure;
     const firstAction = sanitizeSequentialClickDiagnostics(first?.action);

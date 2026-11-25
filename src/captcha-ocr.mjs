@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import sharp from "sharp";
 import { createWorker, PSM } from "tesseract.js";
 import { matchPixelFontGlyph } from "./pixel-font-ocr.mjs";
+import { recognizeGdGiantText } from './gd-font-ocr.mjs';
 
 function removeNoise(data, width, height) {
   const binary = new Uint8Array(width * height);
@@ -111,7 +112,7 @@ async function prepareOpenCdCaptcha(input) {
     .resize({ width: info.width * 6, height: info.height * 6, kernel: "nearest" })
     .png()
     .toBuffer();
-  return { processed, components: cleaned.keptComponents, width: info.width, height: info.height, scale: 6 };
+  return { processed, cleaned: cleaned.output, components: cleaned.keptComponents, width: info.width, height: info.height, scale: 6 };
 }
 
 export async function preprocessOpenCdCaptcha(input) {
@@ -659,11 +660,14 @@ export async function recognizeAlphanumericCaptcha(input, { minLength = 4, maxLe
 export async function recognizeOpenCdCaptcha(input) {
   const prepared = await prepareOpenCdCaptcha(input);
   const { processed } = prepared;
+  const fontRecognition = recognizeGdGiantText(prepared.cleaned, prepared.width, prepared.height);
+  if (fontRecognition.fontDetected) return { ...fontRecognition, processed };
   const worker = await createWorker("eng", 1, { logger: () => {} });
   try {
     await worker.setParameters({
       tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
       tessedit_pageseg_mode: PSM.SINGLE_LINE,
+      user_defined_dpi: "300",
     });
     const result = await worker.recognize(processed, {}, { text: true, box: true });
     const wholeCode = String(result.data.text || "").toUpperCase().replace(/[^A-Z0-9]/g, "");

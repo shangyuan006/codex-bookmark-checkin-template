@@ -130,7 +130,7 @@ test('PowerShell retry deadlines compare absolute instants across UTC and local 
 test('wrapper preflight distinguishes automatic continuation from the first manual or explicit attempt', async () => {
   const runner = await fs.readFile(new URL('../scripts/Run-Checkin.ps1', import.meta.url), 'utf8');
   const start = runner.indexOf('                if ($null -ne $resumeCandidate)', runner.indexOf('if ($preflightConfigured) {'));
-  const end = runner.indexOf('                if ($null -ne $manualVerification)', start);
+  const end = runner.indexOf('                if ($null -ne $manualVerification -and $requestedOrigins.Count -eq 0)', start);
   assert.ok(start > 0 && end > start);
   const { stdout } = await exec('pwsh', ['-NoProfile', '-Command', `
     . ./scripts/ResultContract.ps1
